@@ -16,6 +16,9 @@ use super::{
 /// What choosing a menu item does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    Minimize,
+    Maximize,
+    Restore,
     Open(VolPath),
     Explore(VolPath),
     OpenSelection,

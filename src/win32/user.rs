@@ -751,6 +751,15 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
         .menu_bar_hot
         .filter(|(h, _)| *h == hwnd)
         .map(|(_, i)| i);
+    // The caption shows the window class's icon.
+    let class_icon = shared
+        .gui
+        .classes
+        .iter()
+        .find(|class| class.name.eq_ignore_ascii_case(&window.class))
+        .and_then(|class| shared.gui.small_icon(class.icon))
+        .filter(|icon| icon.width == 16 && icon.height == 16)
+        .cloned();
     with_painter(shared, hwnd, false, |p| {
         let (w, h) = (window.width, window.height);
         let frame = frame_width(window.style, window.ex_style);
@@ -781,7 +790,18 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
             let text_color = if active { sys_color(9) } else { sys_color(19) };
             let mut text_x = frame + 3;
             if window.style & WS_SYSMENU != 0 && !tool {
-                draw_small_icon(p, frame + 2, y + 1);
+                match &class_icon {
+                    Some(icon) => {
+                        for (index, pixel) in icon.pixels.iter().enumerate() {
+                            if let Some(rgb) = pixel {
+                                let (ix, iy) =
+                                    (index as i32 % icon.width, index as i32 / icon.width);
+                                p.pixel(frame + 2 + ix, y + 1 + iy, *rgb);
+                            }
+                        }
+                    }
+                    None => draw_small_icon(p, frame + 2, y + 1),
+                }
                 text_x = frame + 20;
             }
             let (close, max, min) = caption_buttons(&window);
@@ -1838,6 +1858,33 @@ pub fn show_window<M: GuestMemory + ?Sized>(
             }
             ctx.shared.borrow_mut().gui.dirty = true;
             send(ctx, memory, hwnd, WM_SIZE, 1, 0);
+            // A minimized window gives up the activation: the next top-level
+            // window of the program gets it, or none does.
+            let was_active = ctx.shared.borrow().gui.active_hwnd == hwnd;
+            if cmd != 7 && was_active {
+                let next = {
+                    let shared = ctx.shared.borrow();
+                    shared
+                        .gui
+                        .windows
+                        .iter()
+                        .rev()
+                        .find(|w| {
+                            w.hwnd != hwnd
+                                && w.parent == 0
+                                && w.owner == 0
+                                && w.visible
+                                && !w.minimized
+                                && w.style & WS_CHILD == 0
+                                && w.style & WS_CAPTION == WS_CAPTION
+                        })
+                        .map(|w| w.hwnd)
+                };
+                match next {
+                    Some(next) => activate(ctx, memory, next, 1),
+                    None => deactivate_program(ctx, memory),
+                }
+            }
             return was_visible;
         }
         1 | 9 if !child && (maximized || minimized) => {
@@ -2538,11 +2585,20 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
                 0xF120 => {
                     show_window(ctx, memory, hwnd, 9);
                 }
+                0xF100 if lparam == 0x20 => {
+                    // SC_KEYMENU with a space (Alt+Space): the window menu.
+                    crate::win32::menu::track_system_menu(ctx, memory, hwnd, None);
+                }
                 0xF100 => {
                     // SC_KEYMENU: Alt+letter or F10 opens the menu bar.
                     crate::win32::menu::key_menu(ctx, memory, hwnd, lparam);
                 }
-                0xF090 | 0xF010 | 0xF000 => {}
+                0xF090 => {
+                    // SC_MOUSEMENU: the window menu from the caption icon.
+                    crate::win32::menu::track_system_menu(ctx, memory, hwnd, None);
+                }
+                0xF010 => keyboard_move_size(ctx, memory, hwnd, false),
+                0xF000 => keyboard_move_size(ctx, memory, hwnd, true),
                 _ => {}
             }
             0
@@ -2581,6 +2637,9 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
                         send(ctx, memory, hwnd, WM_SYSCOMMAND, 0xF020, lparam);
                     }
                 }
+                HTSYSMENU => {
+                    send(ctx, memory, hwnd, WM_SYSCOMMAND, 0xF090, lparam);
+                }
                 HTCAPTION => move_size_loop(ctx, memory, hwnd, HTCAPTION, lo(lparam), hi(lparam)),
                 HTLEFT..=HTBOTTOMRIGHT => {
                     move_size_loop(ctx, memory, hwnd, wparam as i32, lo(lparam), hi(lparam))
@@ -2598,6 +2657,9 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
             0
         }
         WM_NCLBUTTONDBLCLK => {
+            if wparam as i32 == HTSYSMENU {
+                send(ctx, memory, hwnd, WM_SYSCOMMAND, 0xF060, lparam);
+            }
             if wparam as i32 == HTCAPTION {
                 let (style, maximized) = ctx
                     .shared
@@ -2642,7 +2704,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
         }
         WM_SYSCHAR => {
             let top = ctx.shared.borrow().gui.top_level_for(hwnd).unwrap_or(hwnd);
-            if wparam != 0x0D && wparam != 0x20 {
+            if wparam != 0x0D {
                 send(ctx, memory, top, WM_SYSCOMMAND, 0xF100, wparam);
             }
             0
@@ -2660,6 +2722,19 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
                 dc.attrs.bk_color = gfx::rgb_to_colorref(sys_color(back));
             }
             brush
+        }
+        WM_NCRBUTTONUP => {
+            send(ctx, memory, hwnd, WM_CONTEXTMENU, hwnd, lparam);
+            0
+        }
+        WM_CONTEXTMENU if is_caption_point(ctx, hwnd, lo(lparam), hi(lparam)) => {
+            crate::win32::menu::track_system_menu(
+                ctx,
+                memory,
+                hwnd,
+                Some((lo(lparam), hi(lparam))),
+            );
+            0
         }
         WM_CONTEXTMENU | WM_PARENTNOTIFY => {
             if msg == WM_CONTEXTMENU {
@@ -3625,6 +3700,106 @@ fn track_caption_button<M: GuestMemory + ?Sized>(
 }
 
 /// Modal move/size loop started from a caption or border press.
+/// Whether a screen point is on a top-level window's caption or icon.
+fn is_caption_point(ctx: &ApiContext, hwnd: u32, x: i32, y: i32) -> bool {
+    let shared = ctx.shared.borrow();
+    let Some(window) = shared.gui.window(hwnd) else {
+        return false;
+    };
+    if window.style & WS_CHILD != 0 {
+        return false;
+    }
+    let (wx, wy) = window_screen_origin(&shared.gui, hwnd);
+    matches!(nc_hit_test(window, x - wx, y - wy), HTCAPTION | HTSYSMENU)
+}
+
+/// The window menu's Move and Size: arrow keys (or the mouse) move the
+/// window or its bottom-right corner; Enter or a click accepts, Escape
+/// cancels.
+fn keyboard_move_size<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    hwnd: u32,
+    size: bool,
+) {
+    let Some((start, maximized, child, sizable)) = ({
+        let shared = ctx.shared.borrow();
+        shared.gui.window(hwnd).map(|w| {
+            (
+                Rect::sized(w.x, w.y, w.width, w.height),
+                w.maximized,
+                w.style & WS_CHILD != 0,
+                w.style & WS_THICKFRAME != 0,
+            )
+        })
+    }) else {
+        return;
+    };
+    if maximized || child || (size && !sizable) || !interactive(ctx, memory) {
+        return;
+    }
+    let mut rect = start;
+    let mut anchor: Option<(i32, i32)> = None;
+    let apply = |ctx: &ApiContext, memory: &mut M, rect: Rect| {
+        set_window_pos(
+            ctx,
+            memory,
+            hwnd,
+            0,
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
+            0x4 | 0x10,
+        );
+        flush_paints(ctx, memory);
+    };
+    let adjust = |rect: Rect, dx: i32, dy: i32| {
+        if size {
+            Rect::new(
+                rect.left,
+                rect.top,
+                (rect.right + dx).max(rect.left + 112),
+                (rect.bottom + dy).max(rect.top + 27),
+            )
+        } else {
+            rect.offset(dx, dy)
+        }
+    };
+    while let Some(event) = next_raw_input(ctx, memory) {
+        match event {
+            RawInput::Key { vk, down: true, .. } => match vk {
+                0x25..=0x28 => {
+                    let (dx, dy) = match vk {
+                        0x25 => (-8, 0),
+                        0x26 => (0, -8),
+                        0x27 => (8, 0),
+                        _ => (0, 8),
+                    };
+                    rect = adjust(rect, dx, dy);
+                    apply(ctx, memory, rect);
+                }
+                0x0D => break,
+                0x1B => {
+                    apply(ctx, memory, start);
+                    break;
+                }
+                _ => {}
+            },
+            RawInput::Move { x, y } => {
+                let (ax, ay) = *anchor.get_or_insert((x, y));
+                let moved = adjust(start, x - ax, y - ay);
+                if moved != rect {
+                    rect = moved;
+                    apply(ctx, memory, rect);
+                }
+            }
+            RawInput::Button { down: true, .. } => break,
+            _ => {}
+        }
+    }
+}
+
 fn move_size_loop<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
     memory: &mut M,
@@ -4041,6 +4216,33 @@ pub fn resource_string<M: GuestMemory + ?Sized>(
 }
 
 /// Load a bitmap resource as a GDI bitmap handle.
+/// `LoadIconA`: a handle whose images come from the module's icon
+/// resources, or the system icons for a null instance. A handle is returned
+/// even when no image is found, as programs rarely check.
+pub fn load_icon<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    instance: u32,
+    name_va: u32,
+) -> u32 {
+    let images = if instance == 0 {
+        crate::win32::icon::system_icon(name_va)
+    } else {
+        let name = res_name(memory, name_va);
+        let large = crate::win32::icon::load(ctx, memory, instance, &name, 32);
+        let small = crate::win32::icon::load(ctx, memory, instance, &name, 16);
+        large
+            .zip(small)
+            .map(|(large, small)| crate::win32::icon::Icon { large, small })
+    };
+    let mut shared = ctx.shared.borrow_mut();
+    let handle = shared.alloc_handle() | 0x0050_0000;
+    if let Some(images) = images {
+        shared.gui.icons.insert(handle, images);
+    }
+    handle
+}
+
 pub fn load_bitmap<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
     memory: &mut M,
@@ -5762,15 +5964,20 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             let _ = write_cstr(memory, args[2], &text[..copied]);
             ok(copied as u32)
         }
-        "LoadCursorA" | "LoadIconA" => {
+        "LoadCursorA" => {
             let mut shared = ctx.shared.borrow_mut();
             let handle = shared.alloc_handle();
             ok(handle | 0x0050_0000)
         }
+        "LoadIconA" => ok(load_icon(ctx, memory, args[0], args[1])),
         "LoadImageA" => {
             if args[2] == 0 {
                 let handle = load_bitmap(ctx, memory, args[0], args[1]);
                 return ok(handle);
+            }
+            if args[2] == 1 {
+                // IMAGE_ICON
+                return ok(load_icon(ctx, memory, args[0], args[1]));
             }
             let mut shared = ctx.shared.borrow_mut();
             let handle = shared.alloc_handle();

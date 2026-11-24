@@ -979,6 +979,7 @@ dependencies = [
  "glow",
  "glutin",
  "glutin-winit",
+ "libc",
  "unicorn-engine",
  "winit",
 ]

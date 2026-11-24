@@ -16,7 +16,7 @@ pub mod setup;
 pub mod volume;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     time::{Duration, Instant},
 };
@@ -97,6 +97,61 @@ pub enum PointerOutcome {
     Handled,
     /// A program's taskbar button was clicked.
     Task(usize),
+    /// A mouse event on an icon in the notification area.
+    Tray(usize, TrayEvent),
+}
+
+/// A mouse event on a notification-area icon, reported to its program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayEvent {
+    Down(Button),
+    Up(Button),
+    DoubleClick(Button),
+}
+
+impl TrayEvent {
+    /// The mouse message Windows reports for the event.
+    pub fn message(self) -> u32 {
+        let (base, button) = match self {
+            Self::Down(button) => (0x201, button),
+            Self::Up(button) => (0x202, button),
+            Self::DoubleClick(button) => (0x203, button),
+        };
+        if button == Button::Right {
+            base + 3
+        } else {
+            base
+        }
+    }
+}
+
+/// An icon in the taskbar notification area, supplied by the window system.
+#[derive(Clone, Debug, Default)]
+pub struct TrayItem {
+    pub icon: Option<Bitmap>,
+    pub tip: String,
+}
+
+/// Local time as (hour, minute, weekday 0 = Sunday, day, month 0-11, year).
+fn local_time() -> (i32, i32, usize, i32, usize, i32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    // SAFETY: localtime_r writes only the `tm` it is given.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        tm
+    };
+    (
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_wday as usize % 7,
+        tm.tm_mday,
+        tm.tm_mon as usize % 12,
+        tm.tm_year + 1900,
+    )
 }
 
 /// Paint passes, interleaved by the caller with program windows.
@@ -142,6 +197,9 @@ struct Explorer {
     entries: Vec<Entry>,
     selected: Option<usize>,
     scroll: usize,
+    minimized: bool,
+    /// The normal position while maximized.
+    restore: Option<Rect>,
 }
 
 /// A one-line text box (rename, Run).
@@ -276,6 +334,8 @@ enum MenuOwner {
     Start,
     Bar(usize),
     Context(Place),
+    /// The folder window's window menu.
+    Window,
 }
 
 struct OpenMenu {
@@ -292,6 +352,8 @@ struct Clip {
 enum ClickTarget {
     Icon(usize),
     Row(usize),
+    Caption,
+    Tray(usize),
 }
 
 pub struct Shell {
@@ -308,6 +370,14 @@ pub struct Shell {
     clip: Option<Clip>,
     drag: Option<(i32, i32)>,
     captured: bool,
+    /// Icons in the notification area, kept up to date by the window system.
+    tray: Vec<TrayItem>,
+    /// A notification-area icon being pressed.
+    tray_press: Option<(usize, Button)>,
+    /// Last pointer position over the taskbar, for tooltips.
+    hover: Option<(i32, i32)>,
+    /// The minute the clock last showed.
+    clock_minute: Cell<i32>,
     last_click: Option<(ClickTarget, Instant)>,
     launch: Option<LaunchRequest>,
     screen: (i32, i32),
@@ -410,6 +480,10 @@ impl Shell {
             clip: None,
             drag: None,
             captured: false,
+            tray: Vec::new(),
+            tray_press: None,
+            hover: None,
+            clock_minute: Cell::new(-1),
             last_click: None,
             launch: None,
             screen: (1024, 700),
@@ -428,7 +502,9 @@ impl Shell {
     pub fn set_screen(&mut self, width: i32, height: i32) {
         if self.screen != (width, height) {
             self.screen = (width, height);
-            if let Some(explorer) = &mut self.explorer {
+            if let Some(explorer) = self.explorer.as_mut().filter(|e| e.restore.is_some()) {
+                explorer.rect = Rect::new(0, 0, width, height - TASKBAR_HEIGHT);
+            } else if let Some(explorer) = &mut self.explorer {
                 let (w, h) = (
                     explorer.rect.width().min(width),
                     explorer.rect.height().min(height - TASKBAR_HEIGHT),
@@ -454,6 +530,16 @@ impl Shell {
         self.focus = Focus::Program;
     }
 
+    /// The desktop (or the folder window) takes the keyboard focus, e.g.
+    /// after the program in use was minimized.
+    pub fn focus_desktop(&mut self) {
+        self.focus = if self.explorer.as_ref().is_some_and(|e| !e.minimized) {
+            Focus::Explorer
+        } else {
+            Focus::Desktop
+        };
+    }
+
     /// The running program exited: take the focus back and show any files
     /// it saved.
     pub fn program_exited(&mut self, error: Option<String>) {
@@ -471,7 +557,12 @@ impl Shell {
     }
 
     pub fn foreground_explorer(&self) -> bool {
-        self.focus == Focus::Explorer
+        self.focus == Focus::Explorer && self.explorer_visible()
+    }
+
+    /// The folder window is open and not minimized.
+    fn explorer_visible(&self) -> bool {
+        self.explorer.as_ref().is_some_and(|e| !e.minimized)
     }
 
     /// Whether the shell has keyboard focus (or a menu or dialog is open).
@@ -645,6 +736,7 @@ impl Shell {
             Ok(entries) => entries,
             Err(error) => return self.message("Explorer", &error),
         };
+        let restore = self.explorer.as_ref().and_then(|e| e.restore);
         let rect = self.explorer.as_ref().map(|e| e.rect).unwrap_or_else(|| {
             let (w, h) = (
                 560.min(self.screen.0),
@@ -663,6 +755,8 @@ impl Shell {
             entries,
             selected: None,
             scroll: 0,
+            minimized: false,
+            restore,
         });
         self.focus = Focus::Explorer;
     }
@@ -1046,6 +1140,35 @@ impl Shell {
                 self.explorer = None;
                 self.focus = Focus::Desktop;
             }
+            Command::Minimize => {
+                if let Some(explorer) = self.explorer.as_mut() {
+                    explorer.minimized = true;
+                    self.focus = Focus::Desktop;
+                }
+            }
+            Command::Maximize => {
+                let full = Rect::new(0, 0, self.screen.0, self.screen.1 - TASKBAR_HEIGHT);
+                if let Some(explorer) = self.explorer.as_mut() {
+                    if explorer.restore.is_none() {
+                        explorer.restore = Some(explorer.rect);
+                        explorer.rect = full;
+                    }
+                    explorer.minimized = false;
+                    self.focus = Focus::Explorer;
+                }
+                self.ensure_visible();
+            }
+            Command::Restore => {
+                if let Some(explorer) = self.explorer.as_mut() {
+                    if explorer.minimized {
+                        explorer.minimized = false;
+                    } else if let Some(rect) = explorer.restore.take() {
+                        explorer.rect = rect;
+                    }
+                    self.focus = Focus::Explorer;
+                }
+                self.ensure_visible();
+            }
             Command::Run => {
                 let dialog = self.make_dialog(
                     "Run",
@@ -1259,6 +1382,13 @@ impl Shell {
                 let (x, y) = at.unwrap_or(self.context_anchor(place));
                 (self.context_items(place), Style::Icons, Anchor::Point(x, y))
             }
+            MenuOwner::Window => {
+                let (x, y) = at.unwrap_or_else(|| {
+                    let e = self.explorer.as_ref().map(|e| e.rect).unwrap_or_default();
+                    (e.left + 3, e.top + 3 + CAPTION)
+                });
+                (self.window_menu_items(), Style::Plain, Anchor::Point(x, y))
+            }
         };
         let mut menu = Menu::open(items, style, anchor, self.screen);
         if highlight_first {
@@ -1291,7 +1421,7 @@ impl Shell {
             Outcome::Chosen(command) => {
                 self.menu = None;
                 let place = match owner {
-                    MenuOwner::Bar(_) => Place::Explorer,
+                    MenuOwner::Bar(_) | MenuOwner::Window => Place::Explorer,
                     MenuOwner::Context(place) => place,
                     MenuOwner::Start => Place::Desktop,
                 };
@@ -1359,6 +1489,33 @@ impl Shell {
 
     fn close_rect(e: &Explorer) -> Rect {
         Rect::sized(e.rect.right - 5 - 16, e.rect.top + 5, 16, 14)
+    }
+
+    /// Maximize (or restore) and minimize buttons, left of close.
+    fn max_rect(e: &Explorer) -> Rect {
+        Self::close_rect(e).offset(-18, 0)
+    }
+
+    fn min_rect(e: &Explorer) -> Rect {
+        Self::max_rect(e).offset(-16, 0)
+    }
+
+    /// The caption icon, which opens the window menu.
+    fn icon_rect(e: &Explorer) -> Rect {
+        Rect::sized(e.rect.left + 5, e.rect.top + 4, 16, 16)
+    }
+
+    fn window_menu_items(&self) -> Vec<Item> {
+        let maximized = self.explorer.as_ref().is_some_and(|e| e.restore.is_some());
+        vec![
+            Item::command("&Restore", Command::Restore).enabled(maximized),
+            Item::command("Mi&nimize", Command::Minimize),
+            Item::command("Ma&ximize", Command::Maximize).enabled(!maximized),
+            Item::separator(),
+            Item::command("&Close", Command::Close)
+                .accel("Alt+F4")
+                .default_item(),
+        ]
     }
 
     fn bar_rects(&self) -> Vec<Rect> {
@@ -1465,9 +1622,56 @@ impl Shell {
         }
     }
 
+    /// The notification area: icons, then the clock, at the right.
+    fn tray_rect(&self) -> Rect {
+        let width = 8 + self.tray.len() as i32 * 20 + text_width(b"88:88") + 12;
+        Rect::new(
+            self.screen.0 - 3 - width,
+            self.screen.1 - TASKBAR_HEIGHT + 4,
+            self.screen.0 - 3,
+            self.screen.1 - 2,
+        )
+    }
+
+    fn tray_icon_rect(&self, index: usize) -> Rect {
+        let tray = self.tray_rect();
+        Rect::sized(
+            tray.left + 4 + index as i32 * 20,
+            tray.top + (tray.height() - 16) / 2,
+            16,
+            16,
+        )
+    }
+
+    fn clock_rect(&self) -> Rect {
+        let tray = self.tray_rect();
+        Rect::new(
+            tray.left + 4 + self.tray.len() as i32 * 20,
+            tray.top,
+            tray.right,
+            tray.bottom,
+        )
+    }
+
+    /// Replace the notification-area icons.
+    pub fn set_tray(&mut self, tray: Vec<TrayItem>) {
+        self.tray = tray;
+        if self
+            .tray_press
+            .is_some_and(|(index, _)| index >= self.tray.len())
+        {
+            self.tray_press = None;
+        }
+    }
+
+    /// Whether the clock needs repainting (the minute changed).
+    pub fn clock_changed(&self) -> bool {
+        local_time().1 != self.clock_minute.get()
+    }
+
     fn task_rects(&self, count: usize) -> Vec<Rect> {
         let top = self.screen.1 - TASKBAR_HEIGHT + 4;
-        let available = self.screen.0 - 66 - 4;
+        let available = self.tray_rect().left - 4 - 66;
         let width = if count == 0 {
             0
         } else {
@@ -1549,7 +1753,7 @@ impl Shell {
     fn in_explorer(&self, x: i32, y: i32) -> bool {
         self.explorer
             .as_ref()
-            .is_some_and(|e| e.rect.contains(x, y))
+            .is_some_and(|e| !e.minimized && e.rect.contains(x, y))
     }
 
     /// A button press. `program_hit` says whether a program window is under
@@ -1651,6 +1855,16 @@ impl Shell {
     }
 
     fn taskbar_click(&mut self, x: i32, y: i32, button: Button, tasks: &[Task]) -> PointerOutcome {
+        if let Some(index) = (0..self.tray.len()).find(|&i| self.tray_icon_rect(i).contains(x, y)) {
+            self.tray_press = Some((index, button));
+            let target = ClickTarget::Tray(index);
+            let event = if button == Button::Left && self.double_click(target) {
+                TrayEvent::DoubleClick(button)
+            } else {
+                TrayEvent::Down(button)
+            };
+            return PointerOutcome::Tray(index, event);
+        }
         if button != Button::Left {
             return PointerOutcome::Handled;
         }
@@ -1662,7 +1876,14 @@ impl Shell {
         let rects = self.task_rects(explorer + tasks.len());
         match rects.iter().position(|r| r.contains(x, y)) {
             Some(0) if explorer == 1 => {
-                self.focus = Focus::Explorer;
+                if self.foreground_explorer() {
+                    self.execute(Command::Minimize, Place::Explorer);
+                } else {
+                    if let Some(explorer) = self.explorer.as_mut() {
+                        explorer.minimized = false;
+                    }
+                    self.focus = Focus::Explorer;
+                }
                 PointerOutcome::Handled
             }
             Some(index) => {
@@ -1681,8 +1902,35 @@ impl Shell {
             if Self::close_rect(e).contains(x, y) {
                 return self.execute(Command::Close, Place::Explorer);
             }
+            if Self::max_rect(e).contains(x, y) {
+                let command = if e.restore.is_some() {
+                    Command::Restore
+                } else {
+                    Command::Maximize
+                };
+                return self.execute(command, Place::Explorer);
+            }
+            if Self::min_rect(e).contains(x, y) {
+                return self.execute(Command::Minimize, Place::Explorer);
+            }
+            if Self::icon_rect(e).contains(x, y) {
+                let at = (e.rect.left + 3, e.rect.top + 3 + CAPTION);
+                return self.open_menu(MenuOwner::Window, Some(at), false);
+            }
             if Self::caption_rect(e).contains(x, y) {
-                self.drag = Some((x - e.rect.left, y - e.rect.top));
+                let (maximized, origin) = (e.restore.is_some(), (e.rect.left, e.rect.top));
+                if self.double_click(ClickTarget::Caption) {
+                    let command = if maximized {
+                        Command::Restore
+                    } else {
+                        Command::Maximize
+                    };
+                    return self.execute(command, Place::Explorer);
+                }
+                // A maximized window does not move.
+                if !maximized {
+                    self.drag = Some((x - origin.0, y - origin.1));
+                }
                 return;
             }
             if let Some(index) = self.bar_rects().iter().position(|r| r.contains(x, y)) {
@@ -1751,6 +1999,11 @@ impl Shell {
     ) -> PointerOutcome {
         let captured = std::mem::take(&mut self.captured);
         self.drag = None;
+        if let Some((index, pressed)) = self.tray_press.take() {
+            if pressed == button {
+                return PointerOutcome::Tray(index, TrayEvent::Up(button));
+            }
+        }
         if button == Button::Right
             && self.dialog.is_none()
             && self.menu.is_none()
@@ -1779,6 +2032,13 @@ impl Shell {
 
     /// Pointer motion; returns whether the shell consumed it.
     pub fn pointer_move(&mut self, x: i32, y: i32) -> bool {
+        // Tooltips over the notification area.
+        let over_tray = self.tray_rect().contains(x, y);
+        let previous = self.hover_target();
+        self.hover = over_tray.then_some((x, y));
+        if self.hover_target() != previous {
+            return true;
+        }
         if let Some((grab_x, grab_y)) = self.drag {
             let screen = self.screen;
             if let Some(explorer) = self.explorer.as_mut() {
@@ -1896,7 +2156,7 @@ impl Shell {
         }
         let place = match self.focus {
             Focus::Program => return false,
-            Focus::Explorer if self.explorer.is_some() => Place::Explorer,
+            Focus::Explorer if self.explorer_visible() => Place::Explorer,
             _ => Place::Desktop,
         };
         // Shortcut keys shared by the desktop and folder windows.
@@ -1927,6 +2187,10 @@ impl Shell {
             return true;
         }
         if place == Place::Explorer {
+            if key == Key::Char(' ') && mods.alt {
+                self.open_menu(MenuOwner::Window, None, true);
+                return true;
+            }
             if key == Key::F10 && !mods.shift {
                 self.open_menu(MenuOwner::Bar(0), None, false);
                 return true;
@@ -2035,6 +2299,7 @@ impl Shell {
             }
             Layer::Top => {
                 self.paint_taskbar(&mut p, tasks);
+                self.paint_tray(&mut p);
                 if let Some(open) = &self.menu {
                     popup::paint(&mut p, &open.menu);
                 }
@@ -2104,7 +2369,7 @@ impl Shell {
     }
 
     fn paint_explorer(&self, p: &mut Painter<'_>) {
-        let Some(e) = &self.explorer else {
+        let Some(e) = self.explorer.as_ref().filter(|e| !e.minimized) else {
             return;
         };
         let volume = self.volume.as_ref();
@@ -2130,7 +2395,7 @@ impl Shell {
             Some(name) => name.clone(),
             None => volume.map(Volume::label).unwrap_or_default(),
         };
-        let shown = fit(&title, caption.width() - 46);
+        let shown = fit(&title, caption.width() - 80);
         p.text(
             caption.left + 21,
             caption.top + 2,
@@ -2139,6 +2404,12 @@ impl Shell {
             true,
         );
         user::caption_button(p, Self::close_rect(e), 0);
+        user::caption_button(
+            p,
+            Self::max_rect(e),
+            if e.restore.is_some() { 3 } else { 1 },
+        );
+        user::caption_button(p, Self::min_rect(e), 2);
         // Menu bar.
         let hot_bar = match self.menu.as_ref().map(|m| m.owner) {
             Some(MenuOwner::Bar(index)) => Some(index),
@@ -2365,6 +2636,97 @@ impl Shell {
                 false,
             );
         });
+    }
+
+    /// What the pointer rests on in the notification area: an icon, or the
+    /// clock (`usize::MAX`).
+    fn hover_target(&self) -> Option<usize> {
+        let (x, y) = self.hover?;
+        (0..self.tray.len())
+            .find(|&i| self.tray_icon_rect(i).contains(x, y))
+            .or_else(|| self.clock_rect().contains(x, y).then_some(usize::MAX))
+    }
+
+    fn paint_tray(&self, p: &mut Painter<'_>) {
+        let tray = self.tray_rect();
+        p.edge(
+            tray,
+            sys_color(16),
+            sys_color(15),
+            sys_color(20),
+            sys_color(15),
+        );
+        for (index, item) in self.tray.iter().enumerate() {
+            let rect = self.tray_icon_rect(index);
+            match &item.icon {
+                Some(icon) => icons::draw(p, icon, rect.left, rect.top, 16, false),
+                None => icons::draw(
+                    p,
+                    &icons::builtin(Builtin::Program),
+                    rect.left,
+                    rect.top,
+                    16,
+                    false,
+                ),
+            }
+        }
+        let (hour, minute, weekday, day, month, year) = local_time();
+        self.clock_minute.set(minute);
+        let clock = self.clock_rect();
+        let text = format!("{hour:02}:{minute:02}");
+        let width = text_width(text.as_bytes());
+        p.text(
+            clock.left + (clock.width() - width) / 2,
+            clock.top + (clock.height() - 13) / 2,
+            text.as_bytes(),
+            0x000000,
+            false,
+        );
+
+        // Tooltip: the icon's tip, or the date over the clock.
+        let tip = match self.hover_target() {
+            Some(usize::MAX) => {
+                const DAYS: [&str; 7] = [
+                    "Sunday",
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                ];
+                const MONTHS: [&str; 12] = [
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
+                ];
+                format!("{}, {} {day}, {year}", DAYS[weekday], MONTHS[month])
+            }
+            Some(index) => self
+                .tray
+                .get(index)
+                .map(|item| item.tip.clone())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        if let (false, Some((x, _))) = (tip.is_empty(), self.hover) {
+            let text = bytes(&tip);
+            let width = text_width(&text) + 8;
+            let left = (x - width / 2).clamp(2, self.screen.0 - width - 2);
+            let rect = Rect::sized(left, tray.top - 24, width, 19);
+            p.fill(rect, sys_color(24));
+            p.edge(rect, 0x000000, sys_color(24), 0x000000, sys_color(24));
+            p.text(rect.left + 4, rect.top + 3, &text, sys_color(23), false);
+        }
     }
 
     fn paint_taskbar(&self, p: &mut Painter<'_>, tasks: &[Task]) {

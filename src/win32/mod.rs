@@ -13,6 +13,7 @@ pub mod crt;
 pub mod cxx;
 pub mod gdi;
 pub mod gfx;
+pub mod icon;
 pub mod kernel32;
 pub mod menu;
 pub mod ole;
@@ -197,6 +198,39 @@ pub struct GuestMessage {
     pub lparam: u32,
 }
 
+/// An icon in the taskbar notification area (`NOTIFYICONDATA`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrayIcon {
+    pub hwnd: u32,
+    pub id: u32,
+    /// Message posted to `hwnd` for mouse events on the icon.
+    pub callback: u32,
+    pub icon: u32,
+    pub tip: String,
+}
+
+impl GuiState {
+    /// The small image of an icon handle.
+    pub fn small_icon(&self, handle: u32) -> Option<&icon::IconImage> {
+        self.icons.get(&handle).map(|icon| &icon.small)
+    }
+
+    /// Report a mouse event (`WM_LBUTTONDOWN`, ...) on tray icon `index` to
+    /// the program, as its callback message.
+    pub fn tray_event(&mut self, index: usize, mouse_message: u32) {
+        if let Some(icon) = self.tray.get(index).cloned() {
+            if icon.callback != 0 {
+                self.enqueue(GuestMessage {
+                    hwnd: icon.hwnd,
+                    message: icon.callback,
+                    wparam: icon.id,
+                    lparam: mouse_message,
+                });
+            }
+        }
+    }
+}
+
 /// A registered window class.
 #[derive(Clone, Debug, Default)]
 pub struct GuestClass {
@@ -335,6 +369,11 @@ pub struct GuiState {
     pub pending_activate: Option<u32>,
     /// Another program became the foreground: deactivate this one.
     pub pending_deactivate: bool,
+    /// Images behind icon handles (`LoadIconA`).
+    pub icons: HashMap<u32, icon::Icon>,
+    /// This program's icons in the taskbar notification area
+    /// (`Shell_NotifyIconA`), in the order they were added.
+    pub tray: Vec<TrayIcon>,
     /// BeginDeferWindowPos batches.
     pub deferred: std::collections::HashMap<u32, Vec<[u32; 7]>>,
     /// Accelerator tables: (fVirt flags, key, command).
@@ -383,6 +422,8 @@ impl Default for GuiState {
             pending_chars: VecDeque::new(),
             pending_activate: None,
             pending_deactivate: false,
+            icons: HashMap::new(),
+            tray: Vec::new(),
             deferred: std::collections::HashMap::new(),
             accelerators: std::collections::HashMap::new(),
             idle_exits: 0,
@@ -2083,13 +2124,14 @@ mod shell32 {
             "DragQueryFileA" => 4,
             "ShellAboutA" => 4,
             "ShellExecuteA" => 6,
+            "Shell_NotifyIcon" | "Shell_NotifyIconA" => 2,
             _ => return None,
         })
     }
 
     pub(super) fn dispatch<M: GuestMemory + ?Sized>(
-        _ctx: &ApiContext,
-        _memory: &mut M,
+        ctx: &ApiContext,
+        memory: &mut M,
         name: &ImportName,
         args: &[u32],
     ) -> Option<ApiOutcome> {
@@ -2099,12 +2141,78 @@ mod shell32 {
             return None;
         }
         let value = match name {
+            "Shell_NotifyIcon" | "Shell_NotifyIconA" => notify_icon(ctx, memory, args[0], args[1]),
             "DragQueryFileA" | "DragAcceptFiles" | "DragFinish" | "ShellAboutA" => 0,
             "ShellExecuteA" => 1,
             _ => return None,
         };
         Some(ApiOutcome::new(value, count))
     }
+}
+
+/// `Shell_NotifyIconA(message, NOTIFYICONDATA*)`: add, change or remove
+/// an icon in the taskbar notification area.
+fn notify_icon<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    message: u32,
+    data: u32,
+) -> u32 {
+    const NIF_MESSAGE: u32 = 1;
+    const NIF_ICON: u32 = 2;
+    const NIF_TIP: u32 = 4;
+    let read = |memory: &mut M, offset: u32| memory.read_u32(data + offset).unwrap_or(0);
+    let (hwnd, id, flags) = (read(memory, 4), read(memory, 8), read(memory, 12));
+    let callback = read(memory, 16);
+    let icon = read(memory, 20);
+    let tip = {
+        let mut bytes = read_cstr(memory, data + 24);
+        bytes.truncate(63);
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let mut shared = ctx.shared.borrow_mut();
+    let tray = &mut shared.gui.tray;
+    let index = tray.iter().position(|t| t.hwnd == hwnd && t.id == id);
+    let result = match (message, index) {
+        (0, None) => {
+            let mut entry = TrayIcon {
+                hwnd,
+                id,
+                ..TrayIcon::default()
+            };
+            if flags & NIF_MESSAGE != 0 {
+                entry.callback = callback;
+            }
+            if flags & NIF_ICON != 0 {
+                entry.icon = icon;
+            }
+            if flags & NIF_TIP != 0 {
+                entry.tip = tip;
+            }
+            tray.push(entry);
+            1
+        }
+        (1, Some(index)) => {
+            let entry = &mut tray[index];
+            if flags & NIF_MESSAGE != 0 {
+                entry.callback = callback;
+            }
+            if flags & NIF_ICON != 0 {
+                entry.icon = icon;
+            }
+            if flags & NIF_TIP != 0 {
+                entry.tip = tip;
+            }
+            1
+        }
+        (2, Some(index)) => {
+            tray.remove(index);
+            1
+        }
+        _ => 0,
+    };
+    shared.gui.dirty = true;
+    result
 }
 
 // ── SHLWAPI ────────────────────────────────────────────────────────────────

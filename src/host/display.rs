@@ -40,6 +40,7 @@ use crate::{
         setup,
         volume::{parse_path, Volume},
         Button as ShellButton, Key as ShellKey, Layer, Mods, PointerOutcome, Shell, Task,
+        TrayEvent, TrayItem,
     },
     win32::{GuestMessage, GuiState, SharedState},
 };
@@ -677,6 +678,16 @@ impl Host {
             }
         }
         self.after_programs();
+        let tray = self
+            .app
+            .tray_list()
+            .into_iter()
+            .map(|(_, _, item)| item)
+            .collect();
+        self.app.shell.set_tray(tray);
+        if self.app.shell.clock_changed() {
+            self.app.needs_render = true;
+        }
         self.app.sync_title();
         self.app.run_script();
         self.app.render_if_requested();
@@ -1054,6 +1065,71 @@ impl GuestApp {
         self.needs_render = true;
     }
 
+    /// Every program's notification-area icons: (program state, index in
+    /// that program's list, what the shell shows).
+    fn tray_list(&self) -> Vec<(Rc<RefCell<SharedState>>, usize, TrayItem)> {
+        let mut items = Vec::new();
+        for state in self.states() {
+            let shared = state.borrow();
+            for (index, icon) in shared.gui.tray.iter().enumerate() {
+                let image = shared.gui.small_icon(icon.icon).cloned();
+                items.push((
+                    state.clone(),
+                    index,
+                    TrayItem {
+                        icon: image,
+                        tip: icon.tip.clone(),
+                    },
+                ));
+            }
+        }
+        items
+    }
+
+    /// A click on a notification-area icon goes to its program as the
+    /// icon's callback message; pressing it brings the program forward, so
+    /// a menu it opens gets the mouse.
+    fn tray_event(&mut self, index: usize, event: TrayEvent) {
+        let Some((state, local, _)) = self.tray_list().into_iter().nth(index) else {
+            return;
+        };
+        if !matches!(event, TrayEvent::Up(_)) {
+            if let Some(program) = self
+                .session
+                .programs()
+                .into_iter()
+                .find(|p| Rc::ptr_eq(&p.shared, &state))
+            {
+                self.session.bring_to_front(program.pid);
+                self.sync_foreground();
+            }
+        }
+        state.borrow_mut().gui.tray_event(local, event.message());
+        self.needs_render = true;
+    }
+
+    /// Minimize a taskbar button's window, as clicking the button of the
+    /// window in use does; the desktop takes the focus.
+    fn minimize_task(&mut self, index: usize) {
+        let Some((_, pid, hwnd)) = self.task_list().into_iter().nth(index) else {
+            return;
+        };
+        let state = match pid {
+            Some(pid) => self.session.program(pid).map(|p| p.shared.clone()),
+            None => Some(self.base.clone()),
+        };
+        if let (Some(state), true) = (state, hwnd != 0) {
+            state.borrow_mut().gui.enqueue(GuestMessage {
+                hwnd,
+                message: 0x0112,
+                wparam: 0xF020,
+                lparam: 0,
+            }); // WM_SYSCOMMAND SC_MINIMIZE
+        }
+        self.shell.focus_desktop();
+        self.needs_render = true;
+    }
+
     /// Whether a program window (emulated or drawn by the fallback
     /// renderer) is under a desktop point.
     fn program_at(&self, x: i32, y: i32) -> bool {
@@ -1211,6 +1287,7 @@ impl GuestApp {
         };
         if let Some(shell_button) = shell_button {
             let program_hit = self.program_at(x, y);
+            let program_focused = !self.shell.wants_keyboard();
             let outcome = if down {
                 let tasks = self.tasks();
                 self.shell
@@ -1228,7 +1305,17 @@ impl GuestApp {
                     return;
                 }
                 PointerOutcome::Task(index) => {
-                    self.activate_task(index);
+                    // The button of the window in use minimizes it.
+                    let active = self.tasks().get(index).is_some_and(|task| task.active);
+                    if program_focused && active {
+                        self.minimize_task(index);
+                    } else {
+                        self.activate_task(index);
+                    }
+                    return;
+                }
+                PointerOutcome::Tray(index, event) => {
+                    self.tray_event(index, event);
                     return;
                 }
                 PointerOutcome::Unhandled => {

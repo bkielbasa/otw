@@ -189,6 +189,54 @@ fn locate(ctx: &ApiContext, menu: u32, item: u32, flags: u32) -> Option<(u32, us
     search(&shared.gui, menu, item, 0)
 }
 
+/// Show a window's window menu (the system menu) and carry out the chosen
+/// command. Items are enabled for the window's state, as in Windows: Restore
+/// only when minimized or maximized, Move and Size only when restored, and
+/// so on. It opens below the caption icon, or at `at` (screen coordinates).
+pub fn track_system_menu<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    hwnd: u32,
+    at: Option<(i32, i32)>,
+) {
+    let menu = sys_menu(ctx, hwnd);
+    let (x, y) = {
+        let mut shared = ctx.shared.borrow_mut();
+        let Some(window) = shared.gui.window(hwnd).cloned() else {
+            return;
+        };
+        let sizable = window.style & user::WS_THICKFRAME != 0;
+        let restored = !window.maximized && !window.minimized;
+        let enabled = |id: u32| match id {
+            0xF120 => !restored,
+            0xF010 => restored,
+            0xF000 => restored && sizable,
+            0xF020 => window.style & user::WS_MINIMIZEBOX != 0 && !window.minimized,
+            0xF030 => window.style & user::WS_MAXIMIZEBOX != 0 && !window.maximized,
+            _ => true,
+        };
+        if let Some(menu) = shared.gui.menus.get_mut(&menu) {
+            for item in &mut menu.items {
+                if item.id != 0 {
+                    item.flags = if enabled(item.id) {
+                        item.flags & !MF_GRAYED
+                    } else {
+                        item.flags | MF_GRAYED
+                    };
+                }
+            }
+        }
+        let frame = frame_width(window.style, window.ex_style);
+        let (wx, wy) = user::window_screen_origin(&shared.gui, hwnd);
+        at.unwrap_or((wx + frame, wy + frame + CAPTION_HEIGHT))
+    };
+    // TPM_RETURNCMD | TPM_NONOTIFY: the program sees only WM_SYSCOMMAND.
+    let command = track_popup(ctx, memory, menu, 0x100 | 0x80, x, y, hwnd);
+    if command != 0 {
+        send(ctx, memory, hwnd, user::WM_SYSCOMMAND, command, 0);
+    }
+}
+
 fn sys_menu(ctx: &ApiContext, hwnd: u32) -> u32 {
     let existing = {
         let shared = ctx.shared.borrow();

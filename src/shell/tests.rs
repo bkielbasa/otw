@@ -375,7 +375,7 @@ fn every_layer_paints() {
     }
     // Desktop teal, taskbar face, and the Start menu's banner.
     assert_eq!(surface.get(1000, 600), Some(0x008080));
-    assert_eq!(surface.get(1000, 690), Some(0xC0C0C0));
+    assert_eq!(surface.get(600, 690), Some(0xC0C0C0));
     let menu = f
         .shell
         .menu
@@ -399,4 +399,103 @@ fn every_layer_paints() {
         assert_ne!(icon, icons::builtin(Builtin::Program));
     }
     assert!(row < f.shell.visible_rows(e));
+}
+
+#[test]
+fn folder_window_minimizes_maximizes_and_restores() {
+    let mut f = fixture("winstate");
+    f.shell.explore(parse_path(setup::WINDOWS));
+    let normal = f.shell.explorer.as_ref().unwrap().rect;
+
+    // The maximize button fills the desktop above the taskbar.
+    let max = Shell::max_rect(f.shell.explorer.as_ref().unwrap());
+    click(&mut f.shell, center(max));
+    assert_eq!(
+        f.shell.explorer.as_ref().unwrap().rect,
+        Rect::new(0, 0, 1024, 700 - TASKBAR_HEIGHT)
+    );
+    // Double-clicking the title bar restores it.
+    let caption = Shell::caption_rect(f.shell.explorer.as_ref().unwrap());
+    double_click(&mut f.shell, (caption.left + 100, caption.top + 8));
+    assert_eq!(f.shell.explorer.as_ref().unwrap().rect, normal);
+
+    // Minimize hides it; its taskbar button brings it back, and clicking
+    // the button of the window in use minimizes it again.
+    let min = Shell::min_rect(f.shell.explorer.as_ref().unwrap());
+    click(&mut f.shell, center(min));
+    assert!(!f.shell.foreground_explorer());
+    assert!(!f.shell.in_explorer(normal.left + 50, normal.top + 50));
+    let button = center(f.shell.task_rects(1)[0]);
+    click(&mut f.shell, button);
+    assert!(f.shell.foreground_explorer());
+    click(&mut f.shell, button);
+    assert!(!f.shell.foreground_explorer());
+    click(&mut f.shell, button);
+
+    // The window menu from the keyboard: Alt+Space, X maximizes; from the
+    // caption icon, R restores.
+    f.shell.key(
+        Key::Char(' '),
+        Mods {
+            alt: true,
+            ..Mods::default()
+        },
+    );
+    assert!(f.shell.menu_open());
+    press(&mut f.shell, Key::Char('x'));
+    assert!(f.shell.explorer.as_ref().unwrap().restore.is_some());
+    let icon = Shell::icon_rect(f.shell.explorer.as_ref().unwrap());
+    click(&mut f.shell, center(icon));
+    press(&mut f.shell, Key::Char('r'));
+    assert_eq!(f.shell.explorer.as_ref().unwrap().rect, normal);
+}
+
+#[test]
+fn tray_icons_report_clicks_and_show_tips() {
+    let mut f = fixture("tray");
+    f.shell.set_tray(vec![TrayItem {
+        icon: None,
+        tip: "Volume".into(),
+    }]);
+    let icon = center(f.shell.tray_icon_rect(0));
+    // The clock and icon take space from the task buttons.
+    assert!(f.shell.task_rects(1)[0].right <= f.shell.tray_rect().left);
+
+    assert_eq!(
+        f.shell
+            .pointer_down(icon.0, icon.1, Button::Left, false, &[]),
+        PointerOutcome::Tray(0, TrayEvent::Down(Button::Left))
+    );
+    assert_eq!(
+        f.shell.pointer_up(icon.0, icon.1, Button::Left, false),
+        PointerOutcome::Tray(0, TrayEvent::Up(Button::Left))
+    );
+    assert_eq!(
+        f.shell
+            .pointer_down(icon.0, icon.1, Button::Left, false, &[]),
+        PointerOutcome::Tray(0, TrayEvent::DoubleClick(Button::Left))
+    );
+    f.shell.pointer_up(icon.0, icon.1, Button::Left, false);
+    assert_eq!(
+        f.shell
+            .pointer_down(icon.0, icon.1, Button::Right, false, &[]),
+        PointerOutcome::Tray(0, TrayEvent::Down(Button::Right))
+    );
+    assert_eq!(
+        f.shell.pointer_up(icon.0, icon.1, Button::Right, false),
+        PointerOutcome::Tray(0, TrayEvent::Up(Button::Right))
+    );
+    assert_eq!(TrayEvent::DoubleClick(Button::Left).message(), 0x203);
+    assert_eq!(TrayEvent::Up(Button::Right).message(), 0x205);
+
+    // Hovering shows the tip above the taskbar.
+    assert!(f.shell.pointer_move(icon.0, icon.1));
+    let mut surface = Surface::new(1024, 700, 24);
+    f.shell.paint(&mut surface, Layer::Top, &[]);
+    let tray = f.shell.tray_rect();
+    assert_eq!(
+        surface.get(icon.0, tray.top - 20),
+        Some(0xFFFFE1),
+        "tooltip background"
+    );
 }

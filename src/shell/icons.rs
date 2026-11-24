@@ -1,15 +1,11 @@
 //! Shell icons: a small built-in set in the Win95 style, and the genuine
 //! icons stored in program files (`RT_GROUP_ICON` / `RT_ICON` resources).
 
-use crate::{win32::gfx::Rgb, win32::user::Painter};
+use crate::{win32::gfx::Rgb, win32::icon, win32::user::Painter};
 
 /// A decoded icon; `None` pixels are transparent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Bitmap {
-    pub width: i32,
-    pub height: i32,
-    pub pixels: Vec<Option<Rgb>>,
-}
+/// A decoded icon; `None` pixels are transparent.
+pub use crate::win32::icon::IconImage as Bitmap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
@@ -336,106 +332,9 @@ pub fn from_pe(bytes: &[u8], size: i32) -> Option<Bitmap> {
         base: image.rva_to_offset(rsrc_rva)?,
     };
     let group = resources.find(14, None)?;
-    let count = u16_at(group, 4)? as usize;
-    // Prefer the requested size with the most colours up to 256.
-    let mut best: Option<(i32, u32, u32)> = None;
-    for index in 0..count.min(64) {
-        let entry = 6 + index * 14;
-        let width = match *group.get(entry)? {
-            0 => 256,
-            w => w as i32,
-        };
-        let bits = u16_at(group, entry + 6)?;
-        let id = u16_at(group, entry + 12)?;
-        let score = (width - size).abs() * 64 - if bits <= 8 { bits as i32 } else { 0 };
-        if best.map_or(true, |(s, _, _)| score < s) {
-            best = Some((score, id, bits));
-        }
-    }
-    let (_, id, _) = best?;
-    let bitmap = decode_dib(resources.find(3, Some(id))?)?;
-    Some(if bitmap.width == size {
-        bitmap
-    } else {
-        scale(&bitmap, size)
-    })
-}
-
-fn scale(bitmap: &Bitmap, size: i32) -> Bitmap {
-    let mut pixels = Vec::with_capacity((size * size) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            pixels.push(
-                bitmap.pixels[((y * bitmap.height / size) * bitmap.width + x * bitmap.width / size)
-                    as usize],
-            );
-        }
-    }
-    Bitmap {
-        width: size,
-        height: size,
-        pixels,
-    }
-}
-
-/// Decode an icon image: BITMAPINFOHEADER, palette, XOR bits, AND mask.
-fn decode_dib(dib: &[u8]) -> Option<Bitmap> {
-    let header = u32_at(dib, 0)? as usize;
-    let width = u32_at(dib, 4)? as i32;
-    let height = u32_at(dib, 8)? as i32 / 2;
-    let bits = u16_at(dib, 14)?;
-    if !(1..=256).contains(&width) || !(1..=256).contains(&height) {
-        return None;
-    }
-    let colors = if bits <= 8 {
-        match u32_at(dib, 32)? {
-            0 => 1 << bits,
-            n => n as usize,
-        }
-    } else {
-        0
-    };
-    let palette = header;
-    let xor = palette + colors * 4;
-    let xor_stride = ((width as usize * bits as usize + 31) / 32) * 4;
-    let and = xor + xor_stride * height as usize;
-    let and_stride = ((width as usize + 31) / 32) * 4;
-    let mut pixels = vec![None; (width * height) as usize];
-    for y in 0..height as usize {
-        let row = height as usize - 1 - y;
-        for x in 0..width as usize {
-            let mask = dib.get(and + row * and_stride + x / 8)? >> (7 - x % 8) & 1;
-            if mask != 0 {
-                continue;
-            }
-            let line = xor + row * xor_stride;
-            let rgb = match bits {
-                1 | 4 | 8 => {
-                    let bit = x * bits as usize;
-                    let byte = *dib.get(line + bit / 8)?;
-                    let index =
-                        (byte >> (8 - bits as usize - bit % 8)) & ((1u16 << bits) - 1) as u8;
-                    let entry = palette + index as usize * 4;
-                    (*dib.get(entry + 2)? as u32) << 16
-                        | (*dib.get(entry + 1)? as u32) << 8
-                        | *dib.get(entry)? as u32
-                }
-                24 | 32 => {
-                    let at = line + x * (bits as usize / 8);
-                    (*dib.get(at + 2)? as u32) << 16
-                        | (*dib.get(at + 1)? as u32) << 8
-                        | *dib.get(at)? as u32
-                }
-                _ => return None,
-            };
-            pixels[y * width as usize + x] = Some(rgb);
-        }
-    }
-    Some(Bitmap {
-        width,
-        height,
-        pixels,
-    })
+    let id = icon::pick(group, size)?;
+    let bitmap = icon::decode_dib(resources.find(3, Some(id))?)?;
+    Some(icon::scale(&bitmap, size))
 }
 
 #[cfg(test)]
