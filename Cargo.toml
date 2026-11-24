@@ -1,0 +1,34 @@
+[package]
+name = "otw-vm"
+version = "0.1.0"
+edition = "2021"
+description = "Open-source Windows 95 compatibility VM: PE loader, IAT dispatcher, and Win32 API layers"
+license = "GPL-2.0-only"
+publish = false
+
+[dependencies]
+# x86-only CPU backend for the VM. Other architectures are not needed yet.
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
+
+# Optional host window for displaying captured guest frames. Kept out of the
+# default build so the packaged static-pie binary stays dependency-free.
+glow = { version = "0.16", optional = true }
+glutin = { version = "0.32", default-features = false, features = ["glx", "x11"], optional = true }
+glutin-winit = { version = "0.5", default-features = false, features = ["glx", "x11"], optional = true }
+winit = { version = "0.30", default-features = false, features = ["x11", "rwh_06"], optional = true }
+
+[features]
+default = []
+# Embed the genuine Win95 NOTEPAD.EXE so the packaged binary is self-contained.
+embedded-target = []
+# Build the host-side OpenGL window and event loop.
+display = ["dep:glow", "dep:glutin", "dep:glutin-winit", "dep:winit"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true

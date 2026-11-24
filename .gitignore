@@ -1,0 +1,18 @@
+# Build output
+/target/
+/dist/
+perf.data*
+
+# Third-party sources downloaded for local experiments
+/qemu-*/
+/qemu-*.tar.*
+
+# Microsoft Windows 95 files are copyrighted and not redistributable. Put
+# your own copies here to run the compatibility tests (see the README).
+/binaries/win95/
+/binaries/disks/OTWDISK.IMG
+/binaries/*.7z
+
+# Decompiler/disassembler output derived from Microsoft's Notepad
+/docs/win95-notepad-decompiled/
+/docs/win95-notepad-disassembly.md
