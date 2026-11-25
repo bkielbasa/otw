@@ -218,6 +218,12 @@ use F::*;
 pub const MSG: Layout = Layout::new(&[P, D, P, P, D, D, D]);
 pub const WNDCLASS: Layout = Layout::new(&[D, P, D, D, P, P, P, P, P, P]);
 pub const WNDCLASSEX: Layout = Layout::sized(&[D, D, P, D, D, P, P, P, P, P, P, P]);
+/// WNDCLASS or WNDCLASSEX, and the index of its first WNDCLASS field (the
+/// Ex form starts with cbSize).
+pub fn window_class(ex: bool) -> (Layout, usize) {
+    if ex { (WNDCLASSEX, 1) } else { (WNDCLASS, 0) }
+}
+
 pub const CREATESTRUCT: Layout = Layout::new(&[P, P, P, P, D, D, D, D, D, P, P, D]);
 pub const PAINTSTRUCT: Layout = Layout::new(&[P, D, A(4), D, D, Bytes(32)]);
 pub const WINDOWPOS: Layout = Layout::new(&[P, P, D, D, D, D, D]);
@@ -269,10 +275,6 @@ enum Dir {
 fn struct_args(name: &str) -> &'static [(usize, Layout, Dir)] {
     use Dir::*;
     match name {
-        "RegisterClassW" | "RegisterClassA" => &[(0, WNDCLASS, In)],
-        "RegisterClassExW" | "RegisterClassExA" => &[(0, WNDCLASSEX, In)],
-        "GetClassInfoW" | "GetClassInfoA" => &[(2, WNDCLASS, Out)],
-        "GetClassInfoExW" | "GetClassInfoExA" => &[(2, WNDCLASSEX, InOut)],
         "BeginPaint" => &[(1, PAINTSTRUCT, Out)],
         "EndPaint" => &[(1, PAINTSTRUCT, In)],
         "GetMenuItemInfoW" | "GetMenuItemInfoA" => &[(3, MENUITEMINFO, InOut)],

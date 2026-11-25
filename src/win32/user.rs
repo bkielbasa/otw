@@ -4680,21 +4680,20 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
 
         // ── Classes ──
         "RegisterClassA" | "RegisterClassExA" => {
-            let base = args[0];
-            let ex = name == "RegisterClassExA";
-            let o = if ex { 4 } else { 0 };
-            let field =
-                |memory: &mut M, offset: u32| memory.read_u32(base + o + offset).unwrap_or(0);
+            // WNDCLASS, or WNDCLASSEX (cbSize first), in the process's layout.
+            let (layout, first) = crate::win32::x64::window_class(name == "RegisterClassExA");
+            let view = crate::win32::x64::View::new(memory, &layout, args[0]);
+            let field = |memory: &mut M, index: usize| view.get32(memory, first + index);
             let style = field(memory, 0);
-            let wndproc = field(memory, 4);
-            let cls_extra = field(memory, 8);
-            let wnd_extra = field(memory, 12);
-            let instance = field(memory, 16);
-            let icon = field(memory, 20);
-            let cursor = field(memory, 24);
-            let background = field(memory, 28);
-            let menu_name = field(memory, 32);
-            let class_va = field(memory, 36);
+            let wndproc = field(memory, 1);
+            let cls_extra = field(memory, 2);
+            let wnd_extra = field(memory, 3);
+            let instance = field(memory, 4);
+            let icon = field(memory, 5);
+            let cursor = field(memory, 6);
+            let background = field(memory, 7);
+            let menu_name = field(memory, 8);
+            let class_va = field(memory, 9);
             let class_name = class_name_from(ctx, memory, class_va);
             let mut shared = ctx.shared.borrow_mut();
             if let Some(existing) = shared
@@ -4751,8 +4750,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 .cloned();
             match class {
                 Some(class) => {
-                    let ex = name == "GetClassInfoExA";
-                    let base = args[2] + if ex { 4 } else { 0 };
+                    let (layout, first) = crate::win32::x64::window_class(name == "GetClassInfoExA");
+                    let view = crate::win32::x64::View::new(memory, &layout, args[2]);
                     let values = [
                         class.style,
                         class.wndproc,
@@ -4770,7 +4769,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                         args[1],
                     ];
                     for (index, value) in values.iter().enumerate() {
-                        let _ = memory.write_u32(base + index as u32 * 4, *value);
+                        view.set(memory, first + index, *value);
                     }
                     ok(1)
                 }

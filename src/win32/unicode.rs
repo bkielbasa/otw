@@ -950,29 +950,22 @@ fn native<M: GuestMemory + ?Sized>(
                 call_a(ctx, memory, dll, "SendDlgItemMessageA", &[dialog, id, msg, wparam, lparam], caller)
             })
         }
-        "RegisterClassW" => {
-            // WNDCLASSW: lpfnWndProc at 4, lpszMenuName at 32, lpszClassName at 36.
-            let mut class = memory.read_bytes(args[0], 40).unwrap_or_else(|| vec![0; 40]);
-            mark_unicode(ctx, u32::from_le_bytes(class[4..8].try_into().unwrap()));
-            for offset in [32usize, 36] {
-                let va = u32::from_le_bytes(class[offset..offset + 4].try_into().unwrap());
-                let converted = ansi_arg(ctx, memory, &mut temps, va);
-                class[offset..offset + 4].copy_from_slice(&converted.to_le_bytes());
-            }
+        "RegisterClassW" | "RegisterClassExW" => {
+            // A copy with ANSI menu and class names (WNDCLASS(EX) fields
+            // 8 and 9, after cbSize in the Ex form).
+            let ex = name == "RegisterClassExW";
+            let (layout, first) = crate::win32::x64::window_class(ex);
+            let size = layout.size(memory.ptr_size() == 8) as usize;
+            let class = memory.read_bytes(args[0], size).unwrap_or_else(|| vec![0; size]);
             let copy = temps.bytes(ctx, memory, &class);
-            call_a(ctx, memory, dll, "RegisterClassA", &[copy], caller)
-        }
-        "RegisterClassExW" => {
-            // WNDCLASSEXW: lpfnWndProc at 8, lpszMenuName at 36, lpszClassName at 40.
-            let mut class = memory.read_bytes(args[0], 48).unwrap_or_else(|| vec![0; 48]);
-            mark_unicode(ctx, u32::from_le_bytes(class[8..12].try_into().unwrap()));
-            for offset in [36usize, 40] {
-                let va = u32::from_le_bytes(class[offset..offset + 4].try_into().unwrap());
+            let view = crate::win32::x64::View::new(memory, &layout, copy);
+            mark_unicode(ctx, view.get32(memory, first + 1));
+            for index in [first + 8, first + 9] {
+                let va = view.get32(memory, index);
                 let converted = ansi_arg(ctx, memory, &mut temps, va);
-                class[offset..offset + 4].copy_from_slice(&converted.to_le_bytes());
+                view.set(memory, index, converted);
             }
-            let copy = temps.bytes(ctx, memory, &class);
-            call_a(ctx, memory, dll, "RegisterClassExA", &[copy], caller)
+            call_a(ctx, memory, dll, if ex { "RegisterClassExA" } else { "RegisterClassA" }, &[copy], caller)
         }
         "GetClassInfoW" | "GetClassInfoExW" => {
             let class_name = ansi_arg(ctx, memory, &mut temps, args[1]);
@@ -981,9 +974,10 @@ fn native<M: GuestMemory + ?Sized>(
             let result = call_a(ctx, memory, dll, a_name, &[args[0], class_name, args[2]], caller);
             if result != 0 {
                 // Point the names back at the caller's string; no menu name.
-                let (menu, class) = if ex { (36, 40) } else { (32, 36) };
-                let _ = memory.write_u32(args[2] + menu, 0);
-                let _ = memory.write_u32(args[2] + class, args[1]);
+                let (layout, first) = crate::win32::x64::window_class(ex);
+                let view = crate::win32::x64::View::new(memory, &layout, args[2]);
+                view.set(memory, first + 8, 0);
+                view.set(memory, first + 9, args[1]);
             }
             result
         }
