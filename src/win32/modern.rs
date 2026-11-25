@@ -26,7 +26,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "FlsAlloc" | "FlsGetValue" | "FlsFree" | "InitializeSListHead" | "AcquireSRWLockExclusive" | "AcquireSRWLockShared" | "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared" | "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" | "InitializeSRWLock" | "InitializeConditionVariable" | "WakeAllConditionVariable" | "WakeConditionVariable" | "InitOnceInitialize" | "SubmitThreadpoolWork" | "CloseThreadpoolWork" | "CancelIo" | "UnregisterApplicationRestart" | "IsCharLowerW" | "IsCharAlphaNumericW" | "IsCharAlphaW" | "IsCharUpperW" | "AddClipboardFormatListener" | "RemoveClipboardFormatListener" | "FlashWindowEx" | "PathIsRelativeW" | "PathGetDriveNumberW" | "PathIsNetworkPathW" | "PathStripPathW" | "PathRemoveExtensionW" | "CloseThemeData" | "ImageNtHeader" | "IsNetworkAlive" | "_TrackMouseEvent" | "BufferedPaintStopAllAnimations" | "ImageList_DragShowNolock" | "BCryptDestroyHash" | "CryptMsgClose" | "DwmIsCompositionEnabled" | "GetSidSubAuthorityCount" | "CryptDestroyHash" => 1,
         "FlsSetValue" | "RegisterApplicationRestart" | "GetAncestor" | "SetDCBrushColor" | "WaitForThreadpoolWorkCallbacks" | "FreeLibraryWhenCallbackReturns" | "PathMatchSpecW" | "PathCanonicalizeW" | "OpenThemeData" | "DragQueryPoint" | "Shell_NotifyIconW" | "IsDestinationReachableW" | "ImmSetCompositionFontW" | "DwmGetColorizationColor" | "CertCloseStore" | "Process32FirstW" | "Process32NextW" | "ChangeWindowMessageFilter" | "CryptReleaseContext" | "GetSidSubAuthority" | "BCryptCloseAlgorithmProvider" | "ImageList_DragMove" | "EndBufferedPaint" | "BufferedPaintRenderAnimation" | "EnableThemeDialogTexture" => 2,
         "InitOnceComplete" | "SetWindowTheme" | "ColorAdjustLuma" | "ColorHLSToRGB" | "GetScrollBarInfo" | "WinVerifyTrust" | "GetLongPathNameW" | "CreateThreadpoolWork" | "CheckTokenMembership" | "DrawThemeParentBackground" | "SleepConditionVariableCS" | "ImageList_DragEnter" => 3,
-        "ColorRGBToHLS" | "PathCompactPathExW" | "GetLocaleInfoEx" | "SetLayeredWindowAttributes" | "ChangeWindowMessageFilterEx" | "NotifyWinEvent" | "GetFinalPathNameByHandleW" | "FindFirstStreamW" | "QueryFullProcessImageNameW" | "GetFileInformationByHandleEx" | "InitOnceBeginInitialize" | "InitOnceExecuteOnce" | "SleepConditionVariableSRW" | "PathCreateFromUrlW" | "SHOpenFolderAndSelectItems" | "DwmSetWindowAttribute" | "BCryptOpenAlgorithmProvider" | "BCryptHashData" | "CryptHashData" | "ConvertStringSecurityDescriptorToSecurityDescriptorW" | "LoadIconMetric" | "TaskDialogIndirect" | "InternetCrackUrlW" | "BCryptFinishHash" | "ImageList_BeginDrag" | "CertGetCertificateContextProperty" | "GetApplicationRestartSettings" => 4,
+        "ColorRGBToHLS" | "PathCompactPathExW" | "GetLocaleInfoEx" | "GetLocaleInfoW" | "SetLayeredWindowAttributes" | "ChangeWindowMessageFilterEx" | "NotifyWinEvent" | "GetFinalPathNameByHandleW" | "FindFirstStreamW" | "QueryFullProcessImageNameW" | "GetFileInformationByHandleEx" | "InitOnceBeginInitialize" | "InitOnceExecuteOnce" | "SleepConditionVariableSRW" | "PathCreateFromUrlW" | "SHOpenFolderAndSelectItems" | "DwmSetWindowAttribute" | "BCryptOpenAlgorithmProvider" | "BCryptHashData" | "CryptHashData" | "ConvertStringSecurityDescriptorToSecurityDescriptorW" | "LoadIconMetric" | "TaskDialogIndirect" | "InternetCrackUrlW" | "BCryptFinishHash" | "ImageList_BeginDrag" | "CertGetCertificateContextProperty" | "GetApplicationRestartSettings" => 4,
         "CompareStringOrdinal" | "GetProductInfo" | "mouse_event" | "CryptAcquireContextW" | "CryptCreateHash" | "CryptGetHashParam" | "GetThemeColor" | "LoadIconWithScaleDown" | "SHParseDisplayName" | "CryptMsgGetParam" | "CertNameToStrW" | "BeginBufferedPaint" => 5,
         "CopyFileExW" | "ReplaceFileW" | "GetTimeFormatEx" | "AssocQueryStringW" | "DrawThemeBackground" | "GetThemeFont" | "GetThemeTransitionDuration" | "ImmSetCompositionStringW" | "CertGetNameStringW" | "CertFindCertificateInStore" | "GetThemeBackgroundContentRect" | "BCryptGetProperty" => 6,
         "GetDateFormatEx" | "GetThemePartSize" | "GetTextExtentExPointW" | "GetTextExtentExPointA" | "RegGetValueW" | "BCryptCreateHash" => 7,
@@ -174,7 +174,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         // Locale-name forms of the locale functions: the user's locale.
         "CompareStringEx" => ok(call(ctx, memory, "KERNEL32.dll", "CompareStringW", &[lcid, args[1], args[2], args[3], args[4], args[5]])),
         "LCMapStringEx" => ok(call(ctx, memory, "KERNEL32.dll", "LCMapStringW", &[lcid, args[1], args[2], args[3], args[4], args[5]])),
-        "GetLocaleInfoEx" => ok(call(ctx, memory, "KERNEL32.dll", "GetLocaleInfoW", &[lcid, args[1], args[2], args[3]])),
+        "GetLocaleInfoEx" | "GetLocaleInfoW" => ok(get_locale_info(ctx, memory, args[1], args[2], args[3], true)),
         "GetDateFormatEx" => ok(call(ctx, memory, "KERNEL32.dll", "GetDateFormatW", &[lcid, args[1], args[2], args[3], args[4], args[5]])),
         "GetTimeFormatEx" => ok(call(ctx, memory, "KERNEL32.dll", "GetTimeFormatW", &[lcid, args[1], args[2], args[3], args[4], args[5]])),
         "CompareStringOrdinal" => {
@@ -554,3 +554,116 @@ fn hls_to_rgb(h: u16, l: u16, s: u16) -> u32 {
     to(r) | to(g) << 8 | to(b) << 16
 }
 
+
+/// The user's locale, English (United States): the value of a LOCALE_*
+/// type as text.
+pub fn locale_value(lctype: u32) -> Option<String> {
+    const DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+        "December",
+    ];
+    let text = match lctype {
+        0x01 | 0x09 => "0409",
+        0x02 => "English (United States)",
+        0x03 => "ENU",
+        0x04 => "English",
+        0x05 | 0x0A => "1",
+        0x06 | 0x08 | 0x1002 => "United States",
+        0x07 | 0x68 => "USA",
+        0x0B => "437",
+        0x0C | 0x0F | 0x17 => ",",
+        0x0D => "1",
+        0x0E | 0x16 => ".",
+        0x10 | 0x18 => "3;0",
+        0x11 | 0x19 | 0x1A => "2",
+        0x12 | 0x24 => "1",
+        0x13 => "0123456789",
+        0x14 => "$",
+        0x15 => "USD",
+        0x1B | 0x1C | 0x21 | 0x22 | 0x23 | 0x25 | 0x26 | 0x27 => "0",
+        0x1D => "/",
+        0x1E => ":",
+        0x1F => "M/d/yyyy",
+        0x20 => "dddd, MMMM d, yyyy",
+        0x28 => "AM",
+        0x29 => "PM",
+        0x2A..=0x30 => return Some(DAYS[(lctype - 0x2A) as usize].into()),
+        0x31..=0x37 => return Some(DAYS[(lctype - 0x31) as usize][..3].into()),
+        0x38..=0x43 => return Some(MONTHS[(lctype - 0x38) as usize].into()),
+        0x44..=0x4F => return Some(MONTHS[(lctype - 0x44) as usize][..3].into()),
+        0x60..=0x66 => return Some(DAYS[(lctype - 0x60) as usize][..2].into()),
+        0x50 => "",
+        0x51 => "-",
+        0x52 => "3",
+        0x53 | 0x55 | 0x57 | 0x70 | 0x71 | 0x1005 | 0x100B | 0x100D => "0",
+        0x54 | 0x56 | 0x1009 | 0x100A | 0x1010 | 0x1015 | 0x74 | 0x75 => "1",
+        0x59 | 0x6D => "en",
+        0x5A => "US",
+        0x5C | 0x6E | 0x7B => "en-US",
+        0x5D => "h:mm:ss",
+        0x67 => "eng",
+        0x69 => "NaN",
+        0x6A => "Infinity",
+        0x6B => "-Infinity",
+        0x6C => "Latn;",
+        0x6F | 0x72 | 0x73 => "English (United States)",
+        0x76 => "%",
+        0x77 => "\u{2030}",
+        0x78 => "MMMM d",
+        0x79 => "h:mm tt",
+        0x7A => "ENG",
+        0x1001 => "English",
+        0x1003 => "h:mm:ss tt",
+        0x1004 => "1252",
+        0x1006 => "MMMM yyyy",
+        0x1007 | 0x1008 => "US Dollar",
+        0x100C => "6",
+        0x1011 => "10000",
+        0x1012 => "037",
+        0x1014 => "Default",
+        _ => return None,
+    };
+    Some(text.into())
+}
+
+/// GetLocaleInfoA/W/Ex(type, buffer, capacity): characters written (or
+/// needed, with no buffer); LOCALE_RETURN_NUMBER gives a DWORD.
+pub fn get_locale_info<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, lctype: u32, buffer: u32, capacity: u32, wide: bool) -> u32 {
+    const RETURN_NUMBER: u32 = 0x2000_0000;
+    let Some(text) = locale_value(lctype & 0x0FFF_FFFF) else {
+        set_error(ctx, 1004); // ERROR_INVALID_FLAGS
+        return 0;
+    };
+    if lctype & RETURN_NUMBER != 0 {
+        let number: u32 = text.parse().unwrap_or(0);
+        let needed = if wide { 2 } else { 4 };
+        if capacity == 0 {
+            return needed;
+        }
+        if capacity < needed || buffer == 0 {
+            set_error(ctx, 122);
+            return 0;
+        }
+        let _ = memory.write_u32(buffer, number);
+        return needed;
+    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let bytes = unicode::wide_to_ansi(&units);
+    let needed = if wide { units.len() } else { bytes.len() } as u32 + 1;
+    if capacity == 0 {
+        return needed;
+    }
+    if capacity < needed || buffer == 0 {
+        set_error(ctx, 122); // ERROR_INSUFFICIENT_BUFFER
+        return 0;
+    }
+    if wide {
+        unicode::write_wide(memory, buffer, &units, true);
+    } else {
+        let mut bytes = bytes;
+        bytes.push(0);
+        let _ = memory.write_bytes(buffer, &bytes);
+    }
+    needed
+}

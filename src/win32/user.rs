@@ -1097,6 +1097,25 @@ pub fn call_wndproc<M: GuestMemory + ?Sized>(
     crate::win32::unicode::call_proc(ctx, memory, proc_va, hwnd, msg, wparam, lparam).unwrap_or(0)
 }
 
+fn print_client<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name: &str, hwnd: u32, target: u32) {
+    let Some((width, height)) = ctx.shared.borrow().gui.window(hwnd).map(client_size) else { return };
+    {
+        let mut shared = ctx.shared.borrow_mut();
+        invalidate(&mut shared.gui, hwnd, None, true, false);
+    }
+    builtin_proc(ctx, memory, name, &[hwnd, WM_PAINT, 0, 0]);
+    let call = |memory: &mut M, dll: &str, function: &str, args: &[u32]| {
+        crate::win32::dispatch_with_memory(ctx, memory, dll, &crate::kernel::pe::ImportName::ByName(function.into()), args, 0)
+            .map(|o| o.value)
+            .unwrap_or(0)
+    };
+    let dc = call(memory, "USER32.dll", "GetDC", &[hwnd]);
+    if dc != 0 {
+        call(memory, "GDI32.dll", "BitBlt", &[target, 0, 0, width as u32, height as u32, dc, 0, 0, 0x00CC_0020]);
+        call(memory, "USER32.dll", "ReleaseDC", &[hwnd, dc]);
+    }
+}
+
 fn builtin_proc<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
     memory: &mut M,
@@ -1104,6 +1123,16 @@ fn builtin_proc<M: GuestMemory + ?Sized>(
     args: &[u32],
 ) -> u32 {
     let (hwnd, msg, wparam, lparam) = (args[0], args[1], args[2], args[3]);
+    // WM_PRINT / WM_PRINTCLIENT to a built-in control: paint it, then copy
+    // its client area into the caller's DC (double-buffered painting).
+    if matches!(msg, 0x0317 | 0x0318)
+        && name.starts_with("OTW_")
+        && !matches!(name, "OTW_SubclassProc" | "OTW_MenuProc")
+        && (msg == 0x0318 || lparam & 0x4 != 0)
+    {
+        print_client(ctx, memory, name, hwnd, wparam);
+        return 0;
+    }
     match name {
         "DefWindowProcA" | "DefMDIChildProcA" => {
             def_window_proc(ctx, memory, hwnd, msg, wparam, lparam)

@@ -169,7 +169,6 @@ fn plan(name: &str) -> Option<Plan> {
         "GetDriveTypeW" => Wrap("GetDriveTypeA", &[In(0)]),
         "GetVolumeInformationW" => Wrap("GetVolumeInformationA", &[In(0), Out(1, 2), Out(6, 7)]),
         "OutputDebugStringW" => Wrap("OutputDebugStringA", &[In(0)]),
-        "GetLocaleInfoW" => Wrap("GetLocaleInfoA", &[Out(2, 3)]),
         "GlobalAddAtomW" => Wrap("GlobalAddAtomA", &[In(0)]),
         "GlobalFindAtomW" => Wrap("GlobalFindAtomA", &[In(0)]),
         "LoadLibraryW" => Wrap("LoadLibraryA", &[In(0)]),
@@ -1339,7 +1338,7 @@ mod tests {
         // The Wrap plans must point at implemented A functions.
         let names = [
             "CreateFileW", "DeleteFileW", "CreateDirectoryW", "SetCurrentDirectoryW", "GetCurrentDirectoryW", "GetDriveTypeW",
-            "GetVolumeInformationW", "OutputDebugStringW", "GetLocaleInfoW",
+            "GetVolumeInformationW", "OutputDebugStringW",
             "GlobalAddAtomW", "GlobalFindAtomW", "LoadLibraryW",
             "LoadLibraryExW", "GetTempPathW", "GetModuleFileNameW", "GetModuleHandleW", "MoveFileExW", "FindResourceW",
             "GetDateFormatW", "GetSystemDirectoryW", "GetWindowsDirectoryW", "CreateWindowExW", "SetWindowTextW",

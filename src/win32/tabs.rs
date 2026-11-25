@@ -51,11 +51,13 @@ pub struct Tabs {
     item_size: (i32, i32),
     min_width: i32,
     extended: u32,
+    /// TCM_SETPADDING: space either side of a label (and above it).
+    padding: (i32, i32),
 }
 
 impl Default for Tabs {
     fn default() -> Self {
-        Self { tabs: Vec::new(), current: -1, focus: -1, image_list: 0, item_size: (0, 0), min_width: 0, extended: 0 }
+        Self { tabs: Vec::new(), current: -1, focus: -1, image_list: 0, item_size: (0, 0), min_width: 0, extended: 0, padding: (PADDING, 3) }
     }
 }
 
@@ -72,8 +74,13 @@ fn tab_height(tabs: &Tabs) -> i32 {
     if tabs.item_size.1 > 0 { tabs.item_size.1 } else { TAB_HEIGHT }
 }
 
-/// Each tab's rectangle, left to right along the top.
-fn rects(tabs: &Tabs, style: u32) -> Vec<Rect> {
+/// Each tab's rectangle, left to right along the top: the label in the
+/// control's font, the padding either side, and the image.
+fn rects(ctx: &ApiContext, hwnd: u32, tabs: &Tabs) -> Vec<Rect> {
+    let style = style(ctx, hwnd);
+    let shared = ctx.shared.borrow();
+    let font = shared.gui.window(hwnd).map(|w| w.font).unwrap_or(0);
+    let face = shared.gdi.font(font).face();
     let height = tab_height(tabs);
     let mut x = 2;
     tabs.tabs
@@ -82,8 +89,8 @@ fn rects(tabs: &Tabs, style: u32) -> Vec<Rect> {
             let width = if style & TCS_FIXEDWIDTH != 0 && tabs.item_size.0 > 0 {
                 tabs.item_size.0
             } else {
-                let image = if tabs.image_list != 0 && tab.image >= 0 { 20 } else { 0 };
-                (user::text_width(&tab.text) + 2 * PADDING + image).max(tabs.min_width.max(0))
+                let image = if tabs.image_list != 0 && tab.image >= 0 { 16 + 3 } else { 0 };
+                (face.text_width(&tab.text) + 2 * tabs.padding.0 + image).max(tabs.min_width.max(0))
             };
             let rect = Rect::new(x, 2, x + width, 2 + height);
             x += width;
@@ -192,7 +199,7 @@ fn paint<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
             (cw, ch, w.parent, w.id)
         })
         .unwrap_or_default();
-    let rects = rects(&tabs, style);
+    let rects = rects(ctx, hwnd, &tabs);
     let strip = tab_height(&tabs) + 2;
     {
         let mut shared = ctx.shared.borrow_mut();
@@ -209,7 +216,7 @@ fn paint<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
                 p.vline(r.right - 1, r.top + 2, r.bottom, sys_color(16));
                 if style & TCS_OWNERDRAWFIXED == 0 {
                     let image = if tabs.image_list != 0 && tab.image >= 0 { 20 } else { 0 };
-                    p.text(r.left + PADDING + image, r.top + 3, &tab.text, sys_color(18), false);
+                    p.text(r.left + tabs.padding.0 + image, r.top + 3, &tab.text, sys_color(18), false);
                 }
             }
         });
@@ -254,7 +261,7 @@ fn click<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, i
 
 fn hit(ctx: &ApiContext, hwnd: u32, x: i32, y: i32) -> i32 {
     let tabs = with_tabs(ctx, hwnd, |t| t.clone());
-    rects(&tabs, style(ctx, hwnd))
+    rects(ctx, hwnd, &tabs)
         .iter()
         .position(|r| r.contains(x, y))
         .map(|i| i as i32)
@@ -337,7 +344,7 @@ pub fn tab_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd:
         // TCM_GETITEMRECT
         0x130A => {
             let tabs = with_tabs(ctx, hwnd, |t| t.clone());
-            match rects(&tabs, style(ctx, hwnd)).get(wparam as usize) {
+            match rects(ctx, hwnd, &tabs).get(wparam as usize) {
                 Some(rect) => {
                     let _ = gdi::write_rect(memory, lparam, *rect);
                     1
@@ -392,6 +399,12 @@ pub fn tab_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd:
             });
             invalidate(ctx, hwnd);
             (old.0 as u32 & 0xFFFF) | ((old.1 as u32) << 16)
+        }
+        // TCM_SETPADDING
+        0x132B => {
+            with_tabs(ctx, hwnd, |t| t.padding = ((lparam & 0xFFFF) as i32, (lparam >> 16) as i32));
+            invalidate(ctx, hwnd);
+            0
         }
         // TCM_GETROWCOUNT
         0x132C => 1,

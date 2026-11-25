@@ -325,10 +325,22 @@ fn with_toolbar<R>(ctx: &ApiContext, hwnd: u32, f: impl FnOnce(&mut Toolbar) -> 
     f(shared.gui.toolbars.entry(hwnd).or_default())
 }
 
+/// TBBUTTON: iBitmap, idCommand, fsState, fsStyle, reserved bytes (2 in a
+/// 32-bit process, 6 in a 64-bit one), dwData, iString.
+const TBBUTTON: crate::win32::x64::Layout = {
+    use crate::win32::x64::F::*;
+    crate::win32::x64::Layout::new(&[D, D, B, B, AlignP, P, P])
+};
+
+fn button_size<M: GuestMemory + ?Sized>(memory: &M) -> u32 {
+    if memory.ptr_size() == 8 { 32 } else { 20 }
+}
+
 fn read_button<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, wide: bool, strings: &[Vec<u8>]) -> Button {
-    let bytes = memory.read_bytes(va, 20).unwrap_or_else(|| vec![0; 20]);
-    let dword = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-    let string = dword(16);
+    let v = crate::win32::x64::View::new(memory, &TBBUTTON, va);
+    let string = v.get32(memory, 6);
+    let (image, command, state, style, data) =
+        (v.get32(memory, 0), v.get32(memory, 1), v.get32(memory, 2) as u8, v.get32(memory, 3) as u8, v.get32(memory, 5));
     let text = if string >= 0x10000 {
         if wide {
             unicode::wide_to_ansi(&unicode::read_wstr(memory, string))
@@ -338,7 +350,7 @@ fn read_button<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, wide: bool, str
     } else {
         strings.get(string as usize).cloned().unwrap_or_default()
     };
-    Button { image: dword(0) as i32, command: dword(4), state: bytes[8], style: bytes[9], data: dword(12), text }
+    Button { image: image as i32, command, state, style, data, text }
 }
 
 fn button_width(toolbar: &Toolbar, button: &Button) -> i32 {
@@ -506,7 +518,11 @@ fn paint_toolbar<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd
 }
 
 fn add_bitmap<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, count: u32, info: u32) -> u32 {
-    let (instance, id) = (memory.read_u32(info).unwrap_or(0), memory.read_u32(info + 4).unwrap_or(0));
+    // TBADDBITMAP: hInst, nID (both pointer-sized).
+    let size = memory.ptr_size();
+    let instance = memory.read_ptr(info).unwrap_or(0);
+    let instance = if instance == u64::MAX { u32::MAX } else { instance as u32 };
+    let id = memory.read_ptr(info + size).unwrap_or(0) as u32;
     let (bw, bh) = with_toolbar(ctx, hwnd, |t| t.bitmap_size);
     let list = with_toolbar(ctx, hwnd, |t| if t.image_list != 0 { t.image_list } else { t.own_list });
     let list = if list != 0 {
@@ -700,7 +716,7 @@ pub fn toolbar_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, h
         0x414 | 0x444 | 0x415 | 0x443 => {
             let strings = with_toolbar(ctx, hwnd, |t| t.strings.clone());
             let wide = msg == 0x444 || msg == 0x443;
-            let size = with_toolbar(ctx, hwnd, |_| 20);
+            let size = button_size(memory);
             let new: Vec<Button> = if msg == 0x414 || msg == 0x444 {
                 (0..wparam.min(1024)).map(|i| read_button(memory, lparam + i * size, wide, &strings)).collect()
             } else {
@@ -725,13 +741,12 @@ pub fn toolbar_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, h
         // TB_GETBUTTON
         0x417 => {
             let Some(button) = with_toolbar(ctx, hwnd, |t| t.buttons.get(wparam as usize).cloned()) else { return 0 };
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&(button.image as u32).to_le_bytes());
-            bytes.extend_from_slice(&button.command.to_le_bytes());
-            bytes.extend_from_slice(&[button.state, button.style, 0, 0]);
-            bytes.extend_from_slice(&button.data.to_le_bytes());
-            bytes.extend_from_slice(&0u32.to_le_bytes());
-            let _ = memory.write_bytes(lparam, &bytes);
+            crate::win32::x64::write_struct(
+                memory,
+                &TBBUTTON,
+                lparam,
+                &[button.image as u32, button.command, button.state as u32, button.style as u32, 0, button.data, 0],
+            );
             1
         }
         // TB_BUTTONCOUNT, TB_COMMANDTOINDEX
@@ -776,7 +791,8 @@ pub fn toolbar_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, h
             let size = ((lparam & 0xFFFF) as i32, (lparam >> 16) as i32);
             with_toolbar(ctx, hwnd, |t| {
                 if msg == 0x41F {
-                    t.button_size = (size.0.max(1), size.1.max(1));
+                    // Never smaller than the images and their padding.
+                    t.button_size = (size.0.max(t.bitmap_size.0 + 7), size.1.max(t.bitmap_size.1 + 6));
                 } else {
                     t.bitmap_size = size;
                     if t.button_size.0 < size.0 + 7 || t.button_size.1 < size.1 + 6 {

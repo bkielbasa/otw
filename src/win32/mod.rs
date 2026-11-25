@@ -2386,14 +2386,7 @@ mod kernel32_base {
                 ApiOutcome::new(cstr_cmp(&left, &right) as u32, count)
             }
 
-            "GetLocaleInfoA" => {
-                if args[3] > 0 && args[2] != 0 {
-                    let _ = write_cstr(memory, args[2], b"0");
-                    ApiOutcome::new(2, count)
-                } else {
-                    ApiOutcome::new(0, count)
-                }
-            }
+            "GetLocaleInfoA" => ApiOutcome::new(modern::get_locale_info(ctx, memory, args[1], args[2], args[3], false), count),
             "GetTimeFormatA" | "GetDateFormatA" => {
                 if args[5] > 0 && args[4] != 0 {
                     let _ = write_cstr(memory, args[4], b"12:00");

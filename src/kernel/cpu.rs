@@ -239,6 +239,9 @@ fn init_teb64(uc: &mut Unicorn<'_, ()>, teb: u32, top: u32, bottom: u32, thread:
         (0x40, 1),                 // ClientId.UniqueProcess
         (0x48, thread as u64),     // ClientId.UniqueThread
         (0x60, peb as u64),        // ProcessEnvironmentBlock
+        // PEB.ProcessParameters: an all-zero RTL_USER_PROCESS_PARAMETERS in
+        // the PEB's unused tail (runtime libraries read its flags).
+        (0x800 + 0x20, (peb + 0x400) as u64),
     ] {
         uc.mem_write((teb + offset) as u64, &value.to_le_bytes())
             .map_err(|error| RunError::Unicorn("initialising the TEB", error))?;
@@ -300,6 +303,66 @@ fn install_tls(uc: &mut Unicorn<'_, ()>, templates: &[Vec<u8>], teb: u32, x64: b
     }
     let slot = if x64 { teb + 0x58 } else { teb + 0x2C };
     uc.mem_write(slot as u64, &(block as u64).to_le_bytes()[..width as usize])
+}
+
+/// CPUID as the emulated processor answers it, without SSE4.2. The
+/// emulator's PCMPESTRI gets "equal ordered" searches wrong, and runtime
+/// libraries (the C++ library's string search among them) use it only when
+/// CPUID reports SSE4.2. Answers come from a scratch engine of the same
+/// model, cached.
+fn hide_sse42(uc: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
+    use std::{collections::HashMap, ffi::c_void};
+    use unicorn_engine::RegisterX86;
+
+    type Engine = *mut c_void;
+    unsafe extern "C" {
+        fn uc_hook_add(uc: Engine, hook: *mut usize, kind: i32, callback: *mut c_void, data: *mut c_void, begin: u64, end: u64, ...) -> i32;
+        fn uc_reg_read(uc: Engine, reg: i32, value: *mut c_void) -> i32;
+        fn uc_reg_write(uc: Engine, reg: i32, value: *const c_void) -> i32;
+    }
+    thread_local! {
+        static ANSWERS: RefCell<HashMap<(u32, u32), [u32; 4]>> = RefCell::new(HashMap::new());
+    }
+
+    fn native(leaf: u32, subleaf: u32) -> [u32; 4] {
+        let run = || -> Result<[u32; 4], uc_error> {
+            let mut scratch = Unicorn::new(Arch::X86, Mode::MODE_64)?;
+            scratch.mem_map(0x1000, 0x1000, unicorn_engine::Prot::ALL)?;
+            scratch.mem_write(0x1000, &[0x0F, 0xA2])?;
+            scratch.reg_write(RegisterX86::RAX, leaf as u64)?;
+            scratch.reg_write(RegisterX86::RCX, subleaf as u64)?;
+            scratch.emu_start(0x1000, 0x1002, 0, 1)?;
+            Ok([RegisterX86::RAX, RegisterX86::RBX, RegisterX86::RCX, RegisterX86::RDX]
+                .map(|reg| scratch.reg_read(reg).unwrap_or(0) as u32))
+        };
+        run().unwrap_or([0; 4])
+    }
+
+    extern "C" fn on_cpuid(uc: Engine, _data: *mut c_void) -> i32 {
+        let read = |reg: RegisterX86| {
+            let mut value = 0u64;
+            unsafe { uc_reg_read(uc, reg as i32, &mut value as *mut u64 as *mut c_void) };
+            value as u32
+        };
+        let (leaf, subleaf) = (read(RegisterX86::EAX), read(RegisterX86::ECX));
+        let mut answer = ANSWERS.with(|answers| *answers.borrow_mut().entry((leaf, subleaf)).or_insert_with(|| native(leaf, subleaf)));
+        if leaf == 1 {
+            answer[2] &= !(1 << 20); // SSE4.2
+        }
+        for (reg, value) in [RegisterX86::RAX, RegisterX86::RBX, RegisterX86::RCX, RegisterX86::RDX].into_iter().zip(answer) {
+            let value = value as u64;
+            unsafe { uc_reg_write(uc, reg as i32, &value as *const u64 as *const c_void) };
+        }
+        1 // the hook answered; skip the instruction
+    }
+
+    const UC_HOOK_INSN: i32 = 1 << 1;
+    const UC_X86_INS_CPUID: i32 = 113;
+    let mut hook = 0usize;
+    let status = unsafe {
+        uc_hook_add(uc.get_handle() as Engine, &mut hook, UC_HOOK_INSN, on_cpuid as *mut c_void, std::ptr::null_mut(), 1, 0, UC_X86_INS_CPUID)
+    };
+    if status == 0 { Ok(()) } else { Err(uc_error::HOOK) }
 }
 
 /// The running thread's TIB.
@@ -1260,6 +1323,12 @@ impl<'a> Process<'a> {
                     eprintln!("{line}");
                 }
             }
+            if std::env::var_os("OTW_TRACE_FAULTS").is_some() {
+                let rip = self.uc.reg_read(unicorn_engine::RegisterX86::RIP).unwrap_or(0);
+                let mut bytes = [0u8; 16];
+                let _ = self.uc.mem_read(rip, &mut bytes);
+                eprintln!("[eh] {error:?} at {rip:#x}: {bytes:02x?}");
+            }
             return Err(RunError::Unicorn("emulating guest code", error));
         }
 
@@ -1294,6 +1363,7 @@ fn build<'a>(
     let x64 = image.is64;
     let mut uc = Unicorn::new(Arch::X86, if x64 { Mode::MODE_64 } else { Mode::MODE_32 })
         .map_err(|error| RunError::Unicorn("creating the CPU", error))?;
+    hide_sse42(&mut uc).map_err(|error| RunError::Unicorn("hooking CPUID", error))?;
 
     for module in &process.modules {
         let image_start = align_down(module.image.image_base, PAGE_SIZE);

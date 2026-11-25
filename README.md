@@ -1,4 +1,4 @@
-# Open Windows Together (otw)
+# Open The Window (otw)
 
 An open-source reimplementation of Windows 95, written in Rust, that runs **unmodified Windows 95 programs** — the genuine Notepad and Paint, with the genuine MFC 3.0 DLLs they ship with — on Linux.
 
