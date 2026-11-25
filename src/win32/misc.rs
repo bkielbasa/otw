@@ -11,33 +11,9 @@ use crate::{
 };
 
 /// Replace `%NAME%` with the Windows 95 environment's value.
-fn expand_environment(text: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.iter().position(|&b| b == b'%') {
-        out.extend_from_slice(&rest[..start]);
-        let after = &rest[start + 1..];
-        let Some(end) = after.iter().position(|&b| b == b'%') else {
-            out.extend_from_slice(&rest[start..]);
-            return out;
-        };
-        let name = String::from_utf8_lossy(&after[..end]).to_ascii_uppercase();
-        let value: Option<&[u8]> = match name.as_str() {
-            "WINDIR" | "SYSTEMROOT" => Some(b"C:\\WINDOWS"),
-            "TEMP" | "TMP" => Some(b"C:\\WINDOWS\\TEMP"),
-            "PROGRAMFILES" => Some(b"C:\\Program Files"),
-            "COMSPEC" => Some(b"C:\\COMMAND.COM"),
-            "SYSTEMDRIVE" => Some(b"C:"),
-            _ => None,
-        };
-        match value {
-            Some(value) => out.extend_from_slice(value),
-            None => out.extend_from_slice(&rest[start..start + end + 2]),
-        }
-        rest = &after[end + 1..];
-    }
-    out.extend_from_slice(rest);
-    out
+fn expand_environment(ctx: &ApiContext, text: &[u8]) -> Vec<u8> {
+    let text = String::from_utf16_lossy(&unicode::ansi_to_wide(text));
+    unicode::wide_to_ansi(&crate::win32::env::expand(ctx, &text).encode_utf16().collect::<Vec<_>>())
 }
 
 pub fn arg_count(name: &str) -> Option<usize> {
@@ -182,7 +158,13 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             0
         }
         "IsDBCSLeadByteEx" => 0,
-        "OpenEventA" | "OpenEventW" | "OpenProcess" => {
+        // OpenProcess(access, inherit, id): this process; no other.
+        "OpenProcess" if args[2] == 1 => 0xFFFF_FFFF,
+        "OpenProcess" => {
+            ctx.shared.borrow_mut().last_error = 87; // ERROR_INVALID_PARAMETER: no such process
+            0
+        }
+        "OpenEventA" | "OpenEventW" => {
             ctx.shared.borrow_mut().last_error = 2;
             0
         }
@@ -425,7 +407,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             } else {
                 crate::win32::read_cstr(memory, args[0])
             };
-            let mut text = expand_environment(&source);
+            let mut text = expand_environment(ctx, &source);
             text.push(0);
             let needed = text.len() as u32;
             if args[1] != 0 && args[2] >= needed {

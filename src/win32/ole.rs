@@ -706,7 +706,14 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     out(memory, args[1], object);
                     ok(if object == 0 { E_OUTOFMEMORY } else { S_OK })
                 }
-                "OleInitialize" | "CoInitialize" | "CoInitializeEx" => ok(S_OK),
+                "OleInitialize" | "CoInitialize" | "CoInitializeEx" => {
+                    // The thread's apartment: multithreaded for
+                    // CoInitializeEx(COINIT_MULTITHREADED), else single.
+                    let apartment = if name == "CoInitializeEx" && args[1] & 2 == 0 { 1 } else { 0 };
+                    let thread = memory.current_thread();
+                    ctx.shared.borrow_mut().nt.apartments.entry(thread).or_insert(apartment);
+                    ok(S_OK)
+                }
                 "OleUninitialize" | "CoUninitialize" | "CoFreeUnusedLibraries" => ok(0),
                 "CoRegisterMessageFilter" => {
                     out(memory, args[1], 0);

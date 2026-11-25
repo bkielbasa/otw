@@ -65,6 +65,37 @@ pub trait GuestMemory {
         }
     }
 
+    /// Map `size` bytes at exactly `va` if that range is free.
+    fn map_exact(&mut self, _va: u32, _size: u32) -> bool {
+        false
+    }
+
+    /// Unmap a range mapped with `map_region` or `map_exact`.
+    fn unmap(&mut self, _va: u32, _size: u32) -> bool {
+        false
+    }
+
+    /// The mapped ranges, as (first, last) addresses inclusive.
+    fn mapped(&mut self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// Add a static TLS template (a DLL loaded at run time with
+    /// `__declspec(thread)` data): every thread gets a copy. Returns the
+    /// module's TLS index.
+    fn add_tls(&mut self, _template: &[u8]) -> Option<u32> {
+        None
+    }
+
+    /// The low 64 bits of XMM register `index` (an x64 floating-point
+    /// argument).
+    fn xmm(&mut self, _index: usize) -> u64 {
+        0
+    }
+
+    /// Set the low 64 bits of XMM0 (an x64 floating-point result).
+    fn set_xmm0(&mut self, _bits: u64) {}
+
     /// Call guest code `func` as `stdcall(args...)` and return its EAX. Only
     /// a running CPU backend can do this; other views return `None`.
     fn call_guest(&mut self, func: u32, args: &[u32]) -> Option<u32> {

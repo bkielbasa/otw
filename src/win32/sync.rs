@@ -98,6 +98,18 @@ fn name_arg<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, wide: bool) -> Opt
 }
 
 /// A new object, or the existing one of that name.
+/// The thread id behind a thread handle (or the current thread's pseudo
+/// handle).
+pub fn thread_id_of(ctx: &ApiContext, memory: &dyn GuestMemory, handle: u32) -> Option<u32> {
+    if handle == 0xFFFF_FFFE {
+        return Some(memory.current_thread());
+    }
+    match ctx.shared.borrow().sync.objects.get(&handle) {
+        Some(Object::Thread { id, .. }) => Some(*id),
+        _ => None,
+    }
+}
+
 fn create(ctx: &ApiContext, name: Option<String>, object: Object) -> u32 {
     let mut shared = ctx.shared.borrow_mut();
     if let Some(name) = &name {

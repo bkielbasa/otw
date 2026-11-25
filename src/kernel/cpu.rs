@@ -25,6 +25,8 @@ use super::{
 pub const STACK_BASE: u32 = 0x0010_0000;
 pub const STACK_SIZE: u32 = 0x0010_0000;
 pub const STACK_TOP: u32 = STACK_BASE + STACK_SIZE - 0x100;
+/// The bottom of a 64-bit program's first stack.
+const X64_STACK_LOW: u32 = 0x0001_0000;
 
 /// Synthetic Win95 pages sit above genuine high-based DLLs. OLE32 loads at
 /// `0x7ff60000` with a `0x86000` image, ending at `0x7ffe6000`, so the TIB,
@@ -34,6 +36,8 @@ pub const STACK_TOP: u32 = STACK_BASE + STACK_SIZE - 0x100;
 /// and writes `FS:[0]` to install its structured exception handler chain.
 pub const TIB_BASE: u32 = 0x7FFF_0000;
 pub const TIB_SIZE: u32 = 0x1000;
+/// A 64-bit thread's TEB (0x1838 bytes) and its process's PEB after it.
+pub const TEB64_SIZE: u32 = 0x3000;
 
 /// Minimal global descriptor table. Selector `0x08` points at the TIB page.
 const GDT_BASE: u32 = 0x7FFE_C000;
@@ -230,7 +234,7 @@ impl Fault {
 /// A 64-bit thread environment block at `teb`, made current through the GS
 /// base: stack bounds, the self pointer, the client id and an (empty) PEB.
 fn init_teb64(uc: &mut Unicorn<'_, ()>, teb: u32, top: u32, bottom: u32, thread: u32) -> Result<(), RunError> {
-    let peb = teb + 0x800;
+    let peb = teb + 0x2000;
     for (offset, value) in [
         (0x00u32, u64::MAX),       // ExceptionList (unused on x64)
         (0x08, top as u64),        // StackBase
@@ -241,7 +245,7 @@ fn init_teb64(uc: &mut Unicorn<'_, ()>, teb: u32, top: u32, bottom: u32, thread:
         (0x60, peb as u64),        // ProcessEnvironmentBlock
         // PEB.ProcessParameters: an all-zero RTL_USER_PROCESS_PARAMETERS in
         // the PEB's unused tail (runtime libraries read its flags).
-        (0x800 + 0x20, (peb + 0x400) as u64),
+        (0x2000 + 0x20, (peb + 0x400) as u64),
     ] {
         uc.mem_write((teb + offset) as u64, &value.to_le_bytes())
             .map_err(|error| RunError::Unicorn("initialising the TEB", error))?;
@@ -724,6 +728,8 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
 
     fn map_region(&mut self, preferred: u32, size: u32) -> Option<u32> {
         const GRANULE: u64 = 0x1_0000;
+        // A 64-bit process may use the whole 4 GiB below which OTW keeps it.
+        let limit: u64 = if self.run.is_some_and(|run| run.borrow().x64) { 0xFFFF_0000 } else { 0xC000_0000 };
         let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
         let regions: Vec<(u64, u64)> = self
             .uc
@@ -734,13 +740,13 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             .collect();
         let free = |start: u64| {
             start >= GRANULE
-                && start + size <= 0xC000_0000
+                && start + size <= limit
                 && regions.iter().all(|&(begin, end)| start + size <= begin || start > end)
         };
         let mut start = (preferred as u64) & !(PAGE_SIZE as u64 - 1);
         if !free(start) {
             start = ((preferred as u64).max(0x1000_0000) + GRANULE - 1) & !(GRANULE - 1);
-            while start + size <= 0xC000_0000 && !free(start) {
+            while start + size <= limit && !free(start) {
                 start += GRANULE;
             }
             if !free(start) {
@@ -751,11 +757,61 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         Some(start as u32)
     }
 
+    fn add_tls(&mut self, template: &[u8]) -> Option<u32> {
+        let run = self.run?;
+        let (index, tibs, x64) = {
+            let mut state = run.borrow_mut();
+            state.tls_templates.push(template.to_vec());
+            (state.tls_templates.len() as u32 - 1, state.tibs.clone(), state.x64)
+        };
+        let width = if x64 { 8 } else { 4 };
+        for (_, tib) in tibs {
+            // A longer array: the old blocks, then the new one.
+            let slot = if x64 { tib + 0x58 } else { tib + 0x2C };
+            let old = self.read_ptr(slot).unwrap_or(0) as u32;
+            let size = (index + 1) * width;
+            let array = self.map_region(0x1000_0000, size + template.len() as u32 + 16)?;
+            if old != 0 && index > 0 {
+                let previous = self.read_bytes(old, (index * width) as usize).unwrap_or_default();
+                self.write_bytes(array, &previous)?;
+            }
+            let block = (array + size + 15) & !15;
+            self.write_bytes(block, template)?;
+            self.write_ptr(array + index * width, block as u64)?;
+            self.write_ptr(slot, array as u64)?;
+        }
+        Some(index)
+    }
+
+    fn map_exact(&mut self, va: u32, size: u32) -> bool {
+        let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+        let start = va as u64 & !(PAGE_SIZE as u64 - 1);
+        let limit: u64 = if self.run.is_some_and(|run| run.borrow().x64) { 0xFFFF_0000 } else { 0xC000_0000 };
+        if start == 0 || start + size > limit {
+            return false;
+        }
+        let overlaps = self
+            .uc
+            .mem_regions()
+            .map(|regions| regions.iter().any(|r| start <= r.end && start + size > r.begin))
+            .unwrap_or(true);
+        !overlaps && self.uc.mem_map(start, size, Prot::ALL).is_ok()
+    }
+
+    fn unmap(&mut self, va: u32, size: u32) -> bool {
+        let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+        self.uc.mem_unmap(va as u64, size).is_ok()
+    }
+
+    fn mapped(&mut self) -> Vec<(u64, u64)> {
+        self.uc.mem_regions().map(|regions| regions.iter().map(|r| (r.begin, r.end)).collect()).unwrap_or_default()
+    }
+
     fn create_thread(&mut self, entry: u32, param: u32, stack_size: u32) -> Option<u32> {
         let run = self.run?;
         let stack_size = align_up(stack_size.clamp(0x1_0000, 0x100_0000), PAGE_SIZE);
         let stack = self.map_region(0x1000_0000, stack_size)?;
-        let tib = self.map_region(0x1000_0000, PAGE_SIZE)?;
+        let tib = self.map_region(0x1000_0000, if run.borrow().x64 { TEB64_SIZE } else { PAGE_SIZE })?;
         let top = stack + stack_size;
         if run.borrow().x64 {
             return self.create_thread64(entry, param, stack, top, tib);
@@ -930,6 +986,23 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         }
         state.thread_signal = Some(ThreadSignal::Exit(code));
         true
+    }
+
+    fn xmm(&mut self, index: usize) -> u64 {
+        let register = [Reg::XMM0, Reg::XMM1, Reg::XMM2, Reg::XMM3][index.min(3)];
+        self.uc
+            .reg_read_long(register)
+            .ok()
+            .and_then(|bytes| bytes.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))))
+            .unwrap_or(0)
+    }
+
+    fn set_xmm0(&mut self, bits: u64) {
+        let mut value = self.uc.reg_read_long(Reg::XMM0).map(|b| b.to_vec()).unwrap_or_else(|_| vec![0; 16]);
+        value.resize(16, 0);
+        value[..8].copy_from_slice(&bits.to_le_bytes());
+        value[8..].fill(0);
+        let _ = self.uc.reg_write_long(Reg::XMM0, &value);
     }
 
     fn registers(&mut self) -> Option<memory::Registers> {
@@ -1393,7 +1466,10 @@ fn build<'a>(
     uc.mem_write(THREAD_STOP as u64, &[0xC3])
         .map_err(|error| RunError::Unicorn("writing thread stop address", error))?;
 
-    uc.mem_map(STACK_BASE as u64, STACK_SIZE as u64, Prot::ALL)
+    // A 64-bit program's first thread gets nearly 2 MiB of stack (current
+    // programs check for at least 1 MiB), from 64 KiB up.
+    let stack_low = if x64 { X64_STACK_LOW } else { STACK_BASE };
+    uc.mem_map(stack_low as u64, (STACK_BASE + STACK_SIZE - stack_low) as u64, Prot::ALL)
         .map_err(|error| RunError::Unicorn("mapping guest stack", error))?;
 
     // The heap's range, except where a program image already lies in it.
@@ -1416,10 +1492,10 @@ fn build<'a>(
         cursor = cursor.max(end);
     }
 
-    uc.mem_map(TIB_BASE as u64, TIB_SIZE as u64, Prot::ALL)
+    uc.mem_map(TIB_BASE as u64, if x64 { TEB64_SIZE } else { TIB_SIZE } as u64, Prot::ALL)
         .map_err(|error| RunError::Unicorn("mapping guest TIB", error))?;
     if x64 {
-        init_teb64(&mut uc, TIB_BASE, STACK_TOP, STACK_BASE, 1)?;
+        init_teb64(&mut uc, TIB_BASE, STACK_TOP, X64_STACK_LOW, 1)?;
     } else {
         // Win95 TIB: a terminated SEH chain, stack bounds and a pointer to the TIB
         // itself. MFC's CRT and SEH prologues consult all four during startup.
@@ -1580,19 +1656,24 @@ fn build<'a>(
                     })
                     .unwrap_or_default();
                 let mut trace = trace.borrow_mut();
+                // A repeated string instruction keeps one line.
+                let prefix = format!("eip={address:#010x} ");
+                if trace.back().is_some_and(|last| last.starts_with(&prefix)) {
+                    trace.pop_back();
+                }
                 if trace.len() >= 4096 {
                     trace.pop_front();
                 }
                 trace.push_back(format!(
                     "eip={address:#010x} bytes={bytes:<24} eax={:08x} ebx={:08x} ecx={:08x} edx={:08x} esi={:08x} edi={:08x} ebp={:08x} esp={:08x}",
-                    values[0] as u32,
-                    values[1] as u32,
-                    values[2] as u32,
-                    values[3] as u32,
-                    values[4] as u32,
-                    values[5] as u32,
-                    values[6] as u32,
-                    values[7] as u32,
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3],
+                    values[4],
+                    values[5],
+                    values[6],
+                    values[7],
                 ));
             },
         )
@@ -1661,6 +1742,17 @@ fn build<'a>(
                 thunk_calls.arg_count(&entry.dll, &entry.name)
             };
             let Some(arg_count) = arg_count else {
+                // Exploring a program: OTW_STUB_MISSING lets unimplemented
+                // functions return 0 (and says which), to see what comes next.
+                if x64 && std::env::var_os("OTW_STUB_MISSING").is_some() {
+                    eprintln!("[stub] {} returns 0", thunk_calls.describe(&entry.dll, &entry.name));
+                    let mut bytes = [0u8; 8];
+                    let _ = uc.mem_read(esp as u64, &mut bytes);
+                    let _ = uc.reg_write(Reg::RAX, 0);
+                    let _ = uc.reg_write(Reg::RSP, esp as u64 + 8);
+                    let _ = uc.reg_write(Reg::RIP, u64::from_le_bytes(bytes));
+                    return;
+                }
                 abort(
                     &thunk_state,
                     uc,
@@ -2010,12 +2102,20 @@ fn build<'a>(
         {
             continue;
         }
-        let frame = STACK_TOP - 0x40;
-        let writes = uc
-            .mem_write(frame as u64, &SENTINEL_BASE.to_le_bytes())
-            .and_then(|()| uc.mem_write((frame + 4) as u64, &module.image.image_base.to_le_bytes()))
-            .and_then(|()| uc.mem_write((frame + 8) as u64, &1u32.to_le_bytes()))
-            .and_then(|()| uc.mem_write((frame + 12) as u64, &0u32.to_le_bytes()));
+        let frame = STACK_TOP - if x64 { 0x48 } else { 0x40 };
+        let writes = if x64 {
+            // x64: the arguments in RCX, RDX, R8; a 64-bit return address
+            // with the callee's shadow space above it.
+            uc.mem_write(frame as u64, &(SENTINEL_BASE as u64).to_le_bytes())
+                .and_then(|()| uc.reg_write(Reg::RCX, module.image.image_base as u64))
+                .and_then(|()| uc.reg_write(Reg::RDX, 1))
+                .and_then(|()| uc.reg_write(Reg::R8, 0))
+        } else {
+            uc.mem_write(frame as u64, &SENTINEL_BASE.to_le_bytes())
+                .and_then(|()| uc.mem_write((frame + 4) as u64, &module.image.image_base.to_le_bytes()))
+                .and_then(|()| uc.mem_write((frame + 8) as u64, &1u32.to_le_bytes()))
+                .and_then(|()| uc.mem_write((frame + 12) as u64, &0u32.to_le_bytes()))
+        };
         if let Err(error) = writes {
             return Err(RunError::Unicorn("building DllMain frame", error));
         }

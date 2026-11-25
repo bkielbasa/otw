@@ -255,7 +255,7 @@ fn alias(name: &str) -> &str {
 }
 
 /// Functions only 64-bit programs call, with their argument counts.
-fn x64_only(name: &str) -> Option<usize> {
+pub(crate) fn x64_only(name: &str) -> Option<usize> {
     Some(match name {
         "InitializeCriticalSectionEx" => 3,
         "VerSetConditionMask" => 3,
@@ -274,6 +274,12 @@ fn by_name(name: &ImportName) -> Option<&str> {
 
 /// The x64 argument count of an import.
 pub fn arg_count(ctx: &ApiContext, dll: &str, name: &ImportName) -> Option<usize> {
+    if crate::win32::is_ucrt(crate::win32::api_set_host(dll).unwrap_or(dll)) {
+        return crate::win32::ucrt::arg_count(by_name(name)?);
+    }
+    if let Some(count) = by_name(name).and_then(crate::win32::nt::arg_count) {
+        return Some(count);
+    }
     if let Some(text) = by_name(name) {
         if let Some(count) = x64_only(text) {
             return Some(count);
@@ -300,6 +306,12 @@ pub fn call(
 ) -> Option<ApiOutcome> {
     let count = args.len();
     let args = args.all_wide();
+    if crate::win32::is_ucrt(crate::win32::api_set_host(dll).unwrap_or(dll)) {
+        return crate::win32::ucrt::call(ctx, memory, by_name(name)?, args);
+    }
+    if let Some(outcome) = by_name(name).and_then(|text| crate::win32::nt::call(ctx, memory, text, args)) {
+        return Some(outcome);
+    }
     let text = by_name(name).map(str::to_owned);
     if let Some(text) = text.as_deref() {
         if let Some(value) = x64_function(ctx, memory, text, args) {

@@ -33,6 +33,8 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "ReadDirectoryChangesW" | "BeginBufferedAnimation" => 8,
         "CompareStringEx" | "LCMapStringEx" | "DrawThemeTextEx" => 9,
         "AlphaBlend" | "GdiAlphaBlend" | "CryptQueryObject" => 11,
+        "ReportEventW" | "ReportEventA" => 9,
+        "DeregisterEventSource" => 1,
         _ => return None,
     })
 }
@@ -232,6 +234,23 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             set_error(ctx, 18); // ERROR_NO_MORE_FILES
             ok(0)
         }
+        // ReportEvent(source, type, category, id, sid, strings, data size,
+        // strings, data): shown on the console, as an event log would keep it.
+        "ReportEventW" | "ReportEventA" => {
+            let size = memory.ptr_size();
+            let mut texts = Vec::new();
+            for index in 0..(args[5] & 0xFFFF).min(16) {
+                let text = memory.read_ptr(args[7] + index * size).unwrap_or(0) as u32;
+                texts.push(if name == "ReportEventW" {
+                    String::from_utf16_lossy(&unicode::read_wstr(memory, text))
+                } else {
+                    String::from_utf8_lossy(&crate::win32::read_cstr(memory, text)).into_owned()
+                });
+            }
+            eprintln!("[event log] type {:#x} id {:#x}: {}", args[1], args[3], texts.join(" | "));
+            ok(1)
+        }
+        "DeregisterEventSource" => ok(1),
         // ── USER32 ──
         "GetCaretBlinkTime" => ok(530),
         "ChangeWindowMessageFilterEx" | "ChangeWindowMessageFilter" | "SetLayeredWindowAttributes"

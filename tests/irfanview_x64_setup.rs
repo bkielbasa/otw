@@ -87,7 +87,10 @@ fn irfanview_64_installs_and_shows_a_picture() {
     assert_eq!(link.target, "C:\\Program Files\\IrfanView\\i_view64.exe");
     assert_eq!(link.arguments, "/thumbs");
     let menu = drive.join("WINDOWS/Start Menu/Programs/IrfanView");
-    assert_eq!(fs::read_dir(&menu).unwrap().count(), 9);
+    // On Windows 8 and later (64-bit programs are told Windows 10) the
+    // installer leaves the uninstall shortcut out of the Start menu.
+    assert_eq!(fs::read_dir(&menu).unwrap().count(), 8);
+    assert!(!menu.join("Uninstall IrfanView.lnk").exists());
 
     // Start IrfanView on a picture.
     const COLOUR: u32 = 0x3366CC;

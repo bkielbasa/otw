@@ -667,13 +667,58 @@ fn native<M: GuestMemory + ?Sized>(
             let va = ctx.command_line_va;
             cached_wide(ctx, memory, "command line", |memory| ansi_to_wide(&read_cstr(memory, va)))
         }
-        "GetEnvironmentStringsW" => cached_wide(ctx, memory, "environment", |_| Vec::new()),
-        "FreeEnvironmentStringsW" => 1,
-        "GetEnvironmentVariableW" | "GetEnvironmentVariableA" => {
-            set_last_error(ctx, 203); // ERROR_ENVVAR_NOT_FOUND
-            0
+        "GetEnvironmentStringsW" => {
+            let mut units: Vec<u16> = Vec::new();
+            for entry in crate::win32::env::block(ctx) {
+                units.extend(entry.encode_utf16());
+                units.push(0);
+            }
+            units.push(0);
+            let va = ctx.shared.borrow_mut().heap.alloc(units.len() as u32 * 2 + 2).unwrap_or(0);
+            write_wide(memory, va, &units, true);
+            va
         }
-        "SetEnvironmentVariableW" | "SetEnvironmentVariableA" => 1,
+        "FreeEnvironmentStringsW" => {
+            ctx.shared.borrow_mut().heap.free(args[0]);
+            1
+        }
+        "GetEnvironmentVariableW" | "GetEnvironmentVariableA" => {
+            // (name, buffer, size in characters)
+            let wide = name.ends_with('W');
+            let key = if wide { String::from_utf16_lossy(&read_wstr(memory, args[0])) } else { String::from_utf8_lossy(&read_cstr(memory, args[0])).into_owned() };
+            match crate::win32::env::get(ctx, &key) {
+                Some(value) => {
+                    let units: Vec<u16> = value.encode_utf16().collect();
+                    let bytes = wide_to_ansi(&units);
+                    let length = if wide { units.len() } else { bytes.len() } as u32;
+                    if args[1] == 0 || args[2] <= length {
+                        length + 1
+                    } else {
+                        if wide {
+                            write_wide(memory, args[1], &units, true);
+                        } else {
+                            let mut bytes = bytes;
+                            bytes.push(0);
+                            let _ = memory.write_bytes(args[1], &bytes);
+                        }
+                        set_last_error(ctx, 0);
+                        length
+                    }
+                }
+                None => {
+                    set_last_error(ctx, 203); // ERROR_ENVVAR_NOT_FOUND
+                    0
+                }
+            }
+        }
+        "SetEnvironmentVariableW" | "SetEnvironmentVariableA" => {
+            let wide = name.ends_with('W');
+            let read = |memory: &mut M, va: u32| if wide { String::from_utf16_lossy(&read_wstr(memory, va)) } else { String::from_utf8_lossy(&read_cstr(memory, va)).into_owned() };
+            let key = read(memory, args[0]);
+            let value = (args[1] != 0).then(|| read(memory, args[1]));
+            crate::win32::env::set(ctx, &key, value.as_deref());
+            1
+        }
         "GetStartupInfoW" => {
             crate::win32::x64::write_struct(memory, &crate::win32::x64::STARTUPINFO, args[0], &[]);
             0
@@ -1385,11 +1430,11 @@ pub struct OsVersion {
 }
 
 /// Windows 95 (4.0.950) for 32-bit programs. A 64-bit program cannot run
-/// on Windows 95, so it is told Windows 7 SP1 (6.1.7601), the oldest
-/// 64-bit Windows such programs commonly require.
+/// on Windows 95, so it is told Windows 10 (10.0.19045), which current
+/// 64-bit programs require.
 pub fn os_version(ctx: &ApiContext) -> OsVersion {
     if ctx.shared.borrow().x64 {
-        OsVersion { major: 6, minor: 1, build: 7601, platform: 2, service_pack: 1 }
+        OsVersion { major: 10, minor: 0, build: 19045, platform: 2, service_pack: 0 }
     } else {
         OsVersion { major: 4, minor: 0, build: 950, platform: 1, service_pack: 0 }
     }

@@ -112,7 +112,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(1)
         }
         "VirtualProtect" => {
-            let _ = memory.write_u32(args[3], 0x40); // was PAGE_EXECUTE_READWRITE
+            let old = crate::win32::vmem::protect(ctx, args[0], args[1], args[2]).unwrap_or(0x40);
+            let _ = memory.write_u32(args[3], old);
             ok(1)
         }
         "EncodePointer" | "DecodePointer" => ok(args[0]),
@@ -147,6 +148,33 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         }
         "HeapCreate" => ok(0x0050_0001 + (ctx.shared.borrow_mut().alloc_handle() << 4)),
         "HeapDestroy" => ok(1),
+        "VirtualAlloc" if ctx.shared.borrow().x64 => match crate::win32::vmem::alloc(ctx, memory, args[0], args[1], args[2], args[3]) {
+            Ok(address) => ok(address),
+            Err(code) => {
+                ctx.shared.borrow_mut().last_error = code;
+                ok(0)
+            }
+        },
+        "VirtualFree" if crate::win32::vmem::owns(ctx, args[0]) => match crate::win32::vmem::free(ctx, memory, args[0], args[1], args[2]) {
+            Ok(()) => ok(1),
+            Err(code) => {
+                ctx.shared.borrow_mut().last_error = code;
+                ok(0)
+            }
+        },
+        "VirtualQuery" if ctx.shared.borrow().x64 => {
+            let values = crate::win32::vmem::query(ctx, memory, args[0]);
+            if std::env::var_os("OTW_TRACE_VMEM").is_some() {
+                eprintln!("[vmem] query {:#x} -> {:x?}", args[0], values);
+            }
+            let layout = crate::win32::x64::MEMORY_BASIC_INFORMATION;
+            let size_of = layout.size(memory.ptr_size() == 8);
+            if args[2] < size_of {
+                return ok(0);
+            }
+            crate::win32::x64::write_struct(memory, &layout, args[1], &values);
+            ok(size_of)
+        }
         "VirtualAlloc" => {
             // VirtualAlloc(address, size, type, protect): reserving and
             // committing are one step; committing inside a region is a no-op.
@@ -287,9 +315,14 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(1)
         }
         "GetEnvironmentStrings" | "GetEnvironmentStringsA" => {
-            // An empty block: two NULs.
-            let block = ctx.shared.borrow_mut().heap.alloc(2).unwrap_or(0);
-            let _ = memory.write_bytes(block, &[0, 0]);
+            let mut bytes: Vec<u8> = Vec::new();
+            for entry in crate::win32::env::block(ctx) {
+                bytes.extend(crate::win32::unicode::wide_to_ansi(&entry.encode_utf16().collect::<Vec<_>>()));
+                bytes.push(0);
+            }
+            bytes.extend_from_slice(&[0, 0]);
+            let block = ctx.shared.borrow_mut().heap.alloc(bytes.len() as u32).unwrap_or(0);
+            let _ = memory.write_bytes(block, &bytes);
             ok(block)
         }
         "FreeEnvironmentStringsA" => {

@@ -166,7 +166,16 @@ The subsystem is moving from 32-bit-only towards being bitness-aware:
 - Structures are read and written in the process's own layout through `win32::x64::View` (field lists in `win32::x64`, e.g. `MSG`, `WNDCLASS`, `CREATESTRUCT`, `TVITEM`, `LVITEM`, `NMHDR`-based notifications, `MENUITEMINFO`, `OPENFILENAME`) and `x64::write_struct`; nothing is copied between layouts, and window messages pass between the subsystem and 64-bit window procedures unchanged.
 - What `win32::x64` still does at the boundary: functions whose 32-bit signature takes a 64-bit value as two halves (`SetFilePointerEx`'s distance, a POINT by value) get it split; `*Ptr` functions map to their 32-bit names; a few x64-only functions (`VerSetConditionMask`, unwinding lookups) are implemented there. A result without a `wide` value is widened, sign-extending small negative values (error codes such as -1).
 
-Not yet: addresses above 4 GiB (guest addresses are 32-bit), 64-bit exception handling (table-based unwinding; a fault stops the program), 64-bit DLLs that cannot be relocated below 4 GiB.
+A 64-bit program is told it runs on Windows 10 (10.0.19045) and gets what such programs expect of it:
+
+- The universal C runtime (`win32::ucrt`, imported through the `api-ms-win-crt-*` API sets): start-up and exit tables, the heap, strings and conversions, `printf`/`scanf` through the `__stdio_common_*` entry points (reading the `va_list` the inline functions build), streams and descriptors on the host file layer, time, the "C" locale, and the maths library (floating-point arguments and results in XMM registers, `GuestMemory::xmm`/`set_xmm0`). API set names (`api-ms-win-*`, `ext-ms-win-*`) resolve to their host DLL (`win32::api_set_host`), for imports and for `LoadLibrary`.
+- Vista-and-later KERNEL32 and the native API functions programs call directly (`win32::nt`): completion ports (backed by events, so waiting goes through the scheduler), slim locks and `WaitOnAddress` (one scheduling step, callers allow for spurious wake-ups), interlocked lists, counted strings, HSTRINGs, window stations, security descriptors that enforce nothing, job objects and other processes reported as unavailable.
+- Virtual memory as NT manages it (`win32::vmem`): reservations at 64 KiB granularity anywhere below 4 GiB (the whole 4 GiB for 64-bit processes), at the requested address when there is one, commit and decommit inside them, and `VirtualQuery` reporting free, reserved and committed ranges.
+- Static TLS for DLLs loaded at run time (`GuestMemory::add_tls`) and their TLS callbacks; a full-size TEB (the PEB after it, with process parameters); a main-thread stack of almost 2 MiB.
+- A process environment (`win32::env`) with the usual variables; host variables `OTW_ENV_<NAME>` add `<NAME>` (for example settings a program reads from its environment).
+- Delay-loaded imports a module declares get thunks from `GetProcAddress` even when unimplemented, so a missing function stops the program by name when it is called rather than when it is resolved. `OTW_STUB_MISSING=1` lets unimplemented 64-bit functions return 0 instead, for exploring what a program needs.
+
+Not yet: addresses above 4 GiB (guest addresses are 32-bit), 64-bit exception handling (table-based unwinding; a fault or `RaiseException` stops the program), 64-bit DLLs that cannot be relocated below 4 GiB, child processes of 64-bit programs.
 
 ### Read-only FAT32 Explorer
 

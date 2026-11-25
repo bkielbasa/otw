@@ -8,6 +8,10 @@
 
 pub mod advpack;
 pub mod bindctx;
+pub mod env;
+pub mod vmem;
+pub mod nt;
+pub mod ucrt;
 pub mod tabs;
 pub mod rebar;
 pub mod modern;
@@ -706,6 +710,10 @@ pub struct SharedState {
     /// Process start, the origin of GetTickCount.
     pub started: std::time::Instant,
     pub crt_tables: crate::win32::crt::CrtTables,
+    pub ucrt: ucrt::State,
+    pub nt: nt::State,
+    pub vmem: vmem::State,
+    pub env: env::State,
     /// A floating-point result the CPU backend must load into ST(0).
     pub fpu_result: Option<f64>,
     /// Global atoms (GlobalAddAtomA).
@@ -793,6 +801,10 @@ impl Default for SharedState {
             files: HashMap::new(),
             started: std::time::Instant::now(),
             crt_tables: crate::win32::crt::CrtTables::default(),
+            ucrt: ucrt::State::default(),
+            nt: nt::State::default(),
+            vmem: vmem::State::default(),
+            env: env::State::default(),
             fpu_result: None,
             global_atoms: Vec::new(),
             file_paths: HashMap::new(),
@@ -1245,7 +1257,66 @@ pub const BUILTIN_COM: &[&str] = &[
 
 /// Number of stack arguments an API reads. For `wsprintfA` this is a fixed
 /// upper bound; the handler pops zero words because it is cdecl.
+/// The DLL behind a Windows 7+ API set name (`api-ms-win-core-*`,
+/// `ext-ms-win-*`): KERNEL32 for the core, ADVAPI32 for security and the
+/// registry, the universal C runtime for `api-ms-win-crt-*`.
+pub fn is_ucrt(dll: &str) -> bool {
+    dll.eq_ignore_ascii_case("ucrtbase.dll") || dll.eq_ignore_ascii_case("ucrtbase")
+}
+
+pub fn api_set_host(dll: &str) -> Option<&'static str> {
+    let lower = dll.to_ascii_lowercase();
+    // DLLs of later Windows whose functions Windows 95 kept elsewhere.
+    match lower.as_str() {
+        "combase.dll" | "combase" => return Some("OLE32.dll"),
+        "kernelbase.dll" | "kernelbase" => return Some("KERNEL32.dll"),
+        "ucrtbase.dll" | "ucrtbase" | "msvcp_win.dll" => return Some("ucrtbase.dll"),
+        _ => {}
+    }
+    if !(lower.starts_with("api-ms-win-") || lower.starts_with("ext-ms-win-")) {
+        return None;
+    }
+    let set = &lower[11..];
+    if let Some(rest) = set.strip_prefix("downlevel-") {
+        let dll = rest.split('-').next().unwrap_or("");
+        return Some(match dll {
+            "shell32" => "SHELL32.dll",
+            "shlwapi" => "SHLWAPI.dll",
+            "advapi32" => "ADVAPI32.dll",
+            "user32" => "USER32.dll",
+            "ole32" => "OLE32.dll",
+            "version" => "VERSION.dll",
+            _ => "KERNEL32.dll",
+        });
+    }
+    Some(if set.starts_with("crt-") {
+        "ucrtbase.dll"
+    } else if set.starts_with("security-")
+        || set.starts_with("eventing-")
+        || set.starts_with("service-")
+        || set.starts_with("core-registry-")
+    {
+        "ADVAPI32.dll"
+    } else if set.starts_with("core-version-") {
+        "VERSION.dll"
+    } else if set.starts_with("core-com-") {
+        "OLE32.dll"
+    } else if set.starts_with("shcore-") || set.starts_with("shell-") {
+        "SHELL32.dll"
+    } else if set.starts_with("ntuser-") || set.starts_with("rtcore-ntuser") {
+        "USER32.dll"
+    } else if set.starts_with("gdi-") {
+        "GDI32.dll"
+    } else {
+        "KERNEL32.dll"
+    })
+}
+
 pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
+    let dll = api_set_host(dll).unwrap_or(dll);
+    if is_ucrt(dll) {
+        return ucrt::arg_count(name.as_str()?);
+    }
     if let ImportName::Ordinal(ordinal) = name {
         if let Some(named) = crate::win32::winsock::ordinal_name(dll, *ordinal) {
             return crate::win32::winsock::arg_count(named);
@@ -1339,6 +1410,7 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
 /// Whether an API has an implementation, without calling it.
 pub fn has_implementation(dll: &str, name: &ImportName) -> bool {
     arg_count(dll, name).is_some()
+        || name.as_str().is_some_and(|text| nt::arg_count(text).is_some() || x64::x64_only(text).is_some())
 }
 
 /// DLLs that must keep Rust handlers even when a genuine copy is next to the
@@ -1461,6 +1533,7 @@ pub fn dispatch_with_memory<M: GuestMemory + ?Sized>(
     args: &[u32],
     caller: u32,
 ) -> Option<ApiOutcome> {
+    let dll = api_set_host(dll).unwrap_or(dll);
     // Fault injection for testing error paths: OTW_FAIL_API=Name=value.
     if let (Ok(spec), ImportName::ByName(import)) = (std::env::var("OTW_FAIL_API"), name) {
         if let Some((target, value)) = spec.split_once('=') {
@@ -2276,7 +2349,11 @@ mod kernel32_base {
                     let dll = crate::win32::kernel32::system_module_name(args[0])?;
                     // Functions of Rust-backed DLLs by name, or "#ordinal".
                     let name = requested.clone().unwrap_or_else(|| format!("#{}", args[1]));
-                    crate::win32::kernel32::dynamic_thunk(ctx, dll, &name)
+                    crate::win32::kernel32::dynamic_thunk(ctx, dll, &name).or_else(|| {
+                        crate::win32::nt::declared_delay_import(ctx, memory, dll, &name)
+                            .then(|| crate::win32::kernel32::import_thunk(ctx, dll, &name))
+                            .flatten()
+                    })
                 });
                 match address {
                     Some(address) => ApiOutcome::new(address, count),

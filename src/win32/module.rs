@@ -60,6 +60,38 @@ pub fn subsystem_only(dll: &str) -> bool {
     )
 }
 
+/// Give a just-mapped module's `__declspec(thread)` data a TLS index and
+/// a copy in every thread. Returns its TLS callbacks.
+fn setup_tls<M: GuestMemory + ?Sized>(memory: &mut M, base: u32) -> Vec<u32> {
+    let Some(pe) = memory.read_u32(base + 0x3C) else { return Vec::new() };
+    let x64 = memory.read_bytes(base + pe + 24, 2).is_some_and(|m| m == [0x0B, 0x02]);
+    let directory = base + pe + 24 + if x64 { 112 } else { 96 } + 9 * 8;
+    let rva = memory.read_u32(directory).unwrap_or(0);
+    if rva == 0 {
+        return Vec::new();
+    }
+    let width = if x64 { 8 } else { 4 };
+    let field = |memory: &mut M, index: u32| memory.read_u32(base + rva + index * width).unwrap_or(0);
+    let (start, end, index_va, callbacks) = (field(memory, 0), field(memory, 1), field(memory, 2), field(memory, 3));
+    let zero_fill = memory.read_u32(base + rva + 4 * width).unwrap_or(0);
+    let mut template = if end > start { memory.read_bytes(start, (end - start) as usize).unwrap_or_default() } else { Vec::new() };
+    template.extend(std::iter::repeat_n(0, zero_fill as usize));
+    if let Some(index) = memory.add_tls(&template) {
+        let _ = memory.write_u32(index_va, index);
+    }
+    let mut list = Vec::new();
+    if callbacks != 0 {
+        for slot in 0..64 {
+            let callback = memory.read_ptr(callbacks + slot * width).unwrap_or(0) as u32;
+            if callback == 0 {
+                break;
+            }
+            list.push(callback);
+        }
+    }
+    list
+}
+
 /// `LOAD_LIBRARY_AS_DATAFILE`: map for resources only.
 pub const AS_DATAFILE: u32 = 2;
 
@@ -71,6 +103,12 @@ pub fn load_library<M: GuestMemory + ?Sized>(
     flags: u32,
 ) -> Result<u32, u32> {
     let requested = requested.trim();
+    // An API set name (api-ms-win-*) is its host DLL.
+    if let Some(host) = crate::win32::api_set_host(&file_name(requested)) {
+        if let Some(handle) = kernel32::system_module_handle(host) {
+            return Ok(handle);
+        }
+    }
     let file = file_name(requested);
     if let Some(base) = find_loaded(ctx, &file) {
         return Ok(base);
@@ -83,9 +121,10 @@ pub fn load_library<M: GuestMemory + ?Sized>(
         return kernel32::system_module_handle(&file).ok_or(126);
     };
     let image = PeImage::parse(bytes).map_err(|_| 193u32)?; // ERROR_BAD_EXE_FORMAT
-    // A 64-bit process loads only 64-bit DLLs, a 32-bit one 32-bit DLLs.
+    // A 64-bit process loads only 64-bit DLLs, a 32-bit one 32-bit DLLs;
+    // a system DLL of the other kind is the subsystem's own.
     if image.is64 != (memory.ptr_size() == 8) {
-        return Err(193);
+        return kernel32::system_module_handle(&file).ok_or(193);
     }
     let mut mapped = loader::map_image(&file, &image).map_err(|_| 193u32)?;
     let base = memory
@@ -136,6 +175,11 @@ pub fn load_library<M: GuestMemory + ?Sized>(
 
     if file.eq_ignore_ascii_case("comctl32.dll") {
         crate::win32::user::yield_common_controls(ctx);
+    }
+    // Static thread-local storage: an index of its own and a copy in every
+    // thread; then the TLS callbacks (C++ thread_local initialisation).
+    for callback in setup_tls(memory, base) {
+        memory.call_guest_wide(callback, &[base as u64, 1, 0]);
     }
     if image.entry_rva != 0 {
         let entry = base.wrapping_add(image.entry_rva);
