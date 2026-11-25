@@ -406,12 +406,12 @@ fn notify<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, sheet: u32,
     if page == 0 {
         return 0;
     }
-    let block = ctx.shared.borrow_mut().heap.alloc(16).unwrap_or(0);
-    let mut nmhdr = sheet.to_le_bytes().to_vec();
-    nmhdr.extend_from_slice(&0u32.to_le_bytes());
-    nmhdr.extend_from_slice(&code.to_le_bytes());
-    nmhdr.extend_from_slice(&0u32.to_le_bytes());
-    let _ = memory.write_bytes(block, &nmhdr);
+    // PSHNOTIFY (header, lParam) in the process's layout.
+    let block = ctx.shared.borrow_mut().heap.alloc(32).unwrap_or(0);
+    let view = crate::win32::x64::View::new(memory, &crate::win32::x64::PSHNOTIFY, block);
+    for (index, value) in [sheet, 0, code, 0].into_iter().enumerate() {
+        view.set(memory, index, value);
+    }
     controls::set_msg_result(ctx, page, 0);
     user::send(ctx, memory, page, WM_NOTIFY, 0, block);
     ctx.shared.borrow_mut().heap.free(block);
@@ -812,12 +812,15 @@ fn list_notify<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: 
         return;
     }
     let lparam = with_list(ctx, hwnd, |list| list.items.get(item.max(0) as usize).map(|i| i.lparam).unwrap_or(0));
-    let block = ctx.shared.borrow_mut().heap.alloc(48).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(48);
-    for value in [hwnd, id, code, item as u32, 0, new_state, old_state, if code == LVN_ITEMCHANGED { 8 } else { 0 }, 0, 0, lparam] {
-        bytes.extend_from_slice(&value.to_le_bytes());
+    // NMLISTVIEW in the process's layout.
+    let block = ctx.shared.borrow_mut().heap.alloc(64).unwrap_or(0);
+    let view = crate::win32::x64::View::new(memory, &crate::win32::x64::NMLISTVIEW, block);
+    for (index, value) in [hwnd, id, code, item as u32, 0, new_state, old_state, if code == LVN_ITEMCHANGED { 8 } else { 0 }, 0, 0, lparam]
+        .into_iter()
+        .enumerate()
+    {
+        view.set(memory, index, value);
     }
-    let _ = memory.write_bytes(block, &bytes);
     user::send(ctx, memory, parent, WM_NOTIFY, id, block);
     ctx.shared.borrow_mut().heap.free(block);
 }

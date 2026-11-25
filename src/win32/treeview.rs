@@ -6,7 +6,12 @@
 use std::collections::HashMap;
 
 use crate::win32::{
-    commctrl, gdi::sys_color, gfx::Rect, unicode, user, ApiContext, GuestMemory,
+    commctrl,
+    gdi::sys_color,
+    gfx::Rect,
+    unicode, user,
+    x64::{View, NMHDR, TVITEM},
+    ApiContext, GuestMemory,
 };
 
 const TVI_ROOT: u32 = 0xFFFF_0000;
@@ -90,40 +95,44 @@ fn text_of<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, wide: bool) -> Vec<
 /// Apply a TVITEM's fields (mask at 0, state 8, state mask 12, text 16,
 /// image 24, selected image 28, children 32, lParam 36) to an item.
 fn apply_item<M: GuestMemory + ?Sized>(memory: &mut M, item: &mut TreeItem, va: u32, wide: bool) {
-    let mask = rd(memory, va);
+    // TVITEM in the process's layout: mask, hItem, state, stateMask,
+    // pszText, cchTextMax, iImage, iSelectedImage, cChildren, lParam.
+    let v = View::new(memory, &TVITEM, va);
+    let mask = v.get32(memory, 0);
     if mask & TVIF_TEXT != 0 {
-        let text = rd(memory, va + 16);
+        let text = v.get32(memory, 4);
         item.text = if text >= 0x10000 && text != u32::MAX { text_of(memory, text, wide) } else { Vec::new() };
     }
     if mask & TVIF_IMAGE != 0 {
-        item.image = rd(memory, va + 24) as i32;
+        item.image = v.get32(memory, 6) as i32;
     }
     if mask & TVIF_SELECTEDIMAGE != 0 {
-        item.selected_image = rd(memory, va + 28) as i32;
+        item.selected_image = v.get32(memory, 7) as i32;
     }
     if mask & TVIF_STATE != 0 {
-        let state_mask = rd(memory, va + 12);
-        item.state = (item.state & !state_mask) | (rd(memory, va + 8) & state_mask);
+        let state_mask = v.get32(memory, 3);
+        item.state = (item.state & !state_mask) | (v.get32(memory, 2) & state_mask);
     }
     if mask & TVIF_CHILDREN != 0 {
-        item.has_children = rd(memory, va + 32) != 0;
+        item.has_children = v.get32(memory, 8) != 0;
     }
     if mask & TVIF_PARAM != 0 {
-        item.lparam = rd(memory, va + 36);
+        item.lparam = v.get32(memory, 9);
     }
 }
 
 /// Fill a TVITEM from an item, as its mask asks.
 fn write_item<M: GuestMemory + ?Sized>(memory: &mut M, handle: u32, item: &TreeItem, va: u32, wide: bool) {
-    let mask = rd(memory, va);
-    let _ = memory.write_u32(va + 4, handle);
+    let v = View::new(memory, &TVITEM, va);
+    let mask = v.get32(memory, 0);
+    v.set(memory, 1, handle);
     if mask & TVIF_STATE != 0 {
-        let state_mask = rd(memory, va + 12);
-        let _ = memory.write_u32(va + 8, item.state & state_mask);
+        let state_mask = v.get32(memory, 3);
+        v.set(memory, 2, item.state & state_mask);
     }
     if mask & TVIF_TEXT != 0 {
-        let buffer = rd(memory, va + 16);
-        let capacity = rd(memory, va + 20) as usize;
+        let buffer = v.get32(memory, 4);
+        let capacity = v.get32(memory, 5) as usize;
         if buffer != 0 && capacity > 0 {
             let count = item.text.len().min(capacity - 1);
             if wide {
@@ -134,17 +143,27 @@ fn write_item<M: GuestMemory + ?Sized>(memory: &mut M, handle: u32, item: &TreeI
         }
     }
     if mask & TVIF_IMAGE != 0 {
-        let _ = memory.write_u32(va + 24, item.image as u32);
+        v.set(memory, 6, item.image as u32);
     }
     if mask & TVIF_SELECTEDIMAGE != 0 {
-        let _ = memory.write_u32(va + 28, item.selected_image as u32);
+        v.set(memory, 7, item.selected_image as u32);
     }
     if mask & TVIF_CHILDREN != 0 {
-        let _ = memory.write_u32(va + 32, u32::from(item.has_children || !item.children.is_empty()));
+        v.set(memory, 8, u32::from(item.has_children || !item.children.is_empty()));
     }
     if mask & TVIF_PARAM != 0 {
-        let _ = memory.write_u32(va + 36, item.lparam);
+        v.set(memory, 9, item.lparam);
     }
+}
+
+/// Offsets in an NMTREEVIEW: (action, itemOld, itemNew), after the NMHDR.
+fn nmtreeview_offsets<M: GuestMemory + ?Sized>(memory: &M) -> (u32, u32, u32, u32) {
+    let x64 = memory.ptr_size() == 8;
+    let header = NMHDR.size(x64);
+    let align = if x64 { 8 } else { 4 };
+    let old = (header + 4 + align - 1) & !(align - 1);
+    let new = old + TVITEM.size(x64);
+    (header, old, new, new + TVITEM.size(x64) + 8)
 }
 
 /// The rows on screen: (item, depth), expanded children included.
@@ -209,12 +228,16 @@ fn notify<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, 
     if parent == 0 {
         return 0;
     }
-    let block = ctx.shared.borrow_mut().heap.alloc(104).unwrap_or(0);
-    let _ = memory.write_bytes(block, &[0; 104]);
-    for (offset, value) in [(0, hwnd), (4, id), (8, code), (12, action)] {
-        let _ = memory.write_u32(block + offset, value);
+    // NMTREEVIEW in the process's layout.
+    let (action_at, old_at, new_at, size) = nmtreeview_offsets(memory);
+    let block = ctx.shared.borrow_mut().heap.alloc(size).unwrap_or(0);
+    let _ = memory.write_bytes(block, &vec![0; size as usize]);
+    let header = View::new(memory, &NMHDR, block);
+    for (index, value) in [hwnd, id, code].into_iter().enumerate() {
+        header.set(memory, index, value);
     }
-    for (offset, handle) in [(16u32, old), (56, new)] {
+    let _ = memory.write_u32(block + action_at, action);
+    for (offset, handle) in [(old_at, old), (new_at, new)] {
         if handle == 0 {
             continue;
         }
@@ -417,10 +440,12 @@ pub fn treeview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         // TVM_INSERTITEMA/W: TVINSERTSTRUCT { parent, insert after, TVITEM }
         0x1100 | 0x1132 => {
             let wide = msg == 0x1132;
-            let parent = rd(memory, lparam);
-            let after = rd(memory, lparam + 4);
+            // TVINSERTSTRUCT: hParent, hInsertAfter (pointer-sized), item.
+            let size = memory.ptr_size();
+            let parent = memory.read_ptr(lparam).unwrap_or(0) as u32;
+            let after = memory.read_ptr(lparam + size).unwrap_or(0) as u32;
             let mut item = TreeItem::default();
-            apply_item(memory, &mut item, lparam + 8, wide);
+            apply_item(memory, &mut item, lparam + 2 * size, wide);
             let parent = if parent == TVI_ROOT { 0 } else { parent };
             item.parent = parent;
             let handle = with_tree(ctx, hwnd, |tree| {
@@ -467,7 +492,7 @@ pub fn treeview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         0x1102 => expand(ctx, memory, hwnd, lparam, wparam),
         // TVM_GETITEMRECT (wParam: text only; lParam: in item, out RECT)
         0x1104 => {
-            let handle = rd(memory, lparam);
+            let handle = memory.read_ptr(lparam).unwrap_or(0) as u32;
             let style = style(ctx, hwnd);
             let (width, _) = client_size(ctx, hwnd);
             let found = with_tree(ctx, hwnd, |tree| {
@@ -564,7 +589,7 @@ pub fn treeview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         }
         // TVM_GETITEMA/W
         0x110C | 0x113E => {
-            let handle = rd(memory, lparam + 4);
+            let handle = View::new(memory, &TVITEM, lparam).get32(memory, 1);
             match with_tree(ctx, hwnd, |tree| tree.items.get(&handle).cloned()) {
                 Some(item) => {
                     write_item(memory, handle, &item, lparam, msg == 0x113E);
@@ -575,7 +600,7 @@ pub fn treeview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         }
         // TVM_SETITEMA/W
         0x110D | 0x113F => {
-            let handle = rd(memory, lparam + 4);
+            let handle = View::new(memory, &TVITEM, lparam).get32(memory, 1);
             let Some(mut item) = with_tree(ctx, hwnd, |tree| tree.items.get(&handle).cloned()) else {
                 return 0;
             };
@@ -591,7 +616,8 @@ pub fn treeview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             let (x, y) = (rd(memory, lparam) as i32, rd(memory, lparam + 4) as i32);
             let (item, flags) = hit_test(ctx, hwnd, x, y);
             let _ = memory.write_u32(lparam + 8, flags);
-            let _ = memory.write_u32(lparam + 12, item);
+            // hItem is pointer-sized, aligned after flags.
+            let _ = memory.write_ptr(lparam + if memory.ptr_size() == 8 { 16 } else { 12 }, u64::from(item));
             item
         }
         // TVM_ENSUREVISIBLE
@@ -684,10 +710,15 @@ pub fn treeview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             // TVN_KEYDOWN { NMHDR, wVKey, flags }: the parent may act on it.
             let (parent, id) = ctx.shared.borrow().gui.window(hwnd).map(|w| (w.parent, w.id)).unwrap_or((0, 0));
             if parent != 0 {
-                let block = ctx.shared.borrow_mut().heap.alloc(20).unwrap_or(0);
-                for (offset, value) in [(0, hwnd), (4, id), (8, TVN_KEYDOWN), (12, wparam & 0xFFFF), (16, 0)] {
-                    let _ = memory.write_u32(block + offset, value);
+                // NMTVKEYDOWN: NMHDR, wVKey, flags.
+                let block = ctx.shared.borrow_mut().heap.alloc(40).unwrap_or(0);
+                let header = View::new(memory, &NMHDR, block);
+                for (index, value) in [hwnd, id, TVN_KEYDOWN].into_iter().enumerate() {
+                    header.set(memory, index, value);
                 }
+                let after = NMHDR.size(memory.ptr_size() == 8);
+                let _ = memory.write_u32(block + after, wparam & 0xFFFF);
+                let _ = memory.write_u32(block + after + 4, 0);
                 user::send(ctx, memory, parent, WM_NOTIFY, id, block);
                 ctx.shared.borrow_mut().heap.free(block);
             }

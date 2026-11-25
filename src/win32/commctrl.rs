@@ -590,20 +590,25 @@ pub fn toolbar_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, h
             if arrow_hit {
                 // TBN_DROPDOWN with an NMTOOLBAR: header, item, TBBUTTON, text, rect.
                 let (parent, id) = notify_parent(ctx, hwnd);
-                let block = user::scratch(ctx, 80);
+                let block = user::scratch(ctx, 112);
                 let r = rects[index];
-                let mut bytes = Vec::new();
-                for v in [hwnd, id, TBN_DROPDOWN, button.command, button.image as u32, button.command] {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+                // NMTOOLBAR in the process's layout.
+                let _ = memory.write_bytes(block, &[0u8; 112]);
+                let view = crate::win32::x64::View::new(memory, &crate::win32::x64::NMTOOLBAR, block);
+                for (index, value) in [
+                    (0, hwnd),
+                    (1, id),
+                    (2, TBN_DROPDOWN),
+                    (3, button.command),
+                    (5, button.image as u32),
+                    (6, button.command),
+                    (7, button.state as u32),
+                    (8, button.style as u32),
+                    (9, button.data),
+                ] {
+                    view.set(memory, index, value);
                 }
-                bytes.extend_from_slice(&[button.state, button.style, 0, 0]);
-                for v in [button.data, 0, 0, 0] {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-                for v in [r.left, r.top, r.right, r.bottom] {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-                let _ = memory.write_bytes(block, &bytes);
+                let _ = gdi::write_rect(memory, view.at(13), r);
                 with_toolbar(ctx, hwnd, |t| t.buttons[index].state |= TBSTATE_PRESSED);
                 invalidate(ctx, hwnd);
                 user::send(ctx, memory, parent, WM_NOTIFY, id, block);

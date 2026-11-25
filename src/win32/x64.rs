@@ -36,6 +36,9 @@ pub enum F {
     A(u32),
     /// `n` bytes, byte aligned (character arrays).
     Bytes(u32),
+    /// No data: align the next field as a pointer (where a nested
+    /// structure holding pointers starts).
+    AlignP,
 }
 
 impl F {
@@ -49,6 +52,8 @@ impl F {
             F::Q => (8, 8),
             F::A(n) => (4 * n, 4),
             F::Bytes(n) => (n, 1),
+            F::AlignP if x64 => (0, 8),
+            F::AlignP => (0, 4),
         }
     }
 }
@@ -257,7 +262,8 @@ pub const TCITEM: Layout = Layout::new(&[D, D, D, P, D, D, P]);
 pub const TOOLINFO: Layout = Layout::sized(&[D, D, P, P, A(4), P, P, P, P]);
 pub const LVITEM: Layout = Layout::new(&[D, D, D, D, D, P, D, D, P, D, D, D, P, D, D]);
 pub const LVCOLUMN: Layout = Layout::new(&[D, D, D, P, D, D, D, D, D, D, D]);
-pub const NMLISTVIEW: Layout = Layout::new(&[P, P, D, D, D, D, D, D, D, P]);
+pub const NMLISTVIEW: Layout = Layout::new(&[P, P, D, D, D, D, D, D, D, D, P]);
+pub const NMTOOLBAR: Layout = Layout::new(&[P, P, D, D, AlignP, D, D, B, B, P, P, D, P, A(4)]);
 pub const TVITEM: Layout = Layout::new(&[D, P, D, D, P, D, D, D, D, P]);
 pub const TVINSERTSTRUCT: Layout = Layout::new(&[P, P, D, P, D, D, P, D, D, D, D, P, D, P, P]);
 pub const NMTREEVIEW: Layout = Layout::new(&[
@@ -313,7 +319,6 @@ fn split_args(name: &str) -> &'static [usize] {
 fn message_struct(msg: u32) -> Option<(Layout, Dir)> {
     use Dir::*;
     Some(match msg {
-        0x004E => (NMHDR, InOut),                         // WM_NOTIFY (header only)
         0x002B => (DRAWITEMSTRUCT, In),                   // WM_DRAWITEM
         0x002C => (MEASUREITEMSTRUCT, InOut),             // WM_MEASUREITEM
         0x002D => (DELETEITEMSTRUCT, In),                 // WM_DELETEITEM
@@ -324,20 +329,7 @@ fn message_struct(msg: u32) -> Option<(Layout, Dir)> {
         0x1305 | 0x1307 | 0x133D => (TCITEM, InOut),
         0x1005 | 0x1006 | 0x1007 | 0x102D | 0x104B | 0x104C | 0x104D | 0x1073 | 0x1074 => (LVITEM, InOut),
         0x1019 | 0x101A | 0x101B | 0x105F | 0x1060 | 0x1061 => (LVCOLUMN, InOut),
-        0x110C | 0x110D | 0x113E | 0x113F => (TVITEM, InOut), // TVM_GETITEM/SETITEM
-        0x1100 | 0x1132 => (TVINSERTSTRUCT, In),          // TVM_INSERTITEM
         0x0404 | 0x0432 | 0x0433 | 0x0434 | 0x0435 | 0x0438 | 0x0439 | 0x043A => (TOOLINFO, InOut),
-        _ => return None,
-    })
-}
-
-/// Notification codes whose WM_NOTIFY structure is longer than NMHDR.
-fn notify_struct(code: u32) -> Option<Layout> {
-    let code = code as i32;
-    Some(match code {
-        -199..=-100 => NMLISTVIEW,
-        -299..=-200 => PSHNOTIFY,                    // PSN_*                   // LVN_*
-        -499..=-400 => NMTREEVIEW,                   // TVN_*
         _ => return None,
     })
 }
@@ -497,12 +489,6 @@ type MessageCopy = (Layout, u32, Vec<(Layout, u32, u32)>);
 /// A 32-bit copy of the structure a message from 64-bit code points to.
 fn message_to32(ctx: &ApiContext, memory: &mut dyn GuestMemory, msg: u32, lparam: u32) -> Option<MessageCopy> {
     let (layout, _) = message_struct(msg)?;
-    let layout = if msg == 0x004E {
-        let code = memory.read_u32(lparam + 16).unwrap_or(0);
-        notify_struct(code).unwrap_or(layout)
-    } else {
-        layout
-    };
     let copy = narrow(ctx, memory, &layout, lparam);
     let mut nested = Vec::new();
     // TVM_INSERTITEM's item text and TCITEM text pointers stay as they are;
@@ -597,12 +583,6 @@ pub fn call_proc<M: GuestMemory + ?Sized>(
 ) -> Option<u32> {
     let Some((layout, dir)) = (lparam != 0).then(|| message_struct(msg)).flatten() else {
         return memory.call_guest(proc_va, &[hwnd, msg, wparam, lparam]);
-    };
-    let layout = if msg == 0x004E {
-        let code = memory.read_u32(lparam + 8).unwrap_or(0);
-        notify_struct(code).unwrap_or(layout)
-    } else {
-        layout
     };
     let copy = widen_struct(ctx, memory, &layout, lparam);
     let result = memory.call_guest(proc_va, &[hwnd, msg, wparam, copy]);
