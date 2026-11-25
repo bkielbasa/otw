@@ -315,25 +315,6 @@ fn split_args(name: &str) -> &'static [usize] {
     }
 }
 
-/// Window messages whose lParam points to a structure, and how it is used.
-fn message_struct(msg: u32) -> Option<(Layout, Dir)> {
-    use Dir::*;
-    Some(match msg {
-        0x002B => (DRAWITEMSTRUCT, In),                   // WM_DRAWITEM
-        0x002C => (MEASUREITEMSTRUCT, InOut),             // WM_MEASUREITEM
-        0x002D => (DELETEITEMSTRUCT, In),                 // WM_DELETEITEM
-        0x0039 => (COMPAREITEMSTRUCT, In),                // WM_COMPAREITEM
-        0x0053 => (HELPINFO, In),                         // WM_HELP
-        0x004A => (COPYDATASTRUCT, In),                   // WM_COPYDATA
-        0x1304 | 0x1306 | 0x133C | 0x133E => (TCITEM, InOut), // TCM_GET/SET/INSERTITEM(A/W)
-        0x1305 | 0x1307 | 0x133D => (TCITEM, InOut),
-        0x1005 | 0x1006 | 0x1007 | 0x102D | 0x104B | 0x104C | 0x104D | 0x1073 | 0x1074 => (LVITEM, InOut),
-        0x1019 | 0x101A | 0x101B | 0x105F | 0x1060 | 0x1061 => (LVCOLUMN, InOut),
-        0x0404 | 0x0432 | 0x0433 | 0x0434 | 0x0435 | 0x0438 | 0x0439 | 0x043A => (TOOLINFO, InOut),
-        _ => return None,
-    })
-}
-
 // ── Calls from 64-bit code ───────────────────────────────────────────────
 
 /// What a function is called, under its x64 name.
@@ -440,26 +421,10 @@ pub fn call(
         narrow_args[index] = copy;
         copies.push((index, layout, dir, original, copy));
     }
-    // Messages with structures, sent by the program to a window procedure
-    // of the subsystem.
-    let message_args = text.and_then(message_position);
-    let mut message_copy = None;
-    if let Some((msg_index, lparam_index)) = message_args {
-        let (msg, lparam) = (narrow_args[msg_index], narrow_args[lparam_index]);
-        if lparam != 0 {
-            if let Some(copy) = message_to32(ctx, memory, msg, lparam) {
-                narrow_args[lparam_index] = copy.1;
-                message_copy = Some((msg, lparam, copy));
-            }
-        }
-    }
     if trace() {
         eprintln!("[x64] {dll}!{} {:x?} -> {:x?}", name.display(), args, narrow_args);
     }
     let outcome: Option<ApiOutcome> = crate::win32::dispatch_with_memory(ctx, memory, dll, &name, &narrow_args, caller);
-    if let Some((msg, original, copy)) = message_copy {
-        message_back_to64(ctx, memory, msg, original, copy);
-    }
     for (_, layout, dir, original, copy) in copies {
         if dir != Dir::In {
             copy_back(memory, &layout, copy, false, original);
@@ -469,53 +434,6 @@ pub fn call(
     let outcome = outcome?;
     let value = outcome.wide.unwrap_or_else(|| widen(outcome.value));
     Some(ApiOutcome { value: value as u32, wide: Some(value), arg_count: count, exit_code: outcome.exit_code })
-}
-
-/// Where the message and lParam are among a messaging function's arguments.
-fn message_position(name: &str) -> Option<(usize, usize)> {
-    Some(match name {
-        "SendMessageW" | "SendMessageA" | "PostMessageW" | "PostMessageA" | "SendNotifyMessageW"
-        | "DefWindowProcW" | "DefWindowProcA" | "DefDlgProcW" | "DefDlgProcA" | "DefMDIChildProcW"
-        | "DefMDIChildProcA" => (1, 3),
-        "SendDlgItemMessageW" | "SendDlgItemMessageA" | "CallWindowProcW" | "CallWindowProcA"
-        | "DefFrameProcW" | "DefFrameProcA" | "SendMessageTimeoutW" => (2, 4),
-        _ => return None,
-    })
-}
-
-/// A message structure: (layout, scratch copy, extra copies to free).
-type MessageCopy = (Layout, u32, Vec<(Layout, u32, u32)>);
-
-/// A 32-bit copy of the structure a message from 64-bit code points to.
-fn message_to32(ctx: &ApiContext, memory: &mut dyn GuestMemory, msg: u32, lparam: u32) -> Option<MessageCopy> {
-    let (layout, _) = message_struct(msg)?;
-    let copy = narrow(ctx, memory, &layout, lparam);
-    let mut nested = Vec::new();
-    // TVM_INSERTITEM's item text and TCITEM text pointers stay as they are;
-    // nested structures only in a few messages.
-    if msg == 0x0083 {
-        // WM_NCCALCSIZE with wParam TRUE: the WINDOWPOS pointer.
-        let pos64 = memory.read_u32(copy + 48).unwrap_or(0);
-        if pos64 != 0 {
-            let pos32 = narrow(ctx, memory, &WINDOWPOS, pos64);
-            let _ = memory.write_u32(copy + 48, pos32);
-            nested.push((WINDOWPOS, pos64, pos32));
-        }
-    }
-    Some((layout, copy, nested))
-}
-
-fn message_back_to64(ctx: &ApiContext, memory: &mut dyn GuestMemory, msg: u32, original: u32, copy: MessageCopy) {
-    let (layout, va, nested) = copy;
-    let dir = message_struct(msg).map(|(_, d)| d).unwrap_or(Dir::In);
-    if dir != Dir::In {
-        copy_back(memory, &layout, va, false, original);
-    }
-    for (layout, original, copy) in nested {
-        copy_back(memory, &layout, copy, false, original);
-        free(ctx, copy);
-    }
-    free(ctx, va);
 }
 
 /// Functions with a 64-bit form of their own.
@@ -570,10 +488,10 @@ fn module_base(ctx: &ApiContext, address: u32) -> u32 {
 
 // ── Calls into 64-bit code ───────────────────────────────────────────────
 
-/// Call a 64-bit window procedure with a message from the subsystem:
-/// structures the message points to are given to it in 64-bit layout.
+/// Call a 64-bit window procedure with a message from the subsystem (its
+/// structures are already in the process's layout).
 pub fn call_proc<M: GuestMemory + ?Sized>(
-    ctx: &ApiContext,
+    _ctx: &ApiContext,
     memory: &mut M,
     proc_va: u32,
     hwnd: u32,
@@ -581,16 +499,7 @@ pub fn call_proc<M: GuestMemory + ?Sized>(
     wparam: u32,
     lparam: u32,
 ) -> Option<u32> {
-    let Some((layout, dir)) = (lparam != 0).then(|| message_struct(msg)).flatten() else {
-        return memory.call_guest(proc_va, &[hwnd, msg, wparam, lparam]);
-    };
-    let copy = widen_struct(ctx, memory, &layout, lparam);
-    let result = memory.call_guest(proc_va, &[hwnd, msg, wparam, copy]);
-    if dir != Dir::In {
-        copy_back(memory, &layout, copy, true, lparam);
-    }
-    free(ctx, copy);
-    result
+    memory.call_guest(proc_va, &[hwnd, msg, wparam, lparam])
 }
 
 /// Call a 64-bit hook procedure: CBT window creation passes a structure

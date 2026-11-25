@@ -782,8 +782,23 @@ fn with_list<R>(ctx: &ApiContext, hwnd: u32, f: impl FnOnce(&mut ListView) -> R)
 
 /// Read an LVITEM's text (pszText at 20), in either character set.
 fn item_text<M: GuestMemory + ?Sized>(memory: &mut M, item: u32, wide: bool) -> Option<Vec<u8>> {
-    let va = rd(memory, item + 20);
+    let va = lvi(memory, item, 5);
     (va >= 0x10000 && va != u32::MAX).then(|| text(memory, va, wide))
+}
+
+/// LVITEM field `index` in the process's layout: mask, iItem, iSubItem,
+/// state, stateMask, pszText, cchTextMax, iImage, lParam, ...
+fn lvi<M: GuestMemory + ?Sized>(memory: &mut M, item: u32, index: usize) -> u32 {
+    crate::win32::x64::View::new(memory, &crate::win32::x64::LVITEM, item).get32(memory, index)
+}
+
+/// LVCOLUMN field `index`: mask, fmt, cx, pszText, ...
+fn lvc<M: GuestMemory + ?Sized>(memory: &mut M, column: u32, index: usize) -> u32 {
+    crate::win32::x64::View::new(memory, &crate::win32::x64::LVCOLUMN, column).get32(memory, index)
+}
+
+fn set_lvi<M: GuestMemory + ?Sized>(memory: &mut M, item: u32, index: usize, value: u32) {
+    crate::win32::x64::View::new(memory, &crate::win32::x64::LVITEM, item).set(memory, index, value);
 }
 
 /// Write `value` into a caller buffer of `capacity` characters.
@@ -992,12 +1007,12 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         // LVM_INSERTITEMA/W
         0x1007 | 0x104D => {
             let wide = msg == 0x104D;
-            let mask = rd(memory, lparam);
-            let index = rd(memory, lparam + 4) as usize;
+            let mask = lvi(memory, lparam, 0);
+            let index = lvi(memory, lparam, 1) as usize;
             let label = if mask & 1 != 0 { item_text(memory, lparam, wide).unwrap_or_default() } else { Vec::new() };
-            let state_mask = rd(memory, lparam + 16);
-            let state = if mask & 8 != 0 { rd(memory, lparam + 12) & state_mask } else { 0 };
-            let item_lparam = if mask & 4 != 0 { rd(memory, lparam + 32) } else { 0 };
+            let state_mask = lvi(memory, lparam, 4);
+            let state = if mask & 8 != 0 { lvi(memory, lparam, 3) & state_mask } else { 0 };
+            let item_lparam = if mask & 4 != 0 { lvi(memory, lparam, 8) } else { 0 };
             let at = with_list(ctx, hwnd, |list| {
                 let at = index.min(list.items.len());
                 let mut state = state;
@@ -1013,9 +1028,9 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         // LVM_SETITEMA/W, LVM_GETITEMA/W
         0x1006 | 0x104C | 0x1005 | 0x104B => {
             let wide = msg == 0x104C || msg == 0x104B;
-            let mask = rd(memory, lparam);
-            let index = rd(memory, lparam + 4) as usize;
-            let sub = rd(memory, lparam + 8) as usize;
+            let mask = lvi(memory, lparam, 0);
+            let index = lvi(memory, lparam, 1) as usize;
+            let sub = lvi(memory, lparam, 2) as usize;
             if index >= count() {
                 return 0;
             }
@@ -1032,26 +1047,26 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
                     }
                 }
                 if mask & 4 != 0 {
-                    let value = rd(memory, lparam + 32);
+                    let value = lvi(memory, lparam, 8);
                     with_list(ctx, hwnd, |list| list.items[index].lparam = value);
                 }
                 if mask & 8 != 0 {
-                    let (state, state_mask) = (rd(memory, lparam + 12), rd(memory, lparam + 16));
+                    let (state, state_mask) = (lvi(memory, lparam, 3), lvi(memory, lparam, 4));
                     set_state(ctx, memory, hwnd, index, state, state_mask);
                 }
                 invalidate_control(ctx, hwnd);
             } else {
                 let item = with_list(ctx, hwnd, |list| list.items[index].clone());
                 if mask & 1 != 0 {
-                    let (va, capacity) = (rd(memory, lparam + 20), rd(memory, lparam + 24));
+                    let (va, capacity) = (lvi(memory, lparam, 5), lvi(memory, lparam, 6));
                     put_text(memory, va, capacity, item.texts.get(sub).map(|t| t.as_slice()).unwrap_or(b""), wide);
                 }
                 if mask & 4 != 0 {
-                    let _ = memory.write_u32(lparam + 32, item.lparam);
+                    set_lvi(memory, lparam, 8, item.lparam);
                 }
                 if mask & 8 != 0 {
-                    let state_mask = rd(memory, lparam + 16);
-                    let _ = memory.write_u32(lparam + 12, item.state & state_mask);
+                    let state_mask = lvi(memory, lparam, 4);
+                    set_lvi(memory, lparam, 3, item.state & state_mask);
                 }
             }
             1
@@ -1091,9 +1106,9 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         // LVM_INSERTCOLUMNA/W
         0x101B | 0x1061 => {
             let wide = msg == 0x1061;
-            let mask = rd(memory, lparam);
-            let width = if mask & 2 != 0 { rd(memory, lparam + 8) as i32 } else { 80 };
-            let title_va = rd(memory, lparam + 12);
+            let mask = lvc(memory, lparam, 0);
+            let width = if mask & 2 != 0 { lvc(memory, lparam, 2) as i32 } else { 80 };
+            let title_va = lvc(memory, lparam, 3);
             let title = if mask & 4 != 0 { text(memory, title_va, wide) } else { Vec::new() };
             let at = with_list(ctx, hwnd, |list| {
                 let at = (wparam as usize).min(list.columns.len());
@@ -1120,7 +1135,7 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         }
         // LVM_SETITEMSTATE (index -1: all), LVM_GETITEMSTATE
         0x102B => {
-            let (state, mask) = (rd(memory, lparam + 12), rd(memory, lparam + 16));
+            let (state, mask) = (lvi(memory, lparam, 3), lvi(memory, lparam, 4));
             let indices: Vec<usize> = if wparam as i32 == -1 { (0..count()).collect() } else { vec![wparam as usize] };
             for index in indices {
                 set_state(ctx, memory, hwnd, index, state, mask);
@@ -1130,13 +1145,13 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         0x102C => with_list(ctx, hwnd, |list| list.items.get(wparam as usize).map(|i| i.state & lparam).unwrap_or(0)),
         // LVM_GETITEMTEXTA/W, LVM_SETITEMTEXTA/W
         0x102D | 0x1073 => {
-            let sub = rd(memory, lparam + 8) as usize;
+            let sub = lvi(memory, lparam, 2) as usize;
             let value = with_list(ctx, hwnd, |list| list.items.get(wparam as usize).and_then(|i| i.texts.get(sub).cloned()).unwrap_or_default());
-            let (va, capacity) = (rd(memory, lparam + 20), rd(memory, lparam + 24));
+            let (va, capacity) = (lvi(memory, lparam, 5), lvi(memory, lparam, 6));
             put_text(memory, va, capacity, &value, msg == 0x1073)
         }
         0x102E | 0x1074 => {
-            let sub = rd(memory, lparam + 8) as usize;
+            let sub = lvi(memory, lparam, 2) as usize;
             let value = item_text(memory, lparam, msg == 0x1074).unwrap_or_default();
             with_list(ctx, hwnd, |list| {
                 if let Some(item) = list.items.get_mut(wparam as usize) {

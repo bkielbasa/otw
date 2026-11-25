@@ -347,18 +347,10 @@ fn paint_button<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd:
         }
         0xB => {
             // Owner-draw: WM_DRAWITEM to the parent.
-            let dis = user::scratch(ctx, 48);
             let state = (window.control.pressed as u32)
                 | if focused { 0x10 } else { 0 }
                 | if disabled { 0x4 } else { 0 };
-            let values = [
-                4u32, window.id, 0, 1, state, hwnd, hdc, 0, 0, cw as u32, ch as u32, 0,
-            ];
-            for (index, value) in values.iter().enumerate() {
-                let _ = memory.write_u32(dis + index as u32 * 4, *value);
-            }
-            send(ctx, memory, window.parent, 0x002B, window.id, dis);
-            user::free_scratch(ctx, dis);
+            send_draw_item(ctx, memory, window.parent, [4, window.id, 0, 1, state, hwnd, hdc], (cw, ch));
         }
         _ => {}
     }
@@ -701,15 +693,7 @@ fn static_proc<M: GuestMemory + ?Sized>(
                     });
                 }
                 0xD => {
-                    let dis = user::scratch(ctx, 48);
-                    let values = [
-                        5u32, window.id, 0, 1, 0, hwnd, hdc, 0, 0, cw as u32, ch as u32, 0,
-                    ];
-                    for (index, value) in values.iter().enumerate() {
-                        let _ = memory.write_u32(dis + index as u32 * 4, *value);
-                    }
-                    send(ctx, memory, window.parent, 0x002B, window.id, dis);
-                    user::free_scratch(ctx, dis);
+                    send_draw_item(ctx, memory, window.parent, [5, window.id, 0, 1, 0, hwnd, hdc], (cw, ch));
                 }
                 _ => {}
             }
@@ -4316,4 +4300,19 @@ mod tests {
         );
         assert_eq!(out, b"Paint -5% 00ab z  |");
     }
+}
+
+/// Send WM_DRAWITEM to `parent` with a DRAWITEMSTRUCT in the process's
+/// layout: CtlType, CtlID, itemID, itemAction, itemState, hwndItem, hDC,
+/// rcItem (0, 0, width, height), itemData 0.
+fn send_draw_item<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, parent: u32, fields: [u32; 7], (width, height): (i32, i32)) {
+    let dis = user::scratch(ctx, 80);
+    let _ = memory.write_bytes(dis, &[0u8; 80]);
+    let view = crate::win32::x64::View::new(memory, &crate::win32::x64::DRAWITEMSTRUCT, dis);
+    for (index, value) in fields.into_iter().enumerate() {
+        view.set(memory, index, value);
+    }
+    let _ = gdi::write_rect(memory, view.at(7), Rect::new(0, 0, width, height));
+    send(ctx, memory, parent, 0x002B, fields[1], dis);
+    user::free_scratch(ctx, dis);
 }
