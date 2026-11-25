@@ -2767,8 +2767,14 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                             .unwrap_or(0)
                             .to_le_bytes(),
                     );
+                    // In a 64-bit process bmBits is 8 bytes (BITMAP is 32), and
+                    // DIBSECTION's dshSection is too (aligned: 104 in all).
+                    let x64 = memory.ptr_size() == 8;
+                    if x64 {
+                        b.extend_from_slice(&[0; 4]);
+                    }
                     if let Some(section) = &bitmap.dib {
-                        if size >= 84 {
+                        if size >= if x64 { 104 } else { 84 } {
                             // DIBSECTION: BITMAP + BITMAPINFOHEADER + masks + section.
                             for v in [40u32, section.width as u32, section.height as u32] {
                                 b.extend_from_slice(&v.to_le_bytes());
@@ -2790,8 +2796,14 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                                 b.extend_from_slice(&v.to_le_bytes());
                             }
                             let (r, g, bl) = section.masks.unwrap_or((0, 0, 0));
-                            for v in [r, g, bl, 0, 0] {
+                            for v in [r, g, bl] {
                                 b.extend_from_slice(&v.to_le_bytes());
+                            }
+                            // dshSection (pointer-sized, aligned), dsOffset.
+                            if x64 {
+                                b.extend_from_slice(&[0; 4 + 8 + 4 + 4]);
+                            } else {
+                                b.extend_from_slice(&[0; 8]);
                             }
                         }
                     }

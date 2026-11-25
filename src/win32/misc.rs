@@ -109,7 +109,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "CreateFontW" => 14,
         "GetUserNameA" | "GetUserNameW" | "InitializeSecurityDescriptor" | "GetKeyboardLayoutList" => 2,
         "SetSecurityDescriptorDacl" => 4,
-        "ReleaseMutex" | "GetSystemInfo" | "IsBadCodePtr" | "ReinitializeCriticalSection"
+        "ReleaseMutex" | "GetSystemInfo" | "GetNativeSystemInfo" | "IsBadCodePtr" | "ReinitializeCriticalSection"
         | "SetClipboardViewer" | "DdeDisconnect" | "DdeUninitialize" | "SetKeyboardState"
         | "CreateBitmapIndirect" => 1,
         "ChangeClipboardChain" | "DdeFreeStringHandle" | "GetWindowRgn" | "ShowWindowAsync"
@@ -526,14 +526,12 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         "GetThreadLocale" => 0x0409,
         "SetThreadLocale" => 1,
         "IsBadCodePtr" => 0,
-        "GetSystemInfo" => {
-            let mut info = Vec::with_capacity(36);
-            for value in [0u32, 0x1000, 0x1_0000, 0x7FFE_FFFF, 1, 1, 586, 0x1_0000] {
-                info.extend_from_slice(&value.to_le_bytes());
-            }
-            info.extend_from_slice(&5u16.to_le_bytes());
-            info.extend_from_slice(&0u16.to_le_bytes());
-            let _ = memory.write_bytes(args[0], &info);
+        "GetSystemInfo" | "GetNativeSystemInfo" => {
+            // SYSTEM_INFO in the process's layout: a Pentium for 32-bit
+            // programs, an x64 processor for 64-bit ones.
+            let (architecture, kind, level) = if memory.ptr_size() == 8 { (9, 8664, 6) } else { (0, 586, 5) };
+            let values = [architecture, 0, 0x1000, 0x1_0000, 0x7FFE_FFFF, 1, 1, kind, 0x1_0000, level, 0];
+            crate::win32::x64::write_struct(memory, &crate::win32::x64::SYSTEM_INFO, args[0], &values);
             0
         }
         "GetStringTypeExA" => call(ctx, memory, "KERNEL32.dll", "GetStringTypeA", args),
@@ -669,9 +667,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "MessageBoxIndirectA" | "MessageBoxIndirectW" => {
             // MSGBOXPARAMS: owner 4, instance 8, text 12, caption 16, style 20.
-            let field = |memory: &mut M, offset| memory.read_u32(args[0] + offset).unwrap_or(0);
+            // MSGBOXPARAMS (process layout): owner, text, caption, style.
+            let params = crate::win32::x64::View::new(memory, &crate::win32::x64::MSGBOXPARAMS, args[0]);
             let (owner, text, caption, style) =
-                (field(memory, 4), field(memory, 12), field(memory, 16), field(memory, 20));
+                (params.get32(memory, 1), params.get32(memory, 3), params.get32(memory, 4), params.get32(memory, 5));
             let call_name = if name.ends_with('W') { "MessageBoxW" } else { "MessageBoxA" };
             call(ctx, memory, "USER32.dll", call_name, &[owner, text, caption, style & 0xFFFF_FF7F])
         }

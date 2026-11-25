@@ -676,9 +676,7 @@ fn native<M: GuestMemory + ?Sized>(
         }
         "SetEnvironmentVariableW" | "SetEnvironmentVariableA" => 1,
         "GetStartupInfoW" => {
-            let mut info = vec![0u8; 68];
-            info[0] = 68;
-            let _ = memory.write_bytes(args[0], &info);
+            crate::win32::x64::write_struct(memory, &crate::win32::x64::STARTUPINFO, args[0], &[]);
             0
         }
         "GetVersionExW" | "GetVersionExA" => {
@@ -1070,11 +1068,11 @@ fn native<M: GuestMemory + ?Sized>(
             }
         }
         "SetMenuItemInfoW" => {
-            // MENUITEMINFOW: fMask 4, fState 12, wID 16, dwTypeData 36.
-            let mask = memory.read_u32(args[3] + 4).unwrap_or(0);
-            let state = memory.read_u32(args[3] + 12).unwrap_or(0);
-            let id = memory.read_u32(args[3] + 16).unwrap_or(0);
-            let text_va = memory.read_u32(args[3] + 36).unwrap_or(0);
+            // MENUITEMINFOW in the process's layout: fMask, fState, wID, dwTypeData.
+            let mask = crate::win32::xp_user::mii(memory, args[3], 1);
+            let state = crate::win32::xp_user::mii(memory, args[3], 3);
+            let id = crate::win32::xp_user::mii(memory, args[3], 4);
+            let text_va = crate::win32::xp_user::mii(memory, args[3], 9);
             let text = (mask & 0x50 != 0 && text_va >= 0x10000).then(|| wide_to_ansi(&read_wstr(memory, text_va)));
             let mut shared = ctx.shared.borrow_mut();
             let item = shared.gui.menus.get_mut(&args[0]).and_then(|menu| {

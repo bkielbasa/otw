@@ -152,72 +152,21 @@ impl View {
     }
 }
 
-/// Copy a structure from one layout to the other.
-fn convert(layout: &Layout, from: &[u8], to_x64: bool) -> Vec<u8> {
-    let (source, _) = layout.offsets(!to_x64);
-    let (target, size) = layout.offsets(to_x64);
-    let mut out = vec![0u8; size as usize];
-    for (index, field) in layout.fields.iter().enumerate() {
-        let (s, t) = (source[index] as usize, target[index] as usize);
-        match field {
-            F::P => {
-                let value = u32::from_le_bytes(from.get(s..s + 4).and_then(|b| b.try_into().ok()).unwrap_or([0; 4]));
-                if to_x64 {
-                    out[t..t + 8].copy_from_slice(&widen(value).to_le_bytes());
-                } else {
-                    out[t..t + 4].copy_from_slice(&value.to_le_bytes());
-                }
-            }
-            other => {
-                let (n, _) = other.size_align(to_x64);
-                if let Some(bytes) = from.get(s..s + n as usize) {
-                    out[t..t + n as usize].copy_from_slice(bytes);
-                }
-            }
-        }
+/// Fill a structure in the process's layout: zeroed, then its first fields
+/// set to `values` in order; a sized structure gets its size first.
+pub fn write_struct<M: GuestMemory + ?Sized>(memory: &mut M, layout: &Layout, va: u32, values: &[u32]) {
+    if va == 0 {
+        return;
     }
+    let x64 = memory.ptr_size() == 8;
+    let _ = memory.write_bytes(va, &vec![0u8; layout.size(x64) as usize]);
+    let view = View::new(memory, layout, va);
+    let first = usize::from(layout.sized);
     if layout.sized {
-        out[0..4].copy_from_slice(&size.to_le_bytes());
+        view.set(memory, 0, layout.size(x64));
     }
-    out
-}
-
-/// A copy of the 64-bit structure at `va64` in 32-bit layout, in scratch
-/// memory.
-pub fn narrow<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, layout: &Layout, va64: u32) -> u32 {
-    let from = memory.read_bytes(va64, layout.size(true) as usize).unwrap_or_default();
-    let bytes = convert(layout, &from, false);
-    let va = ctx.shared.borrow_mut().heap.alloc(bytes.len() as u32 + 16).unwrap_or(0);
-    let _ = memory.write_bytes(va, &bytes);
-    va
-}
-
-/// A copy of the 32-bit structure at `va32` in 64-bit layout, in scratch
-/// memory.
-pub fn widen_struct<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, layout: &Layout, va32: u32) -> u32 {
-    let from = memory.read_bytes(va32, layout.size(false) as usize).unwrap_or_default();
-    let bytes = convert(layout, &from, true);
-    let va = ctx.shared.borrow_mut().heap.alloc(bytes.len() as u32 + 16).unwrap_or(0);
-    let _ = memory.write_bytes(va, &bytes);
-    va
-}
-
-/// Write a 32-bit scratch copy back over the 64-bit original (or the
-/// reverse), keeping the original's size field.
-pub fn copy_back<M: GuestMemory + ?Sized>(memory: &mut M, layout: &Layout, from: u32, from_x64: bool, to: u32) {
-    let source = memory.read_bytes(from, layout.size(from_x64) as usize).unwrap_or_default();
-    let mut bytes = convert(layout, &source, !from_x64);
-    if layout.sized {
-        if let Some(original) = memory.read_bytes(to, 4) {
-            bytes[0..4].copy_from_slice(&original);
-        }
-    }
-    let _ = memory.write_bytes(to, &bytes);
-}
-
-fn free(ctx: &ApiContext, va: u32) {
-    if va != 0 {
-        ctx.shared.borrow_mut().heap.free(va);
+    for (index, &value) in values.iter().enumerate() {
+        view.set(memory, first + index, value);
     }
 }
 
@@ -244,61 +193,19 @@ pub const SYSTEM_INFO: Layout = Layout::new(&[W, W, D, P, P, P, D, D, D, W, W]);
 pub const MEMORY_BASIC_INFORMATION: Layout = Layout::new(&[P, P, D, P, D, D, D]);
 pub const PROCESS_INFORMATION: Layout = Layout::new(&[P, P, D, D]);
 pub const DRAWITEMSTRUCT: Layout = Layout::new(&[D, D, D, D, D, P, P, A(4), P]);
-pub const MEASUREITEMSTRUCT: Layout = Layout::new(&[D, D, D, D, D, P]);
-pub const DELETEITEMSTRUCT: Layout = Layout::new(&[D, D, D, P, P]);
-pub const COMPAREITEMSTRUCT: Layout = Layout::new(&[D, D, P, D, P, D, P, D]);
-pub const HELPINFO: Layout = Layout::sized(&[D, D, D, P, P, D, D]);
-pub const CWPSTRUCT: Layout = Layout::new(&[P, P, D, P]);
-pub const CWPRETSTRUCT: Layout = Layout::new(&[P, P, P, D, P]);
-pub const BITMAP: Layout = Layout::new(&[D, D, D, D, W, W, P]);
 pub const MSGBOXPARAMS: Layout = Layout::sized(&[D, P, P, P, P, D, P, P, P, D]);
 pub const SHELLEXECUTEINFO: Layout = Layout::sized(&[D, D, P, P, P, P, P, D, P, P, P, P, D, P, P]);
 pub const OPENFILENAME: Layout = Layout::sized(&[
     D, P, P, P, P, D, D, P, D, P, D, P, P, D, W, W, P, P, P, P, P, D, D,
 ]);
-pub const BROWSEINFO: Layout = Layout::new(&[P, P, P, P, D, P, P, D]);
-pub const SECURITY_ATTRIBUTES: Layout = Layout::sized(&[D, P, D]);
-pub const TCITEM: Layout = Layout::new(&[D, D, D, P, D, D, P]);
-pub const TOOLINFO: Layout = Layout::sized(&[D, D, P, P, A(4), P, P, P, P]);
+pub const SHFILEOPSTRUCT: Layout = Layout::new(&[P, D, P, P, W, D, P, P]);
 pub const LVITEM: Layout = Layout::new(&[D, D, D, D, D, P, D, D, P, D, D, D, P, D, D]);
 pub const LVCOLUMN: Layout = Layout::new(&[D, D, D, P, D, D, D, D, D, D, D]);
 pub const NMLISTVIEW: Layout = Layout::new(&[P, P, D, D, D, D, D, D, D, D, P]);
 pub const NMTOOLBAR: Layout = Layout::new(&[P, P, D, D, AlignP, D, D, B, B, P, P, D, P, A(4)]);
 pub const TVITEM: Layout = Layout::new(&[D, P, D, D, P, D, D, D, D, P]);
-pub const TVINSERTSTRUCT: Layout = Layout::new(&[P, P, D, P, D, D, P, D, D, D, D, P, D, P, P]);
-pub const NMTREEVIEW: Layout = Layout::new(&[
-    P, P, D, D, D, P, D, D, P, D, D, D, D, P, D, P, D, D, P, D, D, D, D, P, D, D,
-]);
 pub const PSHNOTIFY: Layout = Layout::new(&[P, P, D, P]);
-pub const COPYDATASTRUCT: Layout = Layout::new(&[P, D, P]);
 pub const CBT_CREATEWND: Layout = Layout::new(&[P, P]);
-pub const NCCALCSIZE_PARAMS: Layout = Layout::new(&[A(12), P]);
-
-/// How a call uses a structure argument.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Dir {
-    In,
-    Out,
-    InOut,
-}
-
-/// The structure arguments of functions, by argument index.
-fn struct_args(name: &str) -> &'static [(usize, Layout, Dir)] {
-    use Dir::*;
-    match name {
-        "GetMenuItemInfoW" | "GetMenuItemInfoA" => &[(3, MENUITEMINFO, InOut)],
-        "SetMenuItemInfoW" | "SetMenuItemInfoA" | "InsertMenuItemW" | "InsertMenuItemA" => &[(3, MENUITEMINFO, In)],
-        "GetStartupInfoW" | "GetStartupInfoA" => &[(0, STARTUPINFO, Out)],
-        "GetSystemInfo" | "GetNativeSystemInfo" => &[(0, SYSTEM_INFO, Out)],
-        "VirtualQuery" => &[(1, MEMORY_BASIC_INFORMATION, Out)],
-        "CreateProcessW" | "CreateProcessA" => &[(8, STARTUPINFO, In), (9, PROCESS_INFORMATION, Out)],
-        "MessageBoxIndirectW" | "MessageBoxIndirectA" => &[(0, MSGBOXPARAMS, In)],
-        "ShellExecuteExW" | "ShellExecuteExA" => &[(0, SHELLEXECUTEINFO, InOut)],
-        "GetOpenFileNameW" | "GetOpenFileNameA" | "GetSaveFileNameW" | "GetSaveFileNameA" => &[(0, OPENFILENAME, InOut)],
-        "SHBrowseForFolderW" | "SHBrowseForFolderA" => &[(0, BROWSEINFO, InOut)],
-        _ => &[],
-    }
-}
 
 /// Arguments passed by value as 64-bit quantities (two 32-bit arguments in
 /// the subsystem's signature), by x64 argument index.
@@ -398,39 +305,10 @@ pub fn call(
             narrow_args.push((value >> 32) as u32);
         }
     }
-    // Structures by pointer: 32-bit copies for the call.
-    let mut copies: Vec<(usize, Layout, Dir, u32, u32)> = Vec::new();
-    for &(index, layout, dir) in text.map(struct_args).unwrap_or(&[]) {
-        let Some(&original) = narrow_args.get(index) else {
-            continue;
-        };
-        if original == 0 {
-            continue;
-        }
-        let copy = if dir == Dir::Out {
-            let va = ctx.shared.borrow_mut().heap.alloc(layout.size(false) + 16).unwrap_or(0);
-            let mut zero = vec![0u8; layout.size(false) as usize];
-            if layout.sized {
-                zero[0..4].copy_from_slice(&layout.size(false).to_le_bytes());
-            }
-            let _ = memory.write_bytes(va, &zero);
-            va
-        } else {
-            narrow(ctx, memory, &layout, original)
-        };
-        narrow_args[index] = copy;
-        copies.push((index, layout, dir, original, copy));
-    }
     if trace() {
         eprintln!("[x64] {dll}!{} {:x?} -> {:x?}", name.display(), args, narrow_args);
     }
     let outcome: Option<ApiOutcome> = crate::win32::dispatch_with_memory(ctx, memory, dll, &name, &narrow_args, caller);
-    for (_, layout, dir, original, copy) in copies {
-        if dir != Dir::In {
-            copy_back(memory, &layout, copy, false, original);
-        }
-        free(ctx, copy);
-    }
     let outcome = outcome?;
     let value = outcome.wide.unwrap_or_else(|| widen(outcome.value));
     Some(ApiOutcome { value: value as u32, wide: Some(value), arg_count: count, exit_code: outcome.exit_code })
@@ -505,46 +383,15 @@ pub fn call_proc<M: GuestMemory + ?Sized>(
 /// Call a 64-bit hook procedure: CBT window creation passes a structure
 /// pointing to a CREATESTRUCT; window-procedure hooks pass the message.
 pub fn call_hook<M: GuestMemory + ?Sized>(
-    ctx: &ApiContext,
+    _ctx: &ApiContext,
     memory: &mut M,
     proc_va: u32,
-    kind: i32,
+    _kind: i32,
     code: u32,
     wparam: u32,
     lparam: u32,
 ) -> Option<u32> {
-    let pair = match (kind, code) {
-        (4, _) => Some((CWPSTRUCT, None)),                   // WH_CALLWNDPROC
-        (12, _) => Some((CWPRETSTRUCT, None)),               // WH_CALLWNDPROCRET
-        (3, _) => Some((MSG, None)),                         // WH_GETMESSAGE
-        _ => None,
-    };
-    let Some((outer, inner)) = pair.filter(|_| lparam != 0) else {
-        return memory.call_guest(proc_va, &[code, wparam, lparam]);
-    };
-    let copy = widen_struct(ctx, memory, &outer, lparam);
-    let mut inner_copy = None;
-    if let Some(inner) = inner {
-        let pointer = memory.read_u32(lparam).unwrap_or(0);
-        if pointer != 0 {
-            let wide = widen_struct(ctx, memory, &inner, pointer);
-            let _ = memory.write_bytes(copy, &(wide as u64).to_le_bytes());
-            inner_copy = Some((inner, pointer, wide));
-        }
-    }
-    let result = memory.call_guest(proc_va, &[code, wparam, copy]);
-    if let Some((inner, pointer, wide)) = inner_copy {
-        copy_back(memory, &inner, wide, true, pointer);
-        free(ctx, wide);
-    }
-    // CBT_CREATEWND's hwndInsertAfter may change; the pointer stays ours.
-    if let Some(after) = memory.read_u32(copy + 8) {
-        if kind == 5 {
-            let _ = memory.write_u32(lparam + 4, after);
-        }
-    }
-    free(ctx, copy);
-    result
+    memory.call_guest(proc_va, &[code, wparam, lparam])
 }
 
 #[cfg(test)]
@@ -574,16 +421,36 @@ mod tests {
     }
 
     #[test]
-    fn converting_widens_pointers_and_keeps_values() {
-        let mut msg32 = Vec::new();
-        for value in [0x1234u32, 0x0201, 0xFFFF_FFFF, 0x0040_1000, 99, 5, 6] {
-            msg32.extend_from_slice(&value.to_le_bytes());
+    fn views_use_the_process_layout() {
+        struct Flat(Vec<u8>, u32);
+        impl GuestMemory for Flat {
+            fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+                self.0.get(va as usize..va as usize + len).map(<[u8]>::to_vec)
+            }
+            fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+                self.0.get_mut(va as usize..va as usize + bytes.len())?.copy_from_slice(bytes);
+                Some(())
+            }
+            fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+                self.write_bytes(va, &value.to_le_bytes())
+            }
+            fn ptr_size(&self) -> u32 {
+                self.1
+            }
         }
-        let msg64 = convert(&MSG, &msg32, true);
-        assert_eq!(&msg64[0..8], &0x1234u64.to_le_bytes());
-        assert_eq!(&msg64[8..12], &0x0201u32.to_le_bytes());
-        assert_eq!(&msg64[16..24], &u64::MAX.to_le_bytes());
-        assert_eq!(&msg64[24..32], &0x0040_1000u64.to_le_bytes());
-        assert_eq!(convert(&MSG, &msg64, false), msg32);
+        for size in [4, 8] {
+            let mut memory = Flat(vec![0xAA; 80], size);
+            write_struct(&mut memory, &MSG, 16, &[0x1234, 0x0201, 0xFFFF_FFFF, 0x0040_1000, 99, 5, 6]);
+            let view = View::new(&memory, &MSG, 16);
+            assert_eq!(view.get32(&mut memory, 1), 0x0201);
+            assert_eq!(view.get32(&mut memory, 3), 0x0040_1000);
+            if size == 8 {
+                // Pointer-sized fields are written in full: -1 stays -1.
+                assert_eq!(view.get(&mut memory, 2), u64::MAX);
+                assert_eq!(&memory.0[24..28], &0x0201u32.to_le_bytes());
+            } else {
+                assert_eq!(&memory.0[20..24], &0x0201u32.to_le_bytes());
+            }
+        }
     }
 }

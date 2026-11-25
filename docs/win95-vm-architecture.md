@@ -163,8 +163,8 @@ The subsystem is moving from 32-bit-only towards being bitness-aware:
 
 - Calls carry their arguments as `kernel::syscall::Args`, 64 bits per argument from 64-bit code (dereferencing to the 32-bit values the existing functions take), and results as `ApiOutcome` with an exact 64-bit `wide` value when a function produces one.
 - `GuestMemory::ptr_size`, `read_ptr` and `write_ptr` read and write pointer-sized values (handles, interface pointers, `*_PTR`) at the process's width; COM objects built by the subsystem get vtables of pointer-sized entries (`win32::set_vtable`); `call_guest_wide` passes and returns full 64-bit values.
-- `win32::x64::View` reads and writes a structure in the process's own layout (MSG is handled this way).
-- What is not converted yet is translated at the boundary by `win32::x64`: structures by pointer are copied to and from 32-bit layouts, as are structures in window messages, and 64-bit values passed by value (`SetFilePointerEx`'s distance, a POINT) are split into the halves the 32-bit signatures take. A result without a `wide` value is widened, sign-extending small negative values (error codes such as -1).
+- Structures are read and written in the process's own layout through `win32::x64::View` (field lists in `win32::x64`, e.g. `MSG`, `WNDCLASS`, `CREATESTRUCT`, `TVITEM`, `LVITEM`, `NMHDR`-based notifications, `MENUITEMINFO`, `OPENFILENAME`) and `x64::write_struct`; nothing is copied between layouts, and window messages pass between the subsystem and 64-bit window procedures unchanged.
+- What `win32::x64` still does at the boundary: functions whose 32-bit signature takes a 64-bit value as two halves (`SetFilePointerEx`'s distance, a POINT by value) get it split; `*Ptr` functions map to their 32-bit names; a few x64-only functions (`VerSetConditionMask`, unwinding lookups) are implemented there. A result without a `wide` value is widened, sign-extending small negative values (error codes such as -1).
 
 Not yet: addresses above 4 GiB (guest addresses are 32-bit), 64-bit exception handling (table-based unwinding; a fault stops the program), 64-bit DLLs that cannot be relocated below 4 GiB.
 

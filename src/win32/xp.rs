@@ -192,10 +192,14 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                 .find(|(start, (_, length))| args[0] >= **start && args[0] < **start + *length)
                 .map(|(start, (_, length))| (*start, *length));
             let (base, size) = region.unwrap_or((args[0] & !0xFFF, 0x1000));
-            let info = [base, base, 4, size, 0x1000, 4, 0x20000];
-            let bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let _ = memory.write_bytes(args[1], &bytes[..(args[2] as usize).min(28)]);
-            ok(28)
+            // MEMORY_BASIC_INFORMATION in the process's layout.
+            let layout = crate::win32::x64::MEMORY_BASIC_INFORMATION;
+            let size_of = layout.size(memory.ptr_size() == 8);
+            if args[2] < size_of {
+                return ok(0);
+            }
+            crate::win32::x64::write_struct(memory, &layout, args[1], &[base, base, 4, size, 0x1000, 4, 0x20000]);
+            ok(size_of)
         }
         "CreateFileMappingA" | "CreateFileMappingW" => {
             // CreateFileMapping(file, attributes, protect, size high, size low, name)

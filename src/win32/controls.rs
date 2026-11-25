@@ -3596,16 +3596,18 @@ pub fn file_dialog<M: GuestMemory + ?Sized>(
     ofn: u32,
     save: bool,
 ) -> u32 {
-    let field = |memory: &mut M, offset: u32| memory.read_u32(ofn + offset).unwrap_or(0);
-    let owner = field(memory, 4);
-    let filter = field(memory, 12);
-    let filter_index = field(memory, 24);
-    let file_va = field(memory, 28);
-    let max_file = field(memory, 32);
-    let title_va = field(memory, 36);
-    let max_title = field(memory, 40);
-    let caption_va = field(memory, 48);
-    let def_ext_va = field(memory, 60);
+    // OPENFILENAME in the process's layout (see `x64::OPENFILENAME`).
+    let view = crate::win32::x64::View::new(memory, &crate::win32::x64::OPENFILENAME, ofn);
+    let field = |memory: &mut M, index: usize| view.get32(memory, index);
+    let owner = field(memory, 1);
+    let filter = field(memory, 3);
+    let filter_index = field(memory, 6);
+    let file_va = field(memory, 7);
+    let max_file = field(memory, 8);
+    let title_va = field(memory, 9);
+    let max_title = field(memory, 10);
+    let caption_va = field(memory, 12);
+    let def_ext_va = field(memory, 16);
     let initial = if file_va != 0 {
         read_cstr(memory, file_va)
     } else {
@@ -3808,8 +3810,8 @@ pub fn file_dialog<M: GuestMemory + ?Sized>(
         .filter(|p| *p > file_offset)
         .map(|p| p + 1)
         .unwrap_or(full.len());
-    let _ = memory.write_bytes(ofn + 56, &(file_offset as u16).to_le_bytes());
-    let _ = memory.write_bytes(ofn + 58, &(ext_offset as u16).to_le_bytes());
+    view.set(memory, 14, file_offset as u32);
+    view.set(memory, 15, ext_offset as u32);
     if title_va != 0 && max_title > 0 {
         let mut title = full[file_offset..].to_vec();
         title.truncate(max_title as usize - 1);

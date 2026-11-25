@@ -222,12 +222,20 @@ fn draw_frame<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hdc: u3
 /// GetOpenFileNameW / GetSaveFileNameW over the ANSI dialog: OPENFILENAMEW's
 /// strings are converted into an OPENFILENAMEA and the results back.
 fn file_dialog_w<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, ofn: u32, save: bool) -> u32 {
-    let mut fields = memory.read_bytes(ofn, 76).unwrap_or_else(|| vec![0; 76]);
-    let field = |fields: &[u8], offset: usize| u32::from_le_bytes([fields[offset], fields[offset + 1], fields[offset + 2], fields[offset + 3]]);
+    // OPENFILENAME in the process's layout; see `x64::OPENFILENAME` for the
+    // field order (3 filter, 4 custom filter, 6 filter index, 7/8 file
+    // buffer, 9/10 title buffer, 11 initial folder, 12 title, 13 flags,
+    // 14/15 name and extension offsets, 16 default extension).
+    let layout = crate::win32::x64::OPENFILENAME;
+    let size = layout.size(memory.ptr_size() == 8);
+    let fields = memory.read_bytes(ofn, size as usize).unwrap_or_else(|| vec![0; size as usize]);
+    let a = ctx.shared.borrow_mut().heap.alloc(size).unwrap_or(0);
+    let _ = memory.write_bytes(a, &fields);
+    let original = crate::win32::x64::View::new(memory, &layout, ofn);
+    let copy = crate::win32::x64::View::new(memory, &layout, a);
     let mut temps = Vec::new();
-    let put = |fields: &mut Vec<u8>, offset: usize, value: u32| fields[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     // The filter: pairs of strings ending with an empty one.
-    let filter_va = field(&fields, 12);
+    let filter_va = original.get32(memory, 3);
     if filter_va != 0 {
         let list = path_list(memory, filter_va, true);
         let mut block: Vec<u8> = list.iter().flat_map(|s| s.iter().copied().chain([0])).collect();
@@ -235,34 +243,32 @@ fn file_dialog_w<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, ofn:
         let va = ctx.shared.borrow_mut().heap.alloc(block.len() as u32).unwrap_or(0);
         let _ = memory.write_bytes(va, &block);
         temps.push(va);
-        put(&mut fields, 12, va);
+        copy.set(memory, 3, va);
     }
-    put(&mut fields, 16, 0); // no custom filter
-    for offset in [44, 48, 60] {
-        let va = field(&fields, offset);
+    copy.set(memory, 4, 0); // no custom filter
+    for index in [11, 12, 16] {
+        let va = original.get32(memory, index);
         if va >= 0x10000 {
             let text = wide_text(memory, va);
             let temp = temp_string(ctx, memory, &text);
             temps.push(temp);
-            put(&mut fields, offset, temp);
+            copy.set(memory, index, temp);
         }
     }
     // The file buffer is in and out; the title buffer only out.
-    let (file_va, file_max) = (field(&fields, 28), field(&fields, 32));
+    let (file_va, file_max) = (original.get32(memory, 7), original.get32(memory, 8));
     let file_temp = ctx.shared.borrow_mut().heap.alloc(file_max.max(1) + 1).unwrap_or(0);
     let initial = if file_va != 0 { wide_text(memory, file_va) } else { Vec::new() };
     let _ = memory.write_bytes(file_temp, &[&initial[..initial.len().min(file_max.saturating_sub(1) as usize)], b"\0"].concat());
-    put(&mut fields, 28, file_temp);
-    let (title_va, title_max) = (field(&fields, 36), field(&fields, 40));
+    copy.set(memory, 7, file_temp);
+    let (title_va, title_max) = (original.get32(memory, 9), original.get32(memory, 10));
     let title_temp = if title_va != 0 { ctx.shared.borrow_mut().heap.alloc(title_max.max(1) + 1).unwrap_or(0) } else { 0 };
     let _ = memory.write_bytes(title_temp, &[0]);
-    put(&mut fields, 36, title_temp);
+    copy.set(memory, 9, title_temp);
     // Hooks and templates expect Unicode messages; the plain dialog is used.
-    let flags = field(&fields, 52) & !(0x20 | 0x40 | 0x80);
-    put(&mut fields, 52, flags);
-    put(&mut fields, 0, 76);
-    let a = ctx.shared.borrow_mut().heap.alloc(76).unwrap_or(0);
-    let _ = memory.write_bytes(a, &fields);
+    let flags = original.get32(memory, 13) & !(0x20 | 0x40 | 0x80);
+    copy.set(memory, 13, flags);
+    copy.set(memory, 0, size);
     let result = call(ctx, memory, "COMDLG32.dll", if save { "GetSaveFileNameA" } else { "GetOpenFileNameA" }, &[a]);
     if result != 0 {
         let chosen = read_cstr(memory, file_temp);
@@ -275,11 +281,10 @@ fn file_dialog_w<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, ofn:
             let n = title.len().min(title_max as usize - 1);
             unicode::write_wide(memory, title_va, &unicode::ansi_to_wide(&title[..n]), true);
         }
-        // Filter index, flags and the name/extension offsets (characters).
-        let back = memory.read_bytes(a, 76).unwrap_or_default();
-        if back.len() == 76 {
-            let _ = memory.write_bytes(ofn + 24, &back[24..28]);
-            let _ = memory.write_bytes(ofn + 56, &back[56..60]);
+        // Filter index and the name/extension offsets (characters).
+        for index in [6, 14, 15] {
+            let value = copy.get32(memory, index);
+            original.set(memory, index, value);
         }
     }
     for va in temps.into_iter().chain([file_temp, title_temp, a]) {
@@ -424,13 +429,12 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             // InsertMenuItem(menu, item, by position, MENUITEMINFO*): as
             // InsertMenu with the item's type, state, ID or submenu, text.
             let info = args[3];
-            let field = |memory: &mut M, offset: u32| memory.read_u32(info + offset).unwrap_or(0);
-            let mask = field(memory, 4);
-            let kind = if mask & 0x110 != 0 { field(memory, 8) } else { 0 };
-            let state = if mask & 1 != 0 { field(memory, 12) } else { 0 };
-            let id = if mask & 2 != 0 { field(memory, 16) } else { 0 };
-            let submenu = if mask & 4 != 0 { field(memory, 20) } else { 0 };
-            let data = field(memory, 36);
+            let mask = mii(memory, info, 1);
+            let kind = if mask & 0x110 != 0 { mii(memory, info, 2) } else { 0 };
+            let state = if mask & 1 != 0 { mii(memory, info, 3) } else { 0 };
+            let id = if mask & 2 != 0 { mii(memory, info, 4) } else { 0 };
+            let submenu = if mask & 4 != 0 { mii(memory, info, 5) } else { 0 };
+            let data = mii(memory, info, 9);
             let mut flags = (kind | state) & !0x10 | if args[2] != 0 { 0x400 } else { 0 };
             if submenu != 0 {
                 flags |= 0x10; // MF_POPUP
@@ -451,11 +455,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(result)
         }
         "SetMenuItemInfoA" => {
-            let mask = memory.read_u32(args[3] + 4).unwrap_or(0);
-            let state = memory.read_u32(args[3] + 12).unwrap_or(0);
-            let id = memory.read_u32(args[3] + 16).unwrap_or(0);
-            let submenu = memory.read_u32(args[3] + 20).unwrap_or(0);
-            let text_va = memory.read_u32(args[3] + 36).unwrap_or(0);
+            let mask = mii(memory, args[3], 1);
+            let state = mii(memory, args[3], 3);
+            let id = mii(memory, args[3], 4);
+            let submenu = mii(memory, args[3], 5);
+            let text_va = mii(memory, args[3], 9);
             let text = (mask & 0x50 != 0 && text_va >= 0x10000).then(|| read_cstr(memory, text_va));
             let mut shared = ctx.shared.borrow_mut();
             let item = shared.gui.menus.get_mut(&args[0]).and_then(|menu| {
@@ -498,28 +502,29 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             };
             let Some(item) = item else { return ok(0) };
             let info = args[3];
-            let mask = memory.read_u32(info + 4).unwrap_or(0);
+            let mask = mii(memory, info, 1);
             let (kind, state) = item_type_state(item.flags);
             if mask & (0x10 | 0x100) != 0 {
-                let _ = memory.write_u32(info + 8, kind);
+                set_mii(memory, info, 2, kind);
             }
             if mask & 0x1 != 0 {
-                let _ = memory.write_u32(info + 12, state);
+                set_mii(memory, info, 3, state);
             }
             if mask & 0x2 != 0 {
-                let _ = memory.write_u32(info + 16, item.id);
+                set_mii(memory, info, 4, item.id);
             }
             if mask & 0x4 != 0 {
-                let _ = memory.write_u32(info + 20, item.submenu);
+                set_mii(memory, info, 5, item.submenu);
             }
             if mask & 0x8 != 0 {
-                let _ = memory.write_bytes(info + 24, &[0u8; 8]);
+                set_mii(memory, info, 6, 0);
+                set_mii(memory, info, 7, 0);
             }
             if mask & 0x20 != 0 {
-                let _ = memory.write_u32(info + 32, 0);
+                set_mii(memory, info, 8, 0);
             }
             if mask & (0x10 | 0x40) != 0 && kind & 0x904 == 0 {
-                let (va, capacity) = (memory.read_u32(info + 36).unwrap_or(0), memory.read_u32(info + 40).unwrap_or(0));
+                let (va, capacity) = (mii(memory, info, 9), mii(memory, info, 10));
                 if va != 0 && capacity > 0 {
                     let n = item.text.len().min(capacity as usize - 1);
                     if name.ends_with('W') {
@@ -528,7 +533,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                         let _ = memory.write_bytes(va, &[&item.text[..n], b"\0"].concat());
                     }
                 }
-                let _ = memory.write_u32(info + 40, item.text.len() as u32);
+                set_mii(memory, info, 10, item.text.len() as u32);
             }
             ok(1)
         }
@@ -784,14 +789,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         }
         "SHGetDataFromIDListW" => ok(0x8000_4001), // E_NOTIMPL
         "ShellExecuteExW" | "ShellExecuteExA" => {
-            // SHELLEXECUTEINFO: verb 12, file 16, parameters 20; hInstApp 32.
+            // SHELLEXECUTEINFO (process layout): verb, file, parameters; hInstApp.
             let wide = name.ends_with('W');
             let read = |memory: &mut M, va: u32| if va == 0 { Vec::new() } else if wide { wide_text(memory, va) } else { read_cstr(memory, va) };
-            let (verb_va, file_va, params_va) = (
-                memory.read_u32(args[0] + 12).unwrap_or(0),
-                memory.read_u32(args[0] + 16).unwrap_or(0),
-                memory.read_u32(args[0] + 20).unwrap_or(0),
-            );
+            let info = crate::win32::x64::View::new(memory, &crate::win32::x64::SHELLEXECUTEINFO, args[0]);
+            let (verb_va, file_va, params_va) = (info.get32(memory, 3), info.get32(memory, 4), info.get32(memory, 5));
             let (verb, file, params) = (read(memory, verb_va), read(memory, file_va), read(memory, params_va));
             eprintln!(
                 "[shell] ShellExecuteEx {} {} {} (starting programs is not supported yet)",
@@ -799,19 +801,21 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                 String::from_utf8_lossy(&file),
                 String::from_utf8_lossy(&params)
             );
-            let _ = memory.write_u32(args[0] + 32, 42);
+            info.set(memory, 8, 42);
             ok(1)
         }
         "SHFileOperationW" | "SHFileOperationA" => {
-            // SHFILEOPSTRUCT: hwnd, wFunc, pFrom, pTo, fFlags, aborted.
+            // SHFILEOPSTRUCT (process layout): hwnd, wFunc, pFrom, pTo,
+            // fFlags, fAnyOperationsAborted.
             let wide = name.ends_with('W');
-            let function = memory.read_u32(args[0] + 4).unwrap_or(0);
-            let from_va = memory.read_u32(args[0] + 8).unwrap_or(0);
-            let to_va = memory.read_u32(args[0] + 12).unwrap_or(0);
+            let op = crate::win32::x64::View::new(memory, &crate::win32::x64::SHFILEOPSTRUCT, args[0]);
+            let function = op.get32(memory, 1);
+            let from_va = op.get32(memory, 2);
+            let to_va = op.get32(memory, 3);
             let from = path_list(memory, from_va, wide);
             let to = path_list(memory, to_va, wide);
             let result = file_operation(ctx, function, &from, &to);
-            let _ = memory.write_u32(args[0] + 20, 0);
+            op.set(memory, 5, 0);
             ok(result)
         }
         "SHGetFileInfoW" | "SHGetFileInfoA" => {
@@ -905,4 +909,15 @@ mod tests {
             }
         }
     }
+}
+
+/// MENUITEMINFO field `index` in the process's layout: cbSize, fMask,
+/// fType, fState, wID, hSubMenu, hbmpChecked, hbmpUnchecked, dwItemData,
+/// dwTypeData, cch, hbmpItem.
+pub(crate) fn mii<M: GuestMemory + ?Sized>(memory: &mut M, info: u32, index: usize) -> u32 {
+    crate::win32::x64::View::new(memory, &crate::win32::x64::MENUITEMINFO, info).get32(memory, index)
+}
+
+fn set_mii<M: GuestMemory + ?Sized>(memory: &mut M, info: u32, index: usize, value: u32) {
+    crate::win32::x64::View::new(memory, &crate::win32::x64::MENUITEMINFO, info).set(memory, index, value);
 }

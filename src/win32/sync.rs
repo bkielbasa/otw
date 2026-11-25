@@ -667,9 +667,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                 let process = create(ctx, None, Object::Process { pid, exit: Some(code) });
                 let main_thread = create(ctx, None, Object::Process { pid, exit: Some(code) });
                 if args[9] != 0 {
-                    for (offset, value) in [(0, process), (4, main_thread), (8, pid), (12, pid)] {
-                        let _ = memory.write_u32(args[9] + offset, value);
-                    }
+                    crate::win32::x64::write_struct(memory, &crate::win32::x64::PROCESS_INFORMATION, args[9], &[process, main_thread, pid, pid]);
                 }
                 return ok(1);
             }
@@ -698,9 +696,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                     let main_thread = create(ctx, None, Object::Process { pid, exit: None });
                     refresh_processes(ctx);
                     if args[9] != 0 {
-                        for (offset, value) in [(0, process), (4, main_thread), (8, pid), (12, pid)] {
-                            let _ = memory.write_u32(args[9] + offset, value);
-                        }
+                        crate::win32::x64::write_struct(memory, &crate::win32::x64::PROCESS_INFORMATION, args[9], &[process, main_thread, pid, pid]);
                     }
                     ok(1)
                 }

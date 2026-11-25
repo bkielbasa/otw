@@ -2162,13 +2162,8 @@ mod kernel32_base {
             // so SHELL32's AutoRun.inf probe must observe a missing file.
             "GetFileAttributesA" => ApiOutcome::new(INVALID_FILE_ATTRIBUTES, count),
             "GetStartupInfoA" => {
-                let ptr = args[0];
-                if ptr != 0 {
-                    for index in 0..17 {
-                        memory.write_u32(ptr.wrapping_add(index * 4), 0)?;
-                    }
-                    memory.write_u32(ptr, 68)?;
-                }
+                // STARTUPINFO, zeroed, in the process's layout.
+                crate::win32::x64::write_struct(memory, &crate::win32::x64::STARTUPINFO, args[0], &[]);
                 ApiOutcome::new(0, count)
             }
             "GetStdHandle" => {
