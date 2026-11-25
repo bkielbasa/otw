@@ -2059,8 +2059,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "CreateDCA" | "CreateICA" => {
             let driver = read_cstr(memory, args[0]).to_ascii_uppercase();
+            let device = read_cstr(memory, args[1]).to_ascii_uppercase();
+            // The display by driver name, or a monitor by device name
+            // (\\.\DISPLAY1, as GetMonitorInfo gives it).
             let target =
-                if driver == b"DISPLAY" || args[0] == 0 && read_cstr(memory, args[1]).is_empty() {
+                if driver == b"DISPLAY" || args[0] == 0 && (device.is_empty() || device.starts_with(b"\\\\.\\DISPLAY")) {
                     DcTarget::Screen
                 } else {
                     // No printers are installed.

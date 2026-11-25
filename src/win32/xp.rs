@@ -151,6 +151,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         "VirtualAlloc" if ctx.shared.borrow().x64 => match crate::win32::vmem::alloc(ctx, memory, args[0], args[1], args[2], args[3]) {
             Ok(address) => ok(address),
             Err(code) => {
+                if std::env::var_os("OTW_TRACE_VMEM").is_some() {
+                    eprintln!("[vmem] alloc {:#x} size {:#x} type {:#x} failed: {code}", args[0], args[1], args[2]);
+                }
                 ctx.shared.borrow_mut().last_error = code;
                 ok(0)
             }

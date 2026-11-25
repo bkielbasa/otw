@@ -33,7 +33,29 @@ struct Region {
 #[derive(Debug, Default)]
 pub struct State {
     regions: BTreeMap<u32, Region>,
+    high: BTreeMap<u64, HighRegion>,
+    /// The next free 4 GiB slot above the low space, for high reservations.
+    next_slot: u64,
 }
+
+/// A reservation too large for the 4 GiB OTW keeps a process in (the
+/// WebAssembly sandboxes Firefox reserves 16 GiB each for, touching a few
+/// megabytes): it lies above 4 GiB and is mapped piecewise as it is
+/// committed. Its low 32 bits match a window reserved in the low space,
+/// where the first `ALIAS_SIZE` bytes are mirrored: OTW reads guest memory
+/// through 32-bit addresses, so a pointer into the reservation handed to
+/// OTW (to `memcpy`, say) is cut to its low half and lands in the mirror.
+#[derive(Debug)]
+struct HighRegion {
+    size: u64,
+    alias: Option<u32>,
+    /// Committed pieces: start to length.
+    chunks: BTreeMap<u64, u64>,
+}
+
+const ALIAS_SIZE: u32 = 0x400_0000;
+/// Reservations at least this large go above 4 GiB.
+pub const HIGH_THRESHOLD: u64 = 0x1_0000_0000;
 
 fn find(state: &State, address: u32) -> Option<(u32, &Region)> {
     let (&base, region) = state.regions.range(..=address).next_back()?;
@@ -50,6 +72,10 @@ pub fn alloc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address:
     // Committing inside a reservation.
     if address != 0 {
         if let Some((base, region)) = find(&shared.vmem, address) {
+            // MEM_RESET / MEM_RESET_UNDO: the contents may be discarded.
+            if kind & 0x0108_0000 != 0 {
+                return Ok(address);
+            }
             if kind & MEM_COMMIT == 0 {
                 return Err(487); // ERROR_INVALID_ADDRESS
             }
@@ -186,6 +212,145 @@ pub fn query<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address:
 /// Whether an address is inside one of these reservations.
 pub fn owns(ctx: &ApiContext, address: u32) -> bool {
     find(&ctx.shared.borrow().vmem, address).is_some()
+}
+
+/// Whether `address` is in a reservation above 4 GiB.
+pub fn owns_high(ctx: &ApiContext, address: u64) -> bool {
+    find_high(&ctx.shared.borrow().vmem, address).is_some()
+}
+
+fn find_high(state: &State, address: u64) -> Option<u64> {
+    let (&base, region) = state.high.range(..=address).next_back()?;
+    (address < base + region.size).then_some(base)
+}
+
+/// Reserve (and maybe commit) `size` bytes above 4 GiB, at `address` when
+/// one is asked for.
+pub fn reserve_high<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address: u64, size: u64, kind: u32) -> Result<u64, u32> {
+    let size = (size + PAGE as u64 - 1) & !(PAGE as u64 - 1);
+    let (base, alias) = if address != 0 {
+        let base = address & !(GRANULARITY as u64 - 1);
+        let taken = {
+            let shared = ctx.shared.borrow();
+            shared.vmem.high.range(..base + size).next_back().is_some_and(|(&b, r)| b + r.size > base)
+        };
+        if base < HIGH_THRESHOLD || taken {
+            return Err(487);
+        }
+        let low = base as u32;
+        (base, (low != 0 && memory.map_exact(low, ALIAS_SIZE)).then_some(low))
+    } else {
+        let alias = memory.map_region(0x2000_0000, ALIAS_SIZE);
+        let mut shared = ctx.shared.borrow_mut();
+        let slot = shared.vmem.next_slot.max(1);
+        shared.vmem.next_slot = slot + (size >> 32) + 2;
+        ((slot << 32) | alias.unwrap_or(0) as u64, alias)
+    };
+    if base + size > 1 << 47 {
+        return Err(8);
+    }
+    {
+        // Later automatic placements go past this one.
+        let mut shared = ctx.shared.borrow_mut();
+        shared.vmem.next_slot = shared.vmem.next_slot.max(((base + size) >> 32) + 1);
+    }
+    ctx.shared.borrow_mut().vmem.high.insert(base, HighRegion { size, alias, chunks: BTreeMap::new() });
+    if kind & MEM_COMMIT != 0 {
+        commit_high(ctx, memory, base, size)?;
+    }
+    Ok(base)
+}
+
+/// Commit pages of a high reservation: map the parts not yet mapped.
+pub fn commit_high<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address: u64, size: u64) -> Result<u64, u32> {
+    let page = PAGE as u64;
+    let start = address & !(page - 1);
+    let end = (address + size.max(1) + page - 1) & !(page - 1);
+    let (base, alias, gaps) = {
+        let shared = ctx.shared.borrow();
+        let base = find_high(&shared.vmem, address).ok_or(487u32)?;
+        let region = &shared.vmem.high[&base];
+        if end > base + region.size {
+            return Err(487);
+        }
+        // The uncommitted stretches of [start, end).
+        let mut gaps = Vec::new();
+        let mut cursor = start;
+        for (&chunk, &length) in region.chunks.range(..end) {
+            let chunk_end = chunk + length;
+            if chunk_end <= cursor {
+                continue;
+            }
+            if chunk > cursor {
+                gaps.push((cursor, chunk));
+            }
+            cursor = cursor.max(chunk_end);
+        }
+        if cursor < end {
+            gaps.push((cursor, end));
+        }
+        (base, region.alias, gaps)
+    };
+    let alias_end = base + ALIAS_SIZE as u64;
+    for (mut from, to) in gaps {
+        // Split where the mirrored window ends.
+        let mut pieces = Vec::new();
+        if alias.is_some() && from < alias_end && to > alias_end {
+            pieces.push((from, alias_end));
+            from = alias_end;
+        }
+        pieces.push((from, to));
+        for (from, to) in pieces {
+            let low = alias.filter(|_| to <= alias_end).map(|low| low + (from - base) as u32);
+            if !memory.map_shared(from, to - from, low) {
+                return Err(8);
+            }
+            ctx.shared.borrow_mut().vmem.high.get_mut(&base).expect("region").chunks.insert(from, to - from);
+        }
+    }
+    Ok(start)
+}
+
+/// Release a high reservation.
+pub fn release_high<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address: u64) -> Result<(), u32> {
+    let region = ctx.shared.borrow_mut().vmem.high.remove(&address).ok_or(487u32)?;
+    for (&chunk, &length) in &region.chunks {
+        memory.unmap_shared(chunk);
+        if let Some(low) = region.alias.filter(|_| chunk + length <= address + ALIAS_SIZE as u64) {
+            // Refill the hole so the window can be unmapped whole.
+            memory.map_exact(low + (chunk - address) as u32, length as u32);
+        }
+    }
+    if let Some(low) = region.alias {
+        memory.unmap(low, ALIAS_SIZE);
+    }
+    Ok(())
+}
+
+/// MEMORY_BASIC_INFORMATION values for an address in a high reservation:
+/// base, allocation base, allocation protection, size, state, protection,
+/// type.
+pub fn query_high(ctx: &ApiContext, address: u64) -> Option<[u64; 7]> {
+    let shared = ctx.shared.borrow();
+    let base = find_high(&shared.vmem, address)?;
+    let region = &shared.vmem.high[&base];
+    let page = address & !(PAGE as u64 - 1);
+    let containing = region.chunks.range(..=page).next_back().filter(|(&c, &l)| page < c + l);
+    let (size, state, protect) = match containing {
+        Some((&chunk, &length)) => {
+            // Adjacent pieces form one committed run.
+            let mut end = chunk + length;
+            while let Some(&next) = region.chunks.get(&end) {
+                end += next;
+            }
+            (end - page, MEM_COMMIT, 4)
+        }
+        None => {
+            let next = region.chunks.range(page..).next().map(|(&c, _)| c).unwrap_or(base + region.size);
+            (next - page, MEM_RESERVE, 0)
+        }
+    };
+    Some([page, base, 4, size, state as u64, protect, MEM_PRIVATE as u64])
 }
 
 const _: u32 = MEM_DECOMMIT;

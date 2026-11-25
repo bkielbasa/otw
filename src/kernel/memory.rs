@@ -9,6 +9,11 @@
 pub const HEAP_BASE: u32 = 0x0080_0000;
 /// Size of the guest heap (120 MiB, ending at 0x0800_0000).
 pub const HEAP_SIZE: u32 = 0x0780_0000;
+/// NTDLL's module handle in a 64-bit process: a page of PE headers
+/// (without exports; GetProcAddress serves the functions) at the top of
+/// the address space, clear of large reservations.
+pub const NTDLL_HANDLE: u32 = 0xFFF0_0000;
+
 /// More heap for 64-bit processes, whose programs allocate far more.
 pub const HEAP64_EXTRA_BASE: u32 = 0x4000_0000;
 pub const HEAP64_EXTRA_SIZE: u32 = 0x1000_0000;
@@ -68,6 +73,17 @@ pub trait GuestMemory {
         }
     }
 
+    /// Read guest memory at a full 64-bit address (memory a 64-bit program
+    /// has above 4 GiB).
+    fn read_bytes_at(&mut self, va: u64, len: usize) -> Option<Vec<u8>> {
+        self.read_bytes(u32::try_from(va).ok()?, len)
+    }
+
+    /// Write guest memory at a full 64-bit address.
+    fn write_bytes_at(&mut self, va: u64, bytes: &[u8]) -> Option<()> {
+        self.write_bytes(u32::try_from(va).ok()?, bytes)
+    }
+
     /// Map `size` bytes at exactly `va` if that range is free.
     fn map_exact(&mut self, _va: u32, _size: u32) -> bool {
         false
@@ -75,6 +91,20 @@ pub trait GuestMemory {
 
     /// Unmap a range mapped with `map_region` or `map_exact`.
     fn unmap(&mut self, _va: u32, _size: u32) -> bool {
+        false
+    }
+
+    /// Map `size` zeroed bytes at `va`, which may lie above 4 GiB (memory a
+    /// 64-bit program reserves past what OTW's 32-bit addresses reach). With
+    /// `alias`, the same bytes also replace the reserved low range there, so
+    /// a pointer to them that reaches OTW cut to 32 bits still finds them.
+    fn map_shared(&mut self, _va: u64, _size: u64, _alias: Option<u32>) -> bool {
+        false
+    }
+
+    /// Unmap a range mapped with `map_shared` (and its alias, which is left
+    /// unmapped).
+    fn unmap_shared(&mut self, _va: u64) -> bool {
         false
     }
 

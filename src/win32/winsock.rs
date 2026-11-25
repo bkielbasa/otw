@@ -765,14 +765,15 @@ fn write_protoent<M: GuestMemory + ?Sized>(
     name: &str,
     number: u16,
 ) -> Option<u32> {
+    let size = memory.ptr_size();
     let name_va = shared.bump_alloc((name.len() + 1) as u32);
-    let aliases_va = shared.bump_alloc(4);
-    let entry_va = shared.bump_alloc(12);
+    let aliases_va = shared.bump_alloc(size);
+    let entry_va = shared.bump_alloc(3 * size);
     memory.write_bytes(name_va, format!("{name}\0").as_bytes())?;
-    memory.write_u32(aliases_va, 0)?;
-    memory.write_u32(entry_va, name_va)?;
-    memory.write_u32(entry_va.wrapping_add(4), aliases_va)?;
-    memory.write_bytes(entry_va.wrapping_add(8), &number.to_le_bytes())?;
+    memory.write_ptr(aliases_va, 0)?;
+    memory.write_ptr(entry_va, name_va as u64)?;
+    memory.write_ptr(entry_va.wrapping_add(size), aliases_va as u64)?;
+    memory.write_bytes(entry_va.wrapping_add(2 * size), &number.to_le_bytes())?;
     Some(entry_va)
 }
 
@@ -783,18 +784,25 @@ fn write_servent<M: GuestMemory + ?Sized>(
     port: u16,
     protocol: &str,
 ) -> Option<u32> {
+    let size = memory.ptr_size();
     let name_va = shared.bump_alloc((name.len() + 1) as u32);
-    let aliases_va = shared.bump_alloc(4);
+    let aliases_va = shared.bump_alloc(size);
     let protocol_va = shared.bump_alloc((protocol.len() + 1) as u32);
-    let entry_va = shared.bump_alloc(16);
+    let entry_va = shared.bump_alloc(4 * size);
     memory.write_bytes(name_va, format!("{name}\0").as_bytes())?;
-    memory.write_u32(aliases_va, 0)?;
+    memory.write_ptr(aliases_va, 0)?;
     memory.write_bytes(protocol_va, format!("{protocol}\0").as_bytes())?;
-    memory.write_u32(entry_va, name_va)?;
-    memory.write_u32(entry_va.wrapping_add(4), aliases_va)?;
-    // s_port is stored in network byte order.
-    memory.write_bytes(entry_va.wrapping_add(8), &port.to_be_bytes())?;
-    memory.write_u32(entry_va.wrapping_add(12), protocol_va)?;
+    memory.write_ptr(entry_va, name_va as u64)?;
+    memory.write_ptr(entry_va.wrapping_add(size), aliases_va as u64)?;
+    // s_port in network byte order; in a 64-bit process s_proto comes
+    // before it.
+    if size == 8 {
+        memory.write_ptr(entry_va + 16, protocol_va as u64)?;
+        memory.write_bytes(entry_va + 24, &port.to_be_bytes())?;
+    } else {
+        memory.write_bytes(entry_va.wrapping_add(8), &port.to_be_bytes())?;
+        memory.write_u32(entry_va.wrapping_add(12), protocol_va)?;
+    }
     Some(entry_va)
 }
 
@@ -1456,30 +1464,31 @@ fn build_hostent<M: GuestMemory + ?Sized>(
     if addresses.is_empty() {
         return None;
     }
+    // hostent: name, aliases, address type and length, address list —
+    // pointers of the process's size (the list after 8 bytes of padding in
+    // a 64-bit one).
+    let size = memory.ptr_size();
     let (name_va, list_va, address_va, hostent_va, aliases_va) = (
         shared.bump_alloc((name.len() + 1) as u32),
-        shared.bump_alloc(((addresses.len() + 1) * 4) as u32),
+        shared.bump_alloc((addresses.len() as u32 + 1) * size),
         shared.bump_alloc((addresses.len() * 4) as u32),
-        shared.bump_alloc(16),
-        shared.bump_alloc(4),
+        shared.bump_alloc(4 * size),
+        shared.bump_alloc(size),
     );
     memory.write_bytes(name_va, format!("{name}\0").as_bytes())?;
     // No aliases: an empty list, never a null pointer (WinINet walks it).
-    memory.write_u32(aliases_va, 0)?;
+    memory.write_ptr(aliases_va, 0)?;
     for (index, address) in addresses.iter().enumerate() {
         let entry = address_va.wrapping_add(index as u32 * 4);
         memory.write_bytes(entry, &address.octets())?;
-        memory.write_u32(list_va.wrapping_add(index as u32 * 4), entry)?;
+        memory.write_ptr(list_va.wrapping_add(index as u32 * size), entry as u64)?;
     }
-    memory.write_u32(list_va.wrapping_add(addresses.len() as u32 * 4), 0)?;
-
-    let mut hostent = [0u8; 16];
-    hostent[0..4].copy_from_slice(&name_va.to_le_bytes());
-    hostent[4..8].copy_from_slice(&aliases_va.to_le_bytes());
-    hostent[8..10].copy_from_slice(&AF_INET.to_le_bytes());
-    hostent[10..12].copy_from_slice(&4u16.to_le_bytes());
-    hostent[12..16].copy_from_slice(&list_va.to_le_bytes());
-    memory.write_bytes(hostent_va, &hostent)?;
+    memory.write_ptr(list_va.wrapping_add(addresses.len() as u32 * size), 0)?;
+    memory.write_ptr(hostent_va, name_va as u64)?;
+    memory.write_ptr(hostent_va + size, aliases_va as u64)?;
+    memory.write_bytes(hostent_va + 2 * size, &AF_INET.to_le_bytes())?;
+    memory.write_bytes(hostent_va + 2 * size + 2, &4u16.to_le_bytes())?;
+    memory.write_ptr(hostent_va + if size == 8 { 24 } else { 12 }, list_va as u64)?;
     Some(hostent_va)
 }
 

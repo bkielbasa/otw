@@ -190,12 +190,39 @@ fn static_wstr(ctx: &ApiContext, memory: &mut dyn GuestMemory, text: &[u16]) -> 
     va
 }
 
+/// A NUL-terminated string of `unit`-byte characters at a 64-bit address,
+/// read a page at a time so that neither its length nor the end of its
+/// mapping cuts it short.
+fn units_until_nul(memory: &mut dyn GuestMemory, va: u64, unit: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if va == 0 {
+        return bytes;
+    }
+    let mut at = va;
+    while bytes.len() < 1 << 26 {
+        let length = (0x1000 - (at & 0xFFF)) as usize;
+        let length = if length < unit { unit } else { length - length % unit };
+        // A mapping smaller than a page: fall back to short reads.
+        let Some(chunk) = [length, 64.min(length), unit].into_iter().find_map(|n| memory.read_bytes_at(at, n)) else {
+            break;
+        };
+        let length = chunk.len();
+        if let Some(end) = chunk.chunks_exact(unit).position(|c| c.iter().all(|&b| b == 0)) {
+            bytes.extend_from_slice(&chunk[..end * unit]);
+            return bytes;
+        }
+        bytes.extend_from_slice(&chunk);
+        at += length as u64;
+    }
+    bytes
+}
+
 fn cstr(memory: &mut dyn GuestMemory, va: u64) -> Vec<u8> {
-    if va == 0 { Vec::new() } else { read_cstr(memory, va as u32) }
+    units_until_nul(memory, va, 1)
 }
 
 fn wstr(memory: &mut dyn GuestMemory, va: u64) -> Vec<u16> {
-    if va == 0 { Vec::new() } else { unicode::read_wstr(memory, va as u32) }
+    units_until_nul(memory, va, 2).chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
 }
 
 fn put_c(memory: &mut dyn GuestMemory, va: u32, text: &[u8]) {
@@ -212,12 +239,12 @@ fn units_bytes(units: &[u16]) -> Vec<u8> {
     units.iter().flat_map(|u| u.to_le_bytes()).collect()
 }
 
-fn read_units(memory: &mut dyn GuestMemory, va: u32, count: usize, wide: bool) -> Vec<u16> {
+fn read_units(memory: &mut dyn GuestMemory, va: u64, count: usize, wide: bool) -> Vec<u16> {
     if wide {
-        let bytes = memory.read_bytes(va, count * 2).unwrap_or_default();
+        let bytes = memory.read_bytes_at(va, count * 2).unwrap_or_default();
         bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
     } else {
-        memory.read_bytes(va, count).unwrap_or_default().into_iter().map(u16::from).collect()
+        memory.read_bytes_at(va, count).unwrap_or_default().into_iter().map(u16::from).collect()
     }
 }
 
@@ -540,8 +567,7 @@ fn format_float(value: f64, conversion: u8, precision: Option<usize>, alternate:
 /// Format `format` (code units; `wide` says whether the output is wide)
 /// with arguments from `va`. `legacy_wide` makes %s and %c mean wide in a
 /// wide format, as in the Microsoft C library by default.
-fn format(ctx: &ApiContext, memory: &mut dyn GuestMemory, fmt: &[u16], va: u32, wide: bool, legacy_wide: bool) -> Vec<u16> {
-    let _ = ctx;
+fn format(memory: &mut dyn GuestMemory, fmt: &[u16], va: u32, wide: bool, legacy_wide: bool) -> Vec<u16> {
     let slot = memory.ptr_size();
     let mut args = VaList { at: va, slot };
     let mut out: Vec<u16> = Vec::new();
@@ -735,10 +761,8 @@ fn format(ctx: &ApiContext, memory: &mut dyn GuestMemory, fmt: &[u16], va: u32, 
                 } else if is_wide {
                     match precision {
                         Some(p) => {
-                            let mut units = read_units(memory, pointer as u32, p, true);
-                            if let Some(end) = units.iter().position(|&u| u == 0) {
-                                units.truncate(end);
-                            }
+                            let mut units = wstr(memory, pointer);
+                            units.truncate(p);
                             units
                         }
                         None => wstr(memory, pointer),
@@ -2013,9 +2037,25 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         "strlen" | "wcslen" => ok(units_at(memory, arg(0), name == "wcslen").len() as u64),
         "strnlen" | "wcsnlen" | "__strncnt" => {
             let wide = name == "wcsnlen";
-            let limit = arg(1).min(1 << 24) as usize;
-            let units = read_units(memory, p(0), limit, wide);
-            ok(units.iter().position(|&u| u == 0).unwrap_or(units.len()) as u64)
+            // Read page by page: a large limit must not run past the end of
+            // the string's mapping (a string at the top of the stack).
+            let limit = arg(1).min(1 << 30) as usize;
+            let unit = if wide { 2 } else { 1 };
+            let mut length = 0usize;
+            while length < limit {
+                let va = arg(0) + (length * unit) as u64;
+                let chunk = ((0x1000 - (va & 0xFFF)) as usize / unit).clamp(1, limit - length);
+                let units = read_units(memory, va, chunk, wide);
+                if units.len() < chunk {
+                    break;
+                }
+                if let Some(end) = units.iter().position(|&u| u == 0) {
+                    length += end;
+                    break;
+                }
+                length += chunk;
+            }
+            ok(length as u64)
         }
         "strcmp" | "wcscmp" | "_stricmp" | "_wcsicmp" | "_wcsicmp_l" => {
             let wide = name.starts_with('w') || name.starts_with("_w");
@@ -2715,7 +2755,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             let (buffer, capacity) = if name == "_wgetcwd" { (p(0), p(1)) } else { (p(1), p(2)) };
             let scratch = alloc(ctx, 1024);
             let length = win32(ctx, memory, "KERNEL32.dll", "GetCurrentDirectoryW", &[512, scratch]);
-            let text = read_units(memory, scratch, length as usize, true);
+            let text = read_units(memory, scratch as u64, length as usize, true);
             release(ctx, scratch);
             let target = if buffer == 0 { alloc(ctx, (text.len() as u64 + 1).max(capacity as u64) * 2) } else { buffer };
             if buffer != 0 && text.len() as u32 >= capacity {
@@ -2970,8 +3010,11 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             let snprintf_s = name.contains("vsn");
             let (max_count, fmt_at, va_at) = if snprintf_s { (arg(3), 4, 6) } else { (TRUNCATE, 3, 5) };
             let fmt = read_format(memory, arg(fmt_at), wide);
-            let text = output_for(&format(ctx, memory, &fmt, p(va_at), wide, options & 4 != 0), wide);
+            let text = output_for(&format(memory, &fmt, p(va_at), wide, options & 4 != 0), wide);
             let n = text.len() as u64;
+            if std::env::var_os("OTW_TRACE_PRINTF").is_some() {
+                eprintln!("[printf] {name} cap {capacity} fmt {:?} -> {:?}", String::from_utf16_lossy(&fmt), String::from_utf16_lossy(&text));
+            }
             if buffer == 0 {
                 return ok(n);
             }
@@ -3016,8 +3059,11 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         | "__stdio_common_vfwprintf_s" => {
             let wide = name.contains("vfw");
             let fmt = read_format(memory, arg(2), wide);
-            let text = format(ctx, memory, &fmt, p(4), wide, arg(0) & 4 != 0);
+            let text = format(memory, &fmt, p(4), wide, arg(0) & 4 != 0);
             let bytes = unicode::wide_to_ansi(&text);
+            if std::env::var_os("OTW_TRACE_PRINTF").is_some() {
+                eprintln!("[printf] {name} fmt {:?} -> {:?}", String::from_utf16_lossy(&fmt), String::from_utf16_lossy(&text));
+            }
             match stream_write(ctx, arg(1), &bytes) {
                 Some(_) => ok(text.len() as u64),
                 None => signed(-1),
@@ -3081,6 +3127,38 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Flat(Vec<u8>);
+    impl GuestMemory for Flat {
+        fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+            self.0.get(va as usize..va as usize + len).map(<[u8]>::to_vec)
+        }
+        fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+            self.0.get_mut(va as usize..va as usize + bytes.len())?.copy_from_slice(bytes);
+            Some(())
+        }
+        fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+            self.write_bytes(va, &value.to_le_bytes())
+        }
+        fn ptr_size(&self) -> u32 {
+            8
+        }
+    }
+
+    #[test]
+    fn printf_reads_a_64_bit_va_list() {
+        let mut memory = Flat(vec![0; 512]);
+        memory.write_bytes(100, b"Parent\0").unwrap();
+        memory.write_bytes(120, b"hello\0").unwrap();
+        // va_list: "Parent", 1 (long), "hello"
+        memory.write_bytes(200, &100u64.to_le_bytes()).unwrap();
+        memory.write_bytes(208, &1u64.to_le_bytes()).unwrap();
+        memory.write_bytes(216, &120u64.to_le_bytes()).unwrap();
+        let fmt: Vec<u16> = "[%s %ld]: %s|%5.2f".encode_utf16().collect();
+        memory.write_bytes(224, &2.5f64.to_bits().to_le_bytes()).unwrap();
+        let out = format(&mut memory, &fmt, 200, false, false);
+        assert_eq!(String::from_utf16_lossy(&out), "[Parent 1]: hello| 2.50");
+    }
 
     #[test]
     fn floats_format_like_the_c_library() {

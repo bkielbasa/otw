@@ -159,6 +159,9 @@ struct RunState<'a> {
     /// Static thread-local storage templates (`__declspec(thread)`), one
     /// per module with a TLS directory, in index order.
     tls_templates: Vec<Vec<u8>>,
+    /// Memory mapped with `map_shared`: its bytes, size and low alias, by
+    /// address.
+    shared_buffers: std::collections::HashMap<u64, (Box<[u8]>, Option<u32>)>,
 }
 
 /// A thread off the CPU.
@@ -769,6 +772,14 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         self.uc.mem_write(va as u64, bytes).ok()
     }
 
+    fn read_bytes_at(&mut self, va: u64, len: usize) -> Option<Vec<u8>> {
+        self.uc.mem_read_as_vec(va, len).ok()
+    }
+
+    fn write_bytes_at(&mut self, va: u64, bytes: &[u8]) -> Option<()> {
+        self.uc.mem_write(va, bytes).ok()
+    }
+
     fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
         self.uc.mem_write(va as u64, &value.to_le_bytes()).ok()
     }
@@ -863,6 +874,43 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             .map(|regions| regions.iter().any(|r| start <= r.end && start + size > r.begin))
             .unwrap_or(true);
         !overlaps && self.uc.mem_map(start, size, Prot::ALL).is_ok()
+    }
+
+    fn map_shared(&mut self, va: u64, size: u64, alias: Option<u32>) -> bool {
+        let Some(run) = self.run else {
+            return false;
+        };
+        let size = (size + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+        let mut buffer = vec![0u8; size as usize].into_boxed_slice();
+        let pointer = buffer.as_mut_ptr() as *mut std::ffi::c_void;
+        // SAFETY: the buffer is kept in the run state until the range is
+        // unmapped, and a boxed slice's storage does not move.
+        if unsafe { self.uc.mem_map_ptr(va, size, Prot::ALL, pointer) }.is_err() {
+            return false;
+        }
+        let alias = alias.filter(|&low| {
+            let _ = self.uc.mem_unmap(low as u64, size);
+            // SAFETY: as above.
+            unsafe { self.uc.mem_map_ptr(low as u64, size, Prot::ALL, pointer) }.is_ok()
+        });
+        run.borrow_mut().shared_buffers.insert(va, (buffer, alias));
+        true
+    }
+
+    fn unmap_shared(&mut self, va: u64) -> bool {
+        let Some(run) = self.run else {
+            return false;
+        };
+        let Some((buffer, alias)) = run.borrow_mut().shared_buffers.remove(&va) else {
+            return false;
+        };
+        let size = buffer.len() as u64;
+        let _ = self.uc.mem_unmap(va, size);
+        if let Some(low) = alias {
+            let _ = self.uc.mem_unmap(low as u64, size);
+        }
+        drop(buffer);
+        true
     }
 
     fn unmap(&mut self, va: u32, size: u32) -> bool {
@@ -1037,6 +1085,9 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         };
         let mut state = run.borrow_mut();
         if state.running.len() < 2 || !state.levels.is_empty() || state.resume.is_some() {
+            if std::env::var_os("OTW_TRACE_THREADS").is_some() {
+                eprintln!("[thread] cannot suspend: running {:?}, levels {:?}", state.running, state.levels);
+            }
             return false;
         }
         state.thread_signal = Some(ThreadSignal::Suspend);
@@ -1589,6 +1640,25 @@ fn build<'a>(
     if x64 {
         uc.mem_map(memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64, Prot::ALL)
             .map_err(|error| RunError::Unicorn("mapping the 64-bit heap", error))?;
+        // NTDLL's headers, for programs that read their own module list.
+        let mut headers = vec![0u8; 0x1000];
+        headers[0..2].copy_from_slice(b"MZ");
+        headers[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        headers[0x80..0x84].copy_from_slice(b"PE\0\0");
+        headers[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        headers[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+        headers[0x96..0x98].copy_from_slice(&0x2022u16.to_le_bytes());
+        let o = 0x98;
+        headers[o..o + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        headers[o + 24..o + 32].copy_from_slice(&(memory::NTDLL_HANDLE as u64).to_le_bytes());
+        headers[o + 32..o + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        headers[o + 36..o + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        headers[o + 56..o + 60].copy_from_slice(&0x1000u32.to_le_bytes());
+        headers[o + 60..o + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        headers[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
+        uc.mem_map(memory::NTDLL_HANDLE as u64, 0x1000, Prot::READ)
+            .and_then(|()| uc.mem_write(memory::NTDLL_HANDLE as u64, &headers))
+            .map_err(|error| RunError::Unicorn("mapping NTDLL's headers", error))?;
     }
 
     uc.mem_map(TIB_BASE as u64, if x64 { TEB64_SIZE } else { TIB_SIZE } as u64, Prot::ALL)

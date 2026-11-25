@@ -44,6 +44,25 @@ pub struct Wait {
     deadline: Option<u64>,
     /// Messages also end the wait.
     messages: bool,
+    /// WaitOnAddress: the address and the value it had; a different value
+    /// ends the wait.
+    address: u32,
+    compare: Vec<u8>,
+    /// The timeout the wait was made with (to tell the same call made
+    /// again from another).
+    timeout: u32,
+}
+
+fn address_changed<M: GuestMemory + ?Sized>(memory: &mut M, wait: &Wait) -> bool {
+    wait.address != 0 && memory.read_bytes(wait.address, wait.compare.len()).is_some_and(|now| now != wait.compare)
+}
+
+/// WaitOnAddress: wait until the value at `address` differs from
+/// `compare` or the timeout passes. Returns whether it changed (or the
+/// thread came off the CPU, to make the call again).
+pub fn wait_on_address<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address: u32, compare: Vec<u8>, timeout: u32) -> bool {
+    let spec = Wait { address, compare, ..Wait::default() };
+    !matches!(wait(ctx, memory, spec, timeout), Outcome::Timeout)
 }
 
 /// Threads and synchronisation objects of a process.
@@ -257,6 +276,9 @@ fn ready<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, thread: u32,
     if wait.section != 0 {
         return section_free(memory, wait.section, thread);
     }
+    if wait.address != 0 {
+        return address_changed(memory, &wait);
+    }
     if wait.messages && messages_waiting(ctx, thread) {
         return true;
     }
@@ -429,13 +451,38 @@ enum Outcome {
 fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wait, timeout: u32) -> Outcome {
     let thread = memory.current_thread();
     // A wait made again after the thread came off the CPU keeps its deadline.
-    let previous = ctx.shared.borrow_mut().sync.waits.remove(&thread);
+    // (Only the same wait: a call that came back for another reason, such
+    // as a step of a longer wait the subsystem makes, must not pass its
+    // deadline on to the next wait.)
+    let previous = ctx
+        .shared
+        .borrow_mut()
+        .sync
+        .waits
+        .remove(&thread)
+        .filter(|p| {
+            p.handles == wait.handles
+                && p.messages == wait.messages
+                && p.section == wait.section
+                && p.address == wait.address
+                && p.timeout == timeout
+        });
+    wait.timeout = timeout;
     wait.deadline = match previous {
         Some(previous) => previous.deadline,
         None if timeout == INFINITE => None,
         None => Some(ctx.shared.borrow().ticks() + timeout as u64),
     };
+    let began = std::time::Instant::now();
+    let mut reported = false;
     loop {
+        if !reported && began.elapsed().as_secs() >= 20 && std::env::var_os("OTW_TRACE_WAITS").is_some() {
+            reported = true;
+            eprintln!("[waits] thread {thread} has waited 20 s for {:?} (address {:#x})", wait.handles, wait.address);
+            for (other, w) in &ctx.shared.borrow().sync.waits {
+                eprintln!("[waits]   thread {other}: handles {:?} address {:#x} deadline {:?}", w.handles, w.address, w.deadline);
+            }
+        }
         refresh_processes(ctx);
         {
             let mut shared = ctx.shared.borrow_mut();
@@ -446,6 +493,20 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         }
         if wait.section != 0 && section_free(memory, wait.section, thread) {
             return Outcome::Signaled(0);
+        }
+        if address_changed(memory, &wait) {
+            return Outcome::Signaled(0);
+        }
+        if wait.messages && !memory.has_host() && ctx.shared.borrow().x64 {
+            // Headless, scripted input (OTW_INPUT) stands in for the
+            // host's, also while other threads keep running. (Only for
+            // 64-bit programs, which wait in MsgWaitForMultipleObjects
+            // rather than GetMessage; fed here too, the script would run
+            // ahead of the older programs it was timed for.)
+            let due = ctx.shared.borrow().gui.script_until.is_none_or(|until| std::time::Instant::now() >= until);
+            if due {
+                crate::win32::user::feed_script(ctx);
+            }
         }
         if wait.messages && messages_waiting(ctx, thread) {
             return Outcome::Signaled(wait.handles.len() as u32);
@@ -472,6 +533,9 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             continue;
         }
         if memory.waiting_threads().is_empty() && wait.deadline.is_none() && !wait.messages {
+            if std::env::var_os("OTW_TRACE_THREADS").is_some() {
+                eprintln!("[thread] {thread} wait on {:?}: nothing else can run; it succeeds", wait.handles);
+            }
             // With no other thread, nothing could ever signal it: do as the
             // single-threaded VM always did and let the wait succeed.
             return Outcome::Signaled(0);

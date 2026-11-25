@@ -273,6 +273,9 @@ pub fn arg_count(ctx: &ApiContext, dll: &str, name: &ImportName) -> Option<usize
     if crate::win32::is_ucrt(crate::win32::api_set_host(dll).unwrap_or(dll)) {
         return crate::win32::ucrt::arg_count(by_name(name)?);
     }
+    if dll.eq_ignore_ascii_case("dwrite.dll") {
+        return crate::win32::dwrite::arg_count(by_name(name)?);
+    }
     if let Some(count) = by_name(name).and_then(crate::win32::seh64::arg_count) {
         return Some(count);
     }
@@ -305,8 +308,16 @@ pub fn call(
 ) -> Option<ApiOutcome> {
     let count = args.len();
     let args = args.all_wide();
+    if std::env::var_os("OTW_TRACE_HIGH").is_some() {
+        if let Some(high) = args.iter().take(count).find(|&&a| a > u32::MAX as u64 && crate::win32::vmem::owns_high(ctx, a)) {
+            eprintln!("[high] {dll}!{name:?} gets {high:#x} (args {:x?})", &args[..count.min(args.len())]);
+        }
+    }
     if crate::win32::is_ucrt(crate::win32::api_set_host(dll).unwrap_or(dll)) {
         return crate::win32::ucrt::call(ctx, memory, by_name(name)?, args);
+    }
+    if dll.eq_ignore_ascii_case("dwrite.dll") {
+        return crate::win32::dwrite::call(ctx, memory, by_name(name)?, args);
     }
     if let Some(outcome) = by_name(name).and_then(|text| crate::win32::seh64::call(ctx, memory, text, args)) {
         return Some(outcome);

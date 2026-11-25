@@ -8,6 +8,8 @@
 
 pub mod advpack;
 pub mod bindctx;
+pub mod dwrite;
+pub mod fonts;
 pub mod seh64;
 pub mod env;
 pub mod vmem;
@@ -719,6 +721,7 @@ pub struct SharedState {
     pub ucrt: ucrt::State,
     pub nt: nt::State,
     pub seh: seh64::State,
+    pub dwrite: dwrite::State,
     pub vmem: vmem::State,
     pub env: env::State,
     /// A floating-point result the CPU backend must load into ST(0).
@@ -814,6 +817,7 @@ impl Default for SharedState {
             ucrt: ucrt::State::default(),
             nt: nt::State::default(),
             seh: seh64::State::default(),
+            dwrite: dwrite::State::default(),
             vmem: vmem::State::default(),
             env: env::State::default(),
             fpu_result: None,
@@ -1108,6 +1112,7 @@ pub fn entry_points() -> Vec<(String, String)> {
             .chain(catmgr::methods())
             .map(|name| ("OLE32.dll".to_owned(), (*name).to_owned())),
     );
+    entries.extend(dwrite::entry_names().into_iter().map(|name| ("DWrite.dll".to_owned(), name)));
     entries.push(("KERNEL32.dll".to_owned(), "OTW_ThreadStart".to_owned()));
     entries.extend(
         (0..kernel32::DYNAMIC_SLOTS).map(|slot| (DYNAMIC_DLL.to_owned(), format!("slot{slot}"))),

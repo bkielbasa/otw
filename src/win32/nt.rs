@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::{
     kernel::pe::ImportName,
-    win32::{unicode, ApiContext, ApiOutcome, GuestMemory},
+    win32::{unicode, vmem, ApiContext, ApiOutcome, GuestMemory},
 };
 
 const STATUS_SUCCESS: u64 = 0;
@@ -139,6 +139,29 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "GetProcessWindowStation" => 0,
         "CoGetApartmentType" => 2,
         "CommandLineToArgvW" => 2,
+        "GetFinalPathNameByHandleW" | "GetFileInformationByHandleEx" => 4,
+        "GetDpiForMonitor" => 4,
+        "GetDpiForWindow" | "EnableNonClientDpiScaling" | "SetThreadDpiAwarenessContext" | "SetProcessDpiAwarenessContext"
+        | "IsValidDpiAwarenessContext" | "GetAwarenessFromDpiAwarenessContext" | "SetProcessDpiAwareness" => 1,
+        "GetDpiForSystem" | "GetThreadDpiAwarenessContext" | "SetProcessDPIAware" | "IsProcessDPIAware" => 0,
+        "AreDpiAwarenessContextsEqual" | "GetSystemMetricsForDpi" | "GetProcessDpiAwareness" => 2,
+        "AdjustWindowRectExForDpi" => 5,
+        "NtQuerySection" | "NtQueryInformationThread" | "NtSetInformationProcess" | "NtQuerySystemInformation"
+        | "NtOpenDirectoryObject" | "NtQueryDirectoryObject" | "NtCreateFile" | "NtReadFile" | "NtWriteFile"
+        | "NtDeviceIoControlFile" | "NtFsControlFile" | "NtCancelIoFileEx" | "LdrResolveDelayLoadedAPI"
+        | "NtCreateSection" => 10,
+        "RtlGetLastNtStatus" => 0,
+        "LdrLoadDll" => 4,
+        "LdrUnloadDll" => 1,
+        "CreateDXGIFactory" | "CreateDXGIFactory1" => 2,
+        "CreateDXGIFactory2" => 3,
+        "D3D11CreateDevice" => 10,
+        "D3D10CreateDevice1" => 7,
+        "Direct3DCreate9" => 1,
+        "Direct3DCreate9Ex" => 2,
+        "D2D1CreateFactory" => 4,
+        "DwmFlush" => 0,
+        "DwmGetCompositionTimingInfo" => 2,
         "MsgWaitForMultipleObjectsEx" => 5,
         "LockFileEx" | "UnlockFileEx" => 6,
         "VirtualQueryEx" => 4,
@@ -167,7 +190,8 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "LocaleNameToLCID" => 2,
         "GetDisplayConfigBufferSizes" => 3,
         "RoActivateInstance" => 2,
-        "VirtualAlloc" => 4,
+        "VirtualAlloc" | "VirtualProtect" => 4,
+        "VirtualFree" | "VirtualQuery" => 3,
         "timeGetTime" => 0,
         "timeBeginPeriod" | "timeEndPeriod" => 1,
         "timeGetDevCaps" => 2,
@@ -387,7 +411,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             if arg(2) != 0 {
                 return ok(STATUS_INVALID_INFO_CLASS);
             }
-            let returned = win32(ctx, memory, "KERNEL32.dll", "VirtualQuery", &[p(1), p(3), p(4)]);
+            let returned = call(ctx, memory, "VirtualQuery", &[arg(1), arg(3), arg(4)]).map(|o| o.value).unwrap_or(0);
             if p(5) != 0 {
                 let _ = memory.write_ptr(p(5), returned as u64);
             }
@@ -565,9 +589,8 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         "WaitOnAddress" => {
             // (address, compare, size, timeout): until the value differs.
             let (address, compare, length, timeout) = (p(0), p(1), arg(2) as usize, p(3));
-            // One step: the other threads run (a thread that comes off the
-            // CPU makes the call again when it is back), then the caller,
-            // which must allow for spurious wake-ups, looks again.
+            // The thread waits until the value changes (WakeByAddress* need
+            // do nothing: the waiting thread looks at the value).
             let expected = memory.read_bytes(compare, length).unwrap_or_default();
             if memory.read_bytes(address, length).unwrap_or_default() != expected {
                 return ok(1);
@@ -576,8 +599,11 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 set_error(ctx, 1460); // ERROR_TIMEOUT
                 return ok(0);
             }
-            win32(ctx, memory, "KERNEL32.dll", "Sleep", &[timeout.min(1)]);
-            ok(1)
+            let changed = crate::win32::sync::wait_on_address(ctx, memory, address, expected, timeout);
+            if !changed {
+                set_error(ctx, 1460);
+            }
+            ok(u64::from(changed))
         }
         // ── Interlocked singly linked lists ──
         "InterlockedPushEntrySList" => {
@@ -716,7 +742,8 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 set_error(ctx, 6);
                 return ok(0);
             };
-            let mut bytes = 0x80u32.to_le_bytes().to_vec();
+            let directory = ctx.shared.borrow().files.get(&p(0)).and_then(|f| f.metadata().ok()).is_some_and(|m| m.is_dir());
+            let mut bytes = (if directory { 0x10u32 } else { 0x80 }).to_le_bytes().to_vec();
             bytes.extend_from_slice(&[0u8; 24]);
             bytes.extend_from_slice(&0x4F54_5700u32.to_le_bytes());
             bytes.extend_from_slice(&((length >> 32) as u32).to_le_bytes());
@@ -825,12 +852,176 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(1)
         }
         "SetThreadStackGuarantee" => ok(1),
+        // (file, buffer, length, flags): \\?\C:\... for a file OTW opened.
+        "GetFinalPathNameByHandleW" => {
+            let Some(path) = ctx.shared.borrow().file_paths.get(&p(0)).cloned() else {
+                set_error(ctx, 6);
+                return ok(0);
+            };
+            let absolute = crate::win32::crt::absolute(ctx, &path);
+            let mut text: Vec<u16> = if p(3) & 0xF == 0 { r"\\?\".encode_utf16().collect() } else { Vec::new() };
+            text.extend(unicode::ansi_to_wide(&absolute));
+            if (p(2) as usize) <= text.len() {
+                return ok(text.len() as u64 + 1);
+            }
+            unicode::write_wide(memory, p(1), &text, true);
+            ok(text.len() as u64)
+        }
+        // (file, class, buffer, size): basic, standard, attribute-tag and
+        // id information from the host file.
+        "GetFileInformationByHandleEx" => {
+            let metadata = ctx.shared.borrow().files.get(&p(0)).and_then(|f| f.metadata().ok());
+            let Some(metadata) = metadata else {
+                set_error(ctx, 6);
+                return ok(0);
+            };
+            let filetime = |time: std::io::Result<std::time::SystemTime>| {
+                time.ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64 / 100 + 116_444_736_000_000_000)
+                    .unwrap_or(116_444_736_000_000_000)
+            };
+            let attributes: u32 = if metadata.is_dir() { 0x10 } else { 0x20 };
+            let mut bytes = Vec::new();
+            match p(1) {
+                0 => {
+                    let modified = filetime(metadata.modified());
+                    for value in [filetime(metadata.created()), filetime(metadata.accessed()), modified, modified] {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                    bytes.extend_from_slice(&attributes.to_le_bytes());
+                    bytes.extend_from_slice(&[0; 4]);
+                }
+                1 => {
+                    let size = if metadata.is_dir() { 0 } else { metadata.len() };
+                    bytes.extend_from_slice(&((size + 4095) & !4095).to_le_bytes());
+                    bytes.extend_from_slice(&size.to_le_bytes());
+                    bytes.extend_from_slice(&1u32.to_le_bytes());
+                    bytes.extend_from_slice(&[0, u8::from(metadata.is_dir()), 0, 0]);
+                }
+                9 => {
+                    bytes.extend_from_slice(&attributes.to_le_bytes());
+                    bytes.extend_from_slice(&0u32.to_le_bytes());
+                }
+                18 => {
+                    use std::os::unix::fs::MetadataExt;
+                    bytes.extend_from_slice(&0x4F54_5700u64.to_le_bytes());
+                    bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+                    bytes.extend_from_slice(&0u64.to_le_bytes());
+                }
+                _ => {
+                    set_error(ctx, 50);
+                    return ok(0);
+                }
+            }
+            if (p(3) as usize) < bytes.len() {
+                set_error(ctx, 24); // ERROR_BAD_LENGTH
+                return ok(0);
+            }
+            let _ = memory.write_bytes(p(2), &bytes);
+            ok(1)
+        }
+        // One display at 96 dots per inch.
+        "GetDpiForMonitor" => {
+            let _ = memory.write_u32(p(2), 96);
+            let _ = memory.write_u32(p(3), 96);
+            ok(0)
+        }
+        "GetDpiForWindow" | "GetDpiForSystem" => ok(96),
+        "EnableNonClientDpiScaling" | "SetProcessDPIAware" | "IsProcessDPIAware" | "AreDpiAwarenessContextsEqual"
+        | "IsValidDpiAwarenessContext" | "SetProcessDpiAwarenessContext" => ok(1),
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4); awareness 2.
+        "SetThreadDpiAwarenessContext" | "GetThreadDpiAwarenessContext" => ok(u64::MAX - 3),
+        "GetAwarenessFromDpiAwarenessContext" => ok(2),
+        "SetProcessDpiAwareness" => ok(0),
+        "GetProcessDpiAwareness" => {
+            let _ = memory.write_u32(p(1), 2);
+            ok(0)
+        }
+        "GetSystemMetricsForDpi" => ok(win32(ctx, memory, "USER32.dll", "GetSystemMetrics", &[p(0)]) as u64),
+        "AdjustWindowRectExForDpi" => ok(win32(ctx, memory, "USER32.dll", "AdjustWindowRectEx", &[p(0), p(1), p(2), p(3)]) as u64),
+        // NtQuerySection(section, class, buffer, length, &returned): basic
+        // information (base, attributes SEC_COMMIT, maximum size).
+        "NtQuerySection" if p(1) == 0 => {
+            let Some((_, size)) = ctx.shared.borrow().file_mappings.get(&p(0)).copied() else {
+                return ok(0xC000_0008); // STATUS_INVALID_HANDLE
+            };
+            let mut bytes = vec![0u8; 24];
+            bytes[8..12].copy_from_slice(&0x0800_0000u32.to_le_bytes());
+            bytes[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+            let _ = memory.write_bytes(p(2), &bytes);
+            if p(4) != 0 {
+                let _ = memory.write_u32(p(4), 24);
+            }
+            ok(STATUS_SUCCESS)
+        }
+        // Native calls for what OTW does not offer through them.
+        "NtQuerySection" | "NtQueryInformationThread" | "NtSetInformationProcess" | "NtQuerySystemInformation"
+        | "NtOpenDirectoryObject" | "NtQueryDirectoryObject" | "NtCreateFile" | "NtReadFile" | "NtWriteFile"
+        | "NtDeviceIoControlFile" | "NtFsControlFile" | "NtCancelIoFileEx" | "LdrResolveDelayLoadedAPI"
+        | "NtCreateSection" => ok(STATUS_NOT_IMPLEMENTED),
+        "RtlGetLastNtStatus" => ok(0),
+        "LdrLoadDll" => {
+            // (search path, flags, &name, &handle)
+            let name = unicode_string(memory, p(2));
+            let text = alloc(ctx, name.len() as u32 * 2 + 2);
+            unicode::write_wide(memory, text, &name, true);
+            let handle = win32(ctx, memory, "KERNEL32.dll", "LoadLibraryW", &[text]);
+            ctx.shared.borrow_mut().heap.free(text);
+            let _ = memory.write_ptr(p(3), handle as u64);
+            ok(if handle != 0 { STATUS_SUCCESS } else { 0xC000_0135 })
+        }
+        "LdrUnloadDll" => ok(STATUS_SUCCESS),
+        // No Direct3D or DXGI: programs draw in software.
+        "CreateDXGIFactory" | "CreateDXGIFactory1" | "CreateDXGIFactory2" => {
+            let out = if name == "CreateDXGIFactory2" { p(2) } else { p(1) };
+            let _ = memory.write_ptr(out, 0);
+            ok(0x887A_0004) // DXGI_ERROR_UNSUPPORTED
+        }
+        "D3D11CreateDevice" => {
+            for index in [7, 9] {
+                if p(index) != 0 {
+                    let _ = memory.write_ptr(p(index), 0);
+                }
+            }
+            ok(0x887A_0004)
+        }
+        "D3D10CreateDevice1" | "Direct3DCreate9Ex" | "D2D1CreateFactory" => ok(0x8000_4005),
+        "Direct3DCreate9" => ok(0),
+        // DWM_TIMING_INFO (packed) of a 60 Hz display: rates, the refresh
+        // period and the last vertical blank in performance-counter ticks
+        // (microseconds).
+        "DwmGetCompositionTimingInfo" => {
+            let now = ctx.shared.borrow().started.elapsed().as_micros() as u64;
+            let period = 16_667u64;
+            let vblank = now - now % period;
+            let mut bytes = vec![0u8; 0x120];
+            bytes[0..4].copy_from_slice(&0x120u32.to_le_bytes());
+            bytes[4..8].copy_from_slice(&60u32.to_le_bytes());
+            bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+            bytes[12..20].copy_from_slice(&period.to_le_bytes());
+            bytes[20..24].copy_from_slice(&60u32.to_le_bytes());
+            bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+            bytes[28..36].copy_from_slice(&vblank.to_le_bytes());
+            bytes[36..44].copy_from_slice(&(now / period).to_le_bytes());
+            bytes[48..56].copy_from_slice(&vblank.to_le_bytes());
+            let size = memory.read_u32(p(1)).unwrap_or(0).clamp(0, 0x120) as usize;
+            let _ = memory.write_bytes(p(1), &bytes[..size.max(44)]);
+            ok(0)
+        }
+        // The next frame of a 60 Hz display.
+        "DwmFlush" => {
+            let now = ctx.shared.borrow().ticks();
+            let wait = 16 - (now % 16).min(15);
+            win32(ctx, memory, "KERNEL32.dll", "Sleep", &[wait as u32]);
+            ok(0)
+        }
         // (count, handles, timeout, wake mask, flags: 1 = wait for all)
         "MsgWaitForMultipleObjectsEx" => {
             ok(win32(ctx, memory, "USER32.dll", "MsgWaitForMultipleObjects", &[p(0), p(1), p(4) & 1, p(2), p(3)]) as u64)
         }
         "LockFileEx" | "UnlockFileEx" => ok(1),
-        "VirtualQueryEx" => ok(win32(ctx, memory, "KERNEL32.dll", "VirtualQuery", &[p(1), p(2), p(3)]) as u64),
+        "VirtualQueryEx" => ok(win32(ctx, memory, "KERNEL32.dll", "VirtualQuery", &[p(1), p(2), p(3), 0]) as u64),
         "GetNamedSecurityInfoW" => {
             for index in 3..7 {
                 if p(index) != 0 {
@@ -894,14 +1085,69 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             }
             ok(1)
         }
-        // A 64-bit request: sizes past 4 GiB cannot be met.
+        // A 64-bit request: reservations of 4 GiB or more go above 4 GiB.
         "VirtualAlloc" => {
+            let trace = std::env::var_os("OTW_TRACE_VMEM").is_some();
+            let high = if vmem::owns_high(ctx, arg(0)) {
+                Some(vmem::commit_high(ctx, memory, arg(0), arg(1)))
+            } else if arg(1) >= vmem::HIGH_THRESHOLD && p(2) & 0x2000 != 0 {
+                Some(vmem::reserve_high(ctx, memory, arg(0), arg(1), p(2)))
+            } else {
+                None
+            };
+            if let Some(result) = high {
+                if trace {
+                    eprintln!("[vmem] high alloc {:#x} size {:#x} type {:#x} -> {result:x?}", arg(0), arg(1), p(2));
+                }
+                return match result {
+                    Ok(address) => ok(address),
+                    Err(code) => {
+                        set_error(ctx, code);
+                        ok(0)
+                    }
+                };
+            }
             if arg(1) > u32::MAX as u64 || arg(0) > u32::MAX as u64 {
+                if std::env::var_os("OTW_TRACE_VMEM").is_some() {
+                    eprintln!("[vmem] alloc {:#x} size {:#x} type {:#x} too large", arg(0), arg(1), p(2));
+                }
                 set_error(ctx, 8);
                 return ok(0);
             }
             ok(win32(ctx, memory, "KERNEL32.dll", "VirtualAlloc", &[p(0), p(1), p(2), p(3)]) as u64)
         }
+        "VirtualFree" if vmem::owns_high(ctx, arg(0)) => {
+            // Decommitting leaves the pages mapped; releasing unmaps them.
+            if p(2) & 0x8000 != 0 {
+                if let Err(code) = vmem::release_high(ctx, memory, arg(0)) {
+                    set_error(ctx, code);
+                    return ok(0);
+                }
+            }
+            ok(1)
+        }
+        "VirtualFree" => ok(win32(ctx, memory, "KERNEL32.dll", "VirtualFree", &[p(0), p(1), p(2)]) as u64),
+        "VirtualProtect" if vmem::owns_high(ctx, arg(0)) => {
+            let _ = memory.write_u32(p(3), 4);
+            ok(1)
+        }
+        "VirtualProtect" => ok(win32(ctx, memory, "KERNEL32.dll", "VirtualProtect", &[p(0), p(1), p(2), p(3)]) as u64),
+        "VirtualQuery" => match vmem::query_high(ctx, arg(0)) {
+            Some(values) => {
+                if arg(2) < 48 {
+                    set_error(ctx, 24);
+                    return ok(0);
+                }
+                let mut bytes = [0u8; 48];
+                for (offset, value, wide) in [(0, values[0], true), (8, values[1], true), (16, values[2], false), (24, values[3], true), (32, values[4], false), (36, values[5], false), (40, values[6], false)] {
+                    let width = if wide { 8 } else { 4 };
+                    bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+                }
+                let _ = memory.write_bytes(p(1), &bytes);
+                ok(48)
+            }
+            None => ok(win32(ctx, memory, "KERNEL32.dll", "VirtualQuery", &[p(0), p(1), p(2), 0]) as u64),
+        },
         "GlobalMemoryStatusEx" => {
             // MEMORYSTATUSEX: load, physical, page file, virtual (total, free).
             let mut bytes = 64u32.to_le_bytes().to_vec();

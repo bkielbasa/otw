@@ -75,6 +75,17 @@ fn root_of(drive: u8) -> Option<PathBuf> {
 /// case-insensitively; missing ones are kept as given.
 pub fn host_path(guest: &[u8]) -> Option<PathBuf> {
     let text = String::from_utf8_lossy(guest).replace('/', "\\");
+    // Win32 file namespace paths (\\?\C:\...) are the plain paths.
+    let text = text.strip_prefix("\\\\?\\").map(str::to_string).unwrap_or(text);
+    // The fonts folder shows the host's fonts (see `win32::fonts`).
+    let upper = text.to_ascii_uppercase();
+    if let Some(name) = upper.strip_prefix("C:\\WINDOWS\\FONTS\\") {
+        if !name.contains('\\') && std::env::var_os("OTW_NO_HOST_FONTS").is_none() {
+            if let Some(path) = crate::win32::fonts::db().host_path(name) {
+                return Some(path);
+            }
+        }
+    }
     let mut rest = text.as_str();
     let mut drive = b'C';
     if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
@@ -117,6 +128,7 @@ pub fn host_path(guest: &[u8]) -> Option<PathBuf> {
 /// A guest path made absolute against the process's current directory
 /// (`C:\` unless SetCurrentDirectory changed it).
 pub fn absolute(ctx: &ApiContext, guest: &[u8]) -> Vec<u8> {
+    let guest = guest.strip_prefix(b"\\\\?\\").unwrap_or(guest);
     let has_drive = guest.len() >= 2 && guest[1] == b':';
     if has_drive {
         return guest.to_vec();

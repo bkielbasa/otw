@@ -457,8 +457,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         | "DrawThemeTextEx" | "GetThemePartSize" | "GetThemeTransitionDuration" | "DrawThemeParentBackground" => ok(E_FAIL),
         "BeginBufferedAnimation" | "BeginBufferedPaint" | "BufferedPaintRenderAnimation" | "EndBufferedPaint" => ok(0),
         "DwmGetColorizationColor" | "DwmSetWindowAttribute" => ok(E_FAIL),
+        // Composition is on for 64-bit programs (Windows 8 and later
+        // cannot turn it off), whose frame pacing waits on DwmFlush.
         "DwmIsCompositionEnabled" => {
-            let _ = memory.write_u32(args[0], 0);
+            let _ = memory.write_u32(args[0], u32::from(ctx.shared.borrow().x64));
             ok(S_OK)
         }
         // ── COMCTL32 v6 ──
