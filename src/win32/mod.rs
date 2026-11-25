@@ -8,6 +8,9 @@
 
 pub mod advpack;
 pub mod bindctx;
+pub mod tabs;
+pub mod rebar;
+pub mod modern;
 pub mod x64;
 pub mod catmgr;
 pub mod cab;
@@ -455,6 +458,8 @@ pub struct GuiState {
     /// State of SysListView32 controls.
     pub list_views: HashMap<u32, comctl32::ListView>,
     pub tree_views: HashMap<u32, treeview::TreeView>,
+    pub rebars: HashMap<u32, rebar::Rebar>,
+    pub tab_controls: HashMap<u32, tabs::Tabs>,
     /// Toolbars, status bars and subclassed windows.
     pub toolbars: HashMap<u32, commctrl::Toolbar>,
     pub status_bars: HashMap<u32, commctrl::StatusBar>,
@@ -518,6 +523,8 @@ impl Default for GuiState {
             unicode_pages: std::collections::HashSet::new(),
             list_views: HashMap::new(),
             tree_views: HashMap::new(),
+            rebars: HashMap::new(),
+            tab_controls: HashMap::new(),
             toolbars: HashMap::new(),
             status_bars: HashMap::new(),
             subclasses: HashMap::new(),
@@ -1160,6 +1167,8 @@ pub const BUILTIN_PROCS: &[&str] = &[
     "OTW_TabProc",
     "OTW_ListViewProc",
     "OTW_TreeViewProc",
+    "OTW_TooltipProc",
+    "OTW_RebarProc",
     "OTW_SubclassProc",
     "OTW_ToolbarProc",
     "OTW_StatusProc",
@@ -1244,6 +1253,9 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
         if let Some(named) = commctrl::ordinal_name(dll, *ordinal) {
             return commctrl::arg_count(named);
         }
+        if let Some(named) = modern::comctl32_ordinal(*ordinal).filter(|_| dll.eq_ignore_ascii_case("comctl32.dll")) {
+            return modern::arg_count(named);
+        }
         if let Some(named) = shell::ordinal_name(dll, *ordinal) {
             return shell::arg_count(named);
         }
@@ -1299,6 +1311,7 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
         .or_else(|| unicode::arg_count(dll, name))
         .or_else(|| xp::arg_count(name))
         .or_else(|| misc::arg_count(name))
+        .or_else(|| modern::arg_count(name))
     {
         return Some(count);
     }
@@ -1469,6 +1482,9 @@ pub fn dispatch_with_memory<M: GuestMemory + ?Sized>(
         if let Some(named) = commctrl::ordinal_name(dll, *ordinal) {
             return commctrl::dispatch(ctx, memory, named, args);
         }
+        if let Some(named) = modern::comctl32_ordinal(*ordinal).filter(|_| dll.eq_ignore_ascii_case("comctl32.dll")) {
+            return modern::dispatch(ctx, memory, named, args);
+        }
         if let Some(named) = shell::ordinal_name(dll, *ordinal) {
             return shell::dispatch(ctx, memory, named, args);
         }
@@ -1528,6 +1544,9 @@ pub fn dispatch_with_memory<M: GuestMemory + ?Sized>(
         }
         if misc::arg_count(text).is_some() {
             return misc::dispatch(ctx, memory, text, args);
+        }
+        if modern::arg_count(text).is_some() {
+            return modern::dispatch(ctx, memory, text, args);
         }
     }
     if dll.eq_ignore_ascii_case("wsock32.dll") || dll.eq_ignore_ascii_case("winsock.dll") {

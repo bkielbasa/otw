@@ -150,6 +150,9 @@ struct RunState<'a> {
     thread_return: u32,
     /// A 64-bit process: the x64 calling convention, GS-based TEBs.
     x64: bool,
+    /// Static thread-local storage templates (`__declspec(thread)`), one
+    /// per module with a TLS directory, in index order.
+    tls_templates: Vec<Vec<u8>>,
 }
 
 /// A thread off the CPU.
@@ -242,6 +245,61 @@ fn init_teb64(uc: &mut Unicorn<'_, ()>, teb: u32, top: u32, bottom: u32, thread:
     }
     uc.reg_write(Reg::GS_BASE, teb as u64)
         .map_err(|error| RunError::Unicorn("setting the GS base", error))
+}
+
+/// The static TLS template of each module with a TLS directory, and its
+/// index written to the module's index variable.
+fn tls_templates(process: &Image, uc: &mut Unicorn<'_, ()>) -> Vec<Vec<u8>> {
+    let mut templates = Vec::new();
+    for module in &process.modules {
+        let memory = &module.memory;
+        let read32 = |at: usize| memory.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let Some(pe) = read32(0x3C).map(|v| v as usize) else { continue };
+        let x64 = module.image.is64;
+        let directories = pe + 24 + if x64 { 112 } else { 96 };
+        let (Some(rva), Some(size)) = (read32(directories + 9 * 8), read32(directories + 9 * 8 + 4)) else { continue };
+        if rva == 0 || size == 0 {
+            continue;
+        }
+        let at = rva as usize;
+        // IMAGE_TLS_DIRECTORY: start, end, index address, callbacks (VAs,
+        // pointer-sized), zero fill.
+        let width = if x64 { 8 } else { 4 };
+        let field = |index: usize| read32(at + index * width).unwrap_or(0);
+        let (start, end, index_va) = (field(0), field(1), field(2));
+        let zero_fill = read32(at + 4 * width).unwrap_or(0);
+        let base = module.image.image_base;
+        let mut template = memory
+            .get((start.wrapping_sub(base)) as usize..(end.wrapping_sub(base)) as usize)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        template.extend(std::iter::repeat_n(0, zero_fill as usize));
+        let _ = uc.mem_write(index_va as u64, &(templates.len() as u32).to_le_bytes());
+        templates.push(template);
+    }
+    templates
+}
+
+/// Give a thread its copies of the TLS templates: the TEB's
+/// ThreadLocalStoragePointer (x64 TEB+0x58, x86 TIB+0x2C) points to an
+/// array of one block per module.
+fn install_tls(uc: &mut Unicorn<'_, ()>, templates: &[Vec<u8>], teb: u32, x64: bool) -> Result<(), uc_error> {
+    if templates.is_empty() {
+        return Ok(());
+    }
+    let width = if x64 { 8 } else { 4 };
+    let array_size = (templates.len() as u32 * width + 15) & !15;
+    let total = array_size + templates.iter().map(|t| (t.len() as u32 + 15) & !15).sum::<u32>();
+    let mut memory = UnicornGuestMemory { uc, run: None };
+    let block = memory.map_region(0x1000_0000, total.max(1)).ok_or(uc_error::NOMEM)?;
+    let mut cursor = block + array_size;
+    for (index, template) in templates.iter().enumerate() {
+        uc.mem_write(cursor as u64, template)?;
+        uc.mem_write((block + index as u32 * width) as u64, &(cursor as u64).to_le_bytes()[..width as usize])?;
+        cursor += (template.len() as u32 + 15) & !15;
+    }
+    let slot = if x64 { teb + 0x58 } else { teb + 0x2C };
+    uc.mem_write(slot as u64, &(block as u64).to_le_bytes()[..width as usize])
 }
 
 /// The running thread's TIB.
@@ -541,6 +599,8 @@ impl UnicornGuestMemory<'_, '_, '_, '_> {
         let mut current = self.uc.context_alloc().ok()?;
         self.uc.context_save(&mut current).ok()?;
         init_teb64(self.uc, teb, top, stack, id).ok()?;
+        let templates = run.borrow().tls_templates.clone();
+        install_tls(self.uc, &templates, teb, true).ok()?;
         let rsp = ((top - 0x40) & !0xF) - 8;
         self.uc.mem_write(rsp as u64, &(thread_return as u64).to_le_bytes()).ok()?;
         for register in SAVED_REGISTERS_64 {
@@ -644,6 +704,8 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             page[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
         self.uc.mem_write(tib as u64, &page).ok()?;
+        let templates = run.borrow().tls_templates.clone();
+        install_tls(self.uc, &templates, tib, false).ok()?;
         // The start routine returns to the thread-end thunk.
         let esp = top - 0x10;
         let thread_return = run.borrow().thread_return;
@@ -1398,6 +1460,12 @@ fn build<'a>(
         .unwrap_or(0);
     initial_state.thread_return = thread_return;
     initial_state.x64 = x64;
+    initial_state.tls_templates = tls_templates(process, &mut uc);
+    {
+        let teb = TIB_BASE;
+        install_tls(&mut uc, &initial_state.tls_templates, teb, x64)
+            .map_err(|error| RunError::Unicorn("setting up thread-local storage", error))?;
+    }
     initial_state.running = vec![1];
     initial_state.tibs = vec![(1, TIB_BASE)];
     initial_state.next_thread = 2;

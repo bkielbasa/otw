@@ -66,11 +66,11 @@ pub struct Layout {
 }
 
 impl Layout {
-    const fn new(fields: &'static [F]) -> Self {
+    pub const fn new(fields: &'static [F]) -> Self {
         Self { fields, sized: false }
     }
 
-    const fn sized(fields: &'static [F]) -> Self {
+    pub const fn sized(fields: &'static [F]) -> Self {
         Self { fields, sized: true }
     }
 
@@ -148,6 +148,21 @@ impl View {
             _ => {
                 let _ = memory.write_u32(at, value);
             }
+        }
+    }
+
+    /// Set a pointer-sized field to a full 64-bit value (in a 32-bit
+    /// process, its low half).
+    pub fn set_wide<M: GuestMemory + ?Sized>(&self, memory: &mut M, index: usize, value: u64) {
+        let at = self.va + self.offsets[index];
+        match self.fields[index] {
+            F::Q => {
+                let _ = memory.write_u64(at, value);
+            }
+            F::P if self.x64 => {
+                let _ = memory.write_u64(at, value);
+            }
+            _ => self.set(memory, index, value as u32),
         }
     }
 }

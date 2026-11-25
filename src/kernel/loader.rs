@@ -77,7 +77,14 @@ pub fn load(
     policy: &dyn ImportPolicy,
 ) -> Result<LoadResult, LoadError> {
     let mut modules = Vec::with_capacity(inputs.len());
-    for (name, image) in inputs {
+    // 64-bit DLLs linked above 4 GiB were all given the same low base when
+    // parsed: lay them out one after another instead.
+    let mut next_base = 0x1000_0000u32;
+    for (name, mut image) in inputs {
+        if image.is64 && image.preferred_base > u32::MAX as u64 && image.image_base != 0x0040_0000 {
+            image.image_base = next_base;
+            next_base = next_base + ((image.size_of_image + 0xFFFF) & !0xFFFF);
+        }
         let memory = map_image(&name, &image)?;
         modules.push(MappedModule {
             name,

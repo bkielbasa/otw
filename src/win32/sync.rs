@@ -612,12 +612,18 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                 }
             }
             let registers = memory.registers()?;
-            let _ = memory.write_u32(registers.esp + 4, parameter);
+            // The parameter: on the stack (stdcall), or in RCX (x64).
+            let regs = if memory.ptr_size() == 8 {
+                Some([0, 0, parameter, 0, 0, 0])
+            } else {
+                let _ = memory.write_u32(registers.esp + 4, parameter);
+                None
+            };
             memory.request_resume(crate::win32::Resume {
                 esp: registers.esp,
                 ebp: 0,
                 eip: start,
-                regs: None,
+                regs,
             });
             ok(0)
         }

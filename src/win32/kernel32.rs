@@ -34,6 +34,14 @@ fn system_module(name: &str) -> Option<u32> {
         "lz32" => 0xBF7C_0000,
         "wsock32" | "winsock" => 0xBF78_0000,
         "imm32" => 0xBF74_0000,
+        "uxtheme" => 0xBF70_0000,
+        "dwmapi" => 0xBF6C_0000,
+        "bcrypt" => 0xBF68_0000,
+        "crypt32" => 0xBF64_0000,
+        "wintrust" => 0xBF60_0000,
+        "sensapi" => 0xBF5C_0000,
+        "msimg32" => 0xBF58_0000,
+        "dbghelp" => 0xBF54_0000,
         _ => return None,
     })
 }
@@ -62,6 +70,14 @@ pub fn system_module_name(handle: u32) -> Option<&'static str> {
         0xBF7C_0000 => "LZ32.dll",
         0xBF78_0000 => "WSOCK32.dll",
         0xBF74_0000 => "IMM32.dll",
+        0xBF70_0000 => "UxTheme.dll",
+        0xBF6C_0000 => "dwmapi.dll",
+        0xBF68_0000 => "bcrypt.dll",
+        0xBF64_0000 => "CRYPT32.dll",
+        0xBF60_0000 => "WINTRUST.dll",
+        0xBF5C_0000 => "SensApi.dll",
+        0xBF58_0000 => "MSIMG32.dll",
+        0xBF54_0000 => "dbghelp.dll",
         _ => return None,
     })
 }

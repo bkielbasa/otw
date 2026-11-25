@@ -48,6 +48,14 @@ pub fn subsystem_only(dll: &str) -> bool {
             | "riched32"
             | "lz32"
             | "imm32"
+            | "uxtheme"
+            | "dwmapi"
+            | "bcrypt"
+            | "crypt32"
+            | "wintrust"
+            | "sensapi"
+            | "msimg32"
+            | "dbghelp"
             | "ntdll"
     )
 }
@@ -75,12 +83,20 @@ pub fn load_library<M: GuestMemory + ?Sized>(
         return kernel32::system_module_handle(&file).ok_or(126);
     };
     let image = PeImage::parse(bytes).map_err(|_| 193u32)?; // ERROR_BAD_EXE_FORMAT
+    // A 64-bit process loads only 64-bit DLLs, a 32-bit one 32-bit DLLs.
+    if image.is64 != (memory.ptr_size() == 8) {
+        return Err(193);
+    }
     let mut mapped = loader::map_image(&file, &image).map_err(|_| 193u32)?;
     let base = memory
         .map_region(image.image_base, mapped.len() as u32)
         .ok_or(8u32)?; // ERROR_NOT_ENOUGH_MEMORY
     if base != image.image_base {
-        loader::relocate(&mut mapped, image.relocations, base.wrapping_sub(image.image_base));
+        if image.is64 {
+            loader::relocate64(&mut mapped, image.relocations, (base as u64).wrapping_sub(image.image_base as u64));
+        } else {
+            loader::relocate(&mut mapped, image.relocations, base.wrapping_sub(image.image_base));
+        }
     }
     memory.write_bytes(base, &mapped).ok_or(8u32)?;
     let mut module = LoadedModule::at(file.clone(), &image, base);
@@ -110,10 +126,11 @@ pub fn load_library<M: GuestMemory + ?Sized>(
                 eprintln!("[module] {file}: missing {}!{}", dll.dll, name.display());
             }
             let address = genuine.unwrap_or_else(|| import_thunk(ctx, &dll.dll, name));
+            let size = memory.ptr_size();
             let slot = base
                 .wrapping_add(dll.first_thunk_rva)
-                .wrapping_add(index as u32 * 4);
-            memory.write_u32(slot, address);
+                .wrapping_add(index as u32 * size);
+            memory.write_ptr(slot, u64::from(address));
         }
     }
 

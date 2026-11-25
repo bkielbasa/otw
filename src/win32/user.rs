@@ -1117,6 +1117,13 @@ fn builtin_proc<M: GuestMemory + ?Sized>(
         "OTW_TabProc" => crate::win32::comctl32::tab_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ListViewProc" => crate::win32::comctl32::listview_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_TreeViewProc" => crate::win32::treeview::treeview_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_RebarProc" => crate::win32::rebar::rebar_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        // Tooltips: tools are accepted and never shown.
+        "OTW_TooltipProc" => match msg {
+            0x0404 | 0x0432 => 1,     // TTM_ADDTOOLA/W
+            0x0400..=0x04FF => 0,     // the other TTM_* messages
+            _ => def_window_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        },
         "OTW_SubclassProc" => crate::win32::commctrl::subclass_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ToolbarProc" => crate::win32::commctrl::toolbar_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_StatusProc" => crate::win32::commctrl::status_proc(ctx, memory, hwnd, msg, wparam, lparam),
@@ -1379,8 +1386,15 @@ fn system_logfont(weight: u32) -> Vec<u8> {
 
 /// The common controls COMCTL32 provides; a genuine COMCTL32 registers
 /// its own.
-pub const COMMON_CONTROL_CLASSES: [&str; 5] =
-    ["ToolbarWindow32", "msctls_statusbar32", "SysListView32", "SysTabControl32", "SysTreeView32"];
+pub const COMMON_CONTROL_CLASSES: [&str; 7] = [
+    "ToolbarWindow32",
+    "msctls_statusbar32",
+    "SysListView32",
+    "SysTabControl32",
+    "SysTreeView32",
+    "tooltips_class32",
+    "ReBarWindow32",
+];
 
 fn has_genuine_comctl32(ctx: &ApiContext) -> bool {
     ctx.modules
@@ -1410,8 +1424,10 @@ pub fn ensure_builtin_classes(ctx: &ApiContext) {
         return;
     }
     let builtin = |name: &str| ctx.builtin_proc(name);
-    let classes: [(&str, &str, u32, u32); 17] = [
+    let classes: [(&str, &str, u32, u32); 19] = [
         ("SysTreeView32", "OTW_TreeViewProc", 0x08, 0),
+        ("ReBarWindow32", "OTW_RebarProc", 0x08, 0),
+        ("tooltips_class32", "OTW_TooltipProc", 0x08, 0),
         ("RICHEDIT", "OTW_RichEditProc", 0x08, 6),
         ("OTW_ColorPanel", "OTW_ColorPanelProc", 0x08, 0),
         ("ToolbarWindow32", "OTW_ToolbarProc", 0x08, 0),

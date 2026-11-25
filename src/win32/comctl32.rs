@@ -728,6 +728,10 @@ pub fn sheet_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwn
 /// SysTabControl32. Property sheets keep one (hidden in wizards); tabs are
 /// not drawn yet, so it answers TCM_* queries as an empty control.
 pub fn tab_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, msg: u32, wparam: u32, lparam: u32) -> u32 {
+    let parent = ctx.shared.borrow().gui.window(hwnd).map(|w| w.parent).unwrap_or(0);
+    if !ctx.shared.borrow().gui.property_sheets.contains_key(&parent) {
+        return crate::win32::tabs::tab_proc(ctx, memory, hwnd, msg, wparam, lparam);
+    }
     match msg {
         // The sheet's page count and current page.
         0x1304 | 0x130B => {
