@@ -251,18 +251,18 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     if let Some(host) = crate::win32::crt::host_path(path.as_bytes()) {
                         let _ = std::fs::create_dir_all(host);
                     }
-                    let _ = memory.write_u32(args[3], block);
+                    let _ = memory.write_ptr(args[3], u64::from(block));
                     0
                 }
                 None => {
-                    let _ = memory.write_u32(args[3], 0);
+                    let _ = memory.write_ptr(args[3], 0);
                     0x8000_4005 // E_FAIL
                 }
             }
         }
         // Shell items (IShellItem) are not there: callers fall back.
         "SHCreateItemFromParsingName" => {
-            let _ = memory.write_u32(args[3], 0);
+            let _ = memory.write_ptr(args[3], 0);
             0x8000_4001 // E_NOTIMPL
         }
         "VerifyVersionInfoW" | "VerifyVersionInfoA" => {
@@ -276,9 +276,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "ActivateActCtx" | "GetCurrentActCtx" => {
             let out = if name == "ActivateActCtx" { args[1] } else { args[0] };
-            let width = if ctx.shared.borrow().x64 { 8 } else { 4 };
             if out != 0 {
-                let _ = memory.write_bytes(out, &vec![0u8; width]);
+                let _ = memory.write_ptr(out, 0);
             }
             1
         }

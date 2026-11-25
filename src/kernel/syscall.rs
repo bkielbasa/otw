@@ -27,7 +27,7 @@ pub trait SystemCalls {
         memory: &mut dyn GuestMemory,
         dll: &str,
         name: &ImportName,
-        args: &[u32],
+        args: &Args,
         caller: u32,
     ) -> Option<ApiOutcome>;
 
@@ -37,24 +37,53 @@ pub trait SystemCalls {
         self.arg_count(dll, name)
     }
 
-    /// Perform a call from 64-bit code (the x64 calling convention: the
-    /// caller cleans the stack). The value is returned in RAX.
-    fn call64(
-        &self,
-        memory: &mut dyn GuestMemory,
-        dll: &str,
-        name: &ImportName,
-        args: &[u64],
-        caller: u32,
-    ) -> Option<(u64, Option<u32>)> {
-        let narrow: Vec<u32> = args.iter().map(|&a| a as u32).collect();
-        let outcome = self.call(memory, dll, name, &narrow, caller)?;
-        Some((widen(outcome.value), outcome.exit_code))
-    }
-
     /// How to name an import in diagnostics.
     fn describe(&self, dll: &str, name: &ImportName) -> String {
         format!("{dll}!{}", name.display())
+    }
+}
+
+/// The arguments of a call: one 64-bit value per argument from 64-bit
+/// code (the x64 convention), one 32-bit value per stack slot from 32-bit
+/// code. Dereferences to the 32-bit values (each argument's low half).
+#[derive(Clone, Debug, Default)]
+pub struct Args {
+    wide: Vec<u64>,
+    narrow: Vec<u32>,
+    x64: bool,
+}
+
+impl Args {
+    pub fn new(wide: Vec<u64>, x64: bool) -> Self {
+        let narrow = wide.iter().map(|&value| value as u32).collect();
+        Self { wide, narrow, x64 }
+    }
+
+    /// Arguments of a call from 32-bit code.
+    pub fn narrow(values: &[u32]) -> Self {
+        Self::new(values.iter().map(|&value| value as u64).collect(), false)
+    }
+
+    /// Whether the caller is 64-bit code.
+    pub fn x64(&self) -> bool {
+        self.x64
+    }
+
+    /// Argument `index` in full.
+    pub fn wide(&self, index: usize) -> u64 {
+        self.wide.get(index).copied().unwrap_or(0)
+    }
+
+    pub fn all_wide(&self) -> &[u64] {
+        &self.wide
+    }
+}
+
+impl std::ops::Deref for Args {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        &self.narrow
     }
 }
 

@@ -195,11 +195,7 @@ fn malloc_object<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) -> u
     if block == 0 {
         return 0;
     }
-    let _ = memory.write_u32(block, block + 4);
-    for (index, name) in crate::win32::BUILTIN_COM.iter().enumerate() {
-        let _ = memory.write_u32(block + 4 + index as u32 * 4, ctx.builtin_proc(name));
-    }
-    crate::win32::wide_vtable(ctx, memory, block, crate::win32::BUILTIN_COM);
+    crate::win32::set_vtable(ctx, memory, block, crate::win32::BUILTIN_COM);
     ctx.shared.borrow_mut().imalloc = block;
     block
 }
@@ -308,7 +304,13 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         return None;
     }
     let ok = |value: u32| Some(ApiOutcome::new(value, count));
+    // A pointer-sized result (an interface pointer, a handle) and a 32-bit one.
     let out = |memory: &mut M, va: u32, value: u32| {
+        if va != 0 {
+            let _ = memory.write_ptr(va, u64::from(value));
+        }
+    };
+    let out32 = |memory: &mut M, va: u32, value: u32| {
         if va != 0 {
             let _ = memory.write_u32(va, value);
         }
@@ -453,11 +455,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     ok(S_FALSE)
                 }
                 "Moniker_Hash" => {
-                    out(memory, args[1], args[0]);
+                    out32(memory, args[1], args[0]);
                     ok(S_OK)
                 }
                 "Moniker_IsSystemMoniker" => {
-                    out(memory, args[1], 2); // MKSYS_FILEMONIKER
+                    out32(memory, args[1], 2); // MKSYS_FILEMONIKER
                     ok(S_OK)
                 }
                 "Moniker_GetDisplayName" => {
@@ -505,7 +507,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     let mut shared = ctx.shared.borrow_mut();
                     let cookie = shared.alloc_handle();
                     drop(shared);
-                    out(memory, args[4], cookie);
+                    out32(memory, args[4], cookie);
                     ok(S_OK)
                 }
                 "Rot_Revoke" | "Rot_NoteChangeTime" => ok(S_OK),
@@ -714,7 +716,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     let mut shared = ctx.shared.borrow_mut();
                     let cookie = shared.alloc_handle();
                     drop(shared);
-                    out(memory, args[4], cookie);
+                    out32(memory, args[4], cookie);
                     ok(S_OK)
                 }
                 "CoRevokeClassObject"

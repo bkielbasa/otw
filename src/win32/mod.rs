@@ -1093,28 +1093,19 @@ impl SystemCalls for ApiContext {
         memory: &mut dyn GuestMemory,
         dll: &str,
         name: &ImportName,
-        args: &[u32],
+        args: &crate::kernel::syscall::Args,
         caller: u32,
     ) -> Option<ApiOutcome> {
         let (dll, name) = self.resolve(dll, name)?;
+        if args.x64() {
+            return x64::call(self, memory, &dll, &name, args, caller);
+        }
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
     }
 
     fn arg_count64(&self, dll: &str, name: &ImportName) -> Option<usize> {
         let (dll, name) = self.resolve(dll, name)?;
         x64::arg_count(self, &dll, &name)
-    }
-
-    fn call64(
-        &self,
-        memory: &mut dyn GuestMemory,
-        dll: &str,
-        name: &ImportName,
-        args: &[u64],
-        caller: u32,
-    ) -> Option<(u64, Option<u32>)> {
-        let (dll, name) = self.resolve(dll, name)?;
-        x64::call(self, memory, &dll, &name, args, caller)
     }
 
     fn describe(&self, dll: &str, name: &ImportName) -> String {
@@ -1130,18 +1121,16 @@ pub fn ptr_size(ctx: &ApiContext) -> u32 {
     if ctx.shared.borrow().x64 { 8 } else { 4 }
 }
 
-/// In a 64-bit process, point the COM interface pointer at `slot` (8
-/// bytes) at a vtable of 8-byte entries for `names`; a 32-bit process keeps
-/// the vtable it has.
-pub fn wide_vtable<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, slot: u32, names: &[&str]) {
-    if !ctx.shared.borrow().x64 {
-        return;
-    }
-    let table = ctx.shared.borrow_mut().heap.alloc(8 * names.len() as u32).unwrap_or(0);
+/// Point the COM interface pointer at `slot` at a new vtable of the
+/// subsystem's `names` methods: pointer-sized slot and entries (8 bytes in
+/// a 64-bit process).
+pub fn set_vtable<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, slot: u32, names: &[&str]) {
+    let size = memory.ptr_size();
+    let table = ctx.shared.borrow_mut().heap.alloc(size * names.len() as u32).unwrap_or(0);
     for (index, name) in names.iter().enumerate() {
-        let _ = memory.write_bytes(table + 8 * index as u32, &(ctx.builtin_proc(name) as u64).to_le_bytes());
+        let _ = memory.write_ptr(table + size * index as u32, u64::from(ctx.builtin_proc(name)));
     }
-    let _ = memory.write_bytes(slot, &(table as u64).to_le_bytes());
+    let _ = memory.write_ptr(slot, u64::from(table));
 }
 
 /// Imports Win32 implements itself even when a genuine DLL is mapped.
@@ -1792,6 +1781,7 @@ mod msvcrt20 {
             "?terminate@@YAXXZ" | "_purecall" => {
                 eprintln!("[crt] {name} called; terminating");
                 ApiOutcome {
+                    wide: None,
                     value: 0,
                     arg_count: 0,
                     exit_code: Some(3),
@@ -1799,6 +1789,7 @@ mod msvcrt20 {
             }
 
             "exit" | "_exit" => ApiOutcome {
+                wide: None,
                 value: 0,
                 arg_count: 0,
                 exit_code: Some(args[0]),
@@ -2249,6 +2240,7 @@ mod kernel32_base {
             "ExitProcess" | "ExitThread" => {
                 registry::flush();
                 ApiOutcome {
+                    wide: None,
                     value: 0,
                     arg_count: count,
                     exit_code: Some(args[0]),

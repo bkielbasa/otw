@@ -625,13 +625,13 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             // RUNDLL32.EXE's program: its command line names the DLL call.
             let line = crate::win32::read_cstr(memory, ctx.command_line_va);
             let code = rundll32(ctx, memory, b"", &line).unwrap_or(1);
-            Some(ApiOutcome { value: 0, arg_count: count, exit_code: Some(code) })
+            Some(ApiOutcome { value: 0, wide: None, arg_count: count, exit_code: Some(code) })
         }
         "ExitThread" => {
             if memory.end_thread(args[0]) {
                 return ok(0);
             }
-            Some(ApiOutcome { value: 0, arg_count: count, exit_code: Some(args[0]) })
+            Some(ApiOutcome { value: 0, wide: None, arg_count: count, exit_code: Some(args[0]) })
         }
         "TerminateThread" => ok(0),
         "CreateProcessA" | "CreateProcessW" => {

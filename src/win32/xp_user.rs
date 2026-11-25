@@ -779,7 +779,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         "SHGetMalloc" => ok(call(ctx, memory, "OLE32.dll", "CoGetMalloc", &[1, args[0]])),
         "SHGetDesktopFolder" => {
             let desktop = crate::win32::shellfolder::desktop(ctx, memory);
-            let _ = memory.write_u32(args[0], desktop);
+            let _ = memory.write_ptr(args[0], u64::from(desktop));
             ok(0)
         }
         "SHGetDataFromIDListW" => ok(0x8000_4001), // E_NOTIMPL

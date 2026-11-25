@@ -131,17 +131,9 @@ pub fn create<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, iid: &[
     let Some(object) = ctx.shared.borrow_mut().heap.alloc(2 * OBJECT_SIZE + vtables) else {
         return E_OUTOFMEMORY;
     };
-    let mut slot = object + 2 * OBJECT_SIZE;
-    for (prefix, offset) in INTERFACES {
-        let _ = memory.write_u32(object + scaled(ctx, offset), slot);
-        for name in SHELL_LINK_METHODS.iter().filter(|name| name.starts_with(prefix)) {
-            let _ = memory.write_u32(slot, ctx.builtin_proc(name));
-            slot += 4;
-        }
-    }
     for (prefix, offset) in INTERFACES {
         let names: Vec<&str> = SHELL_LINK_METHODS.iter().copied().filter(|name| name.starts_with(prefix)).collect();
-        crate::win32::wide_vtable(ctx, memory, object + scaled(ctx, offset), &names);
+        crate::win32::set_vtable(ctx, memory, object + scaled(ctx, offset), &names);
     }
     ctx.shared.borrow_mut().shell_links.insert(object, LinkObject::default());
     let result = query_interface(ctx, memory, object, iid, out);
@@ -158,14 +150,14 @@ fn query_interface<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, ob
         _ if iid == IID_IPERSIST_FILE || iid == IID_IPERSIST => 4,
         _ if iid == IID_ISHELL_LINK_A => 8,
         _ => {
-            let _ = memory.write_u32(out, 0);
+            let _ = memory.write_ptr(out, 0);
             return E_NOINTERFACE;
         }
     };
     if let Some(link) = ctx.shared.borrow_mut().shell_links.get_mut(&object) {
         link.refs += 1;
     }
-    let _ = memory.write_u32(out, object + scaled(ctx, offset));
+    let _ = memory.write_ptr(out, u64::from(object + scaled(ctx, offset)));
     S_OK
 }
 
@@ -246,7 +238,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(if link.target.is_empty() { S_FALSE } else { S_OK })
         }
         "GetIDList" => {
-            let _ = memory.write_u32(args[1], 0);
+            let _ = memory.write_ptr(args[1], 0);
             ok(E_FAIL)
         }
         "SetIDList" | "SetHotkey" | "SetShowCmd" | "SetRelativePath" | "Resolve" => ok(S_OK),

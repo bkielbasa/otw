@@ -238,12 +238,8 @@ pub fn folder<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, path: &
 fn make_object<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, prefix: &str) -> u32 {
     let methods: Vec<&&str> = METHODS.iter().filter(|m| m.starts_with(prefix)).collect();
     let object = ctx.shared.borrow_mut().heap.alloc(4 + methods.len() as u32 * 4).unwrap_or(0);
-    let _ = memory.write_u32(object, object + 4);
-    for (index, name) in methods.iter().enumerate() {
-        let _ = memory.write_u32(object + 4 + index as u32 * 4, ctx.builtin_proc(name));
-    }
     let names: Vec<&str> = methods.iter().map(|m| **m).collect();
-    crate::win32::wide_vtable(ctx, memory, object, &names);
+    crate::win32::set_vtable(ctx, memory, object, &names);
     object
 }
 
@@ -286,7 +282,7 @@ fn bind<M: GuestMemory + ?Sized>(
     iid: u32,
     out: u32,
 ) -> u32 {
-    let _ = memory.write_u32(out, 0);
+    let _ = memory.write_ptr(out, 0);
     let items = read_items(memory, pidl);
     let wanted = read_guid(memory, iid);
     if let Some((ITEM_REGITEM, data)) = items.first().filter(|(_, data)| !is_my_computer(data)) {
@@ -335,7 +331,7 @@ fn bind<M: GuestMemory + ?Sized>(
         return FILE_NOT_FOUND;
     }
     let object = folder(ctx, memory, &path);
-    let _ = memory.write_u32(out, object);
+    let _ = memory.write_ptr(out, u64::from(object));
     S_OK
 }
 
@@ -421,10 +417,10 @@ fn folder_method<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, base
                 if let Some(folder) = ctx.shared.borrow_mut().shell_folders.get_mut(&this) {
                     folder.refs += 1;
                 }
-                let _ = memory.write_u32(args[2], this);
+                let _ = memory.write_ptr(args[2], u64::from(this));
                 S_OK
             } else {
-                let _ = memory.write_u32(args[2], 0);
+                let _ = memory.write_ptr(args[2], 0);
                 E_NOINTERFACE
             }
         }
@@ -455,7 +451,7 @@ fn folder_method<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, base
             if let Some(rest) = text.strip_prefix("file:") {
                 text = rest.trim_start_matches('/').replace('/', "\\").replace('|', ":");
             }
-            let _ = memory.write_u32(args[5], 0);
+            let _ = memory.write_ptr(args[5], 0);
             let full = if base.is_empty() {
                 text.clone()
             } else {
@@ -466,7 +462,7 @@ fn folder_method<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, base
                 return if exists { E_INVALIDARG } else { FILE_NOT_FOUND };
             };
             let pidl = alloc_list(ctx, memory, &list);
-            let _ = memory.write_u32(args[5], pidl);
+            let _ = memory.write_ptr(args[5], u64::from(pidl));
             if args[4] != 0 {
                 let eaten = unicode::read_wstr(memory, args[3]).len() as u32;
                 let _ = memory.write_u32(args[4], eaten);
@@ -494,13 +490,13 @@ fn folder_method<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, base
                 .borrow_mut()
                 .shell_enumerations
                 .insert(object, Enumeration { items, next: 0, refs: 1 });
-            let _ = memory.write_u32(args[3], object);
+            let _ = memory.write_ptr(args[3], u64::from(object));
             S_OK
         }
         "BindToObject" => bind(ctx, memory, base, args[1], args[3], args[4]),
         "BindToStorage" | "CreateViewObject" => {
             let out = if method_name == "BindToStorage" { args[4] } else { args[3] };
-            let _ = memory.write_u32(out, 0);
+            let _ = memory.write_ptr(out, 0);
             E_NOTIMPL
         }
         "CompareIDs" => {
@@ -528,7 +524,7 @@ fn folder_method<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, base
             S_OK
         }
         "GetUIObjectOf" => {
-            let _ = memory.write_u32(args[6], 0);
+            let _ = memory.write_ptr(args[6], 0);
             E_NOTIMPL
         }
         "GetDisplayNameOf" => {
@@ -583,10 +579,10 @@ fn enumeration<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, method
             let iid = read_guid(memory, args[1]);
             if iid == IID_IUNKNOWN || iid == IID_IENUMIDLIST {
                 ctx.shared.borrow_mut().shell_enumerations.get_mut(&this).unwrap().refs += 1;
-                let _ = memory.write_u32(args[2], this);
+                let _ = memory.write_ptr(args[2], u64::from(this));
                 S_OK
             } else {
-                let _ = memory.write_u32(args[2], 0);
+                let _ = memory.write_ptr(args[2], 0);
                 E_NOINTERFACE
             }
         }

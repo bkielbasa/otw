@@ -88,6 +88,60 @@ impl Layout {
     }
 }
 
+/// A structure in guest memory read and written in the layout of the
+/// process it belongs to: field `i` is at its 32-bit or 64-bit offset, and
+/// pointer-sized fields are 4 or 8 bytes.
+pub struct View {
+    va: u32,
+    offsets: Vec<u32>,
+    fields: &'static [F],
+    x64: bool,
+}
+
+impl View {
+    pub fn new<M: GuestMemory + ?Sized>(memory: &M, layout: &Layout, va: u32) -> Self {
+        let x64 = memory.ptr_size() == 8;
+        Self { va, offsets: layout.offsets(x64).0, fields: layout.fields, x64 }
+    }
+
+    /// Field `index` (pointer-sized fields in full).
+    pub fn get<M: GuestMemory + ?Sized>(&self, memory: &mut M, index: usize) -> u64 {
+        let at = self.va + self.offsets[index];
+        match self.fields[index] {
+            F::P if self.x64 => memory.read_u64(at).unwrap_or(0),
+            F::Q => memory.read_u64(at).unwrap_or(0),
+            F::W => memory.read_bytes(at, 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as u64).unwrap_or(0),
+            F::B => memory.read_bytes(at, 1).map(|b| b[0] as u64).unwrap_or(0),
+            _ => memory.read_u32(at).unwrap_or(0) as u64,
+        }
+    }
+
+    /// Field `index` as a 32-bit value: a pointer-sized field's low half.
+    pub fn get32<M: GuestMemory + ?Sized>(&self, memory: &mut M, index: usize) -> u32 {
+        self.get(memory, index) as u32
+    }
+
+    /// Set field `index`; a pointer-sized field is written in full (the
+    /// value widened as a 32-bit result would be).
+    pub fn set<M: GuestMemory + ?Sized>(&self, memory: &mut M, index: usize, value: u32) {
+        let at = self.va + self.offsets[index];
+        match self.fields[index] {
+            F::P if self.x64 => {
+                let _ = memory.write_u64(at, widen(value));
+            }
+            F::W => {
+                let _ = memory.write_bytes(at, &(value as u16).to_le_bytes());
+            }
+            F::B => {
+                let _ = memory.write_bytes(at, &[value as u8]);
+            }
+            _ => {
+                let _ = memory.write_u32(at, value);
+            }
+        }
+    }
+}
+
 /// Copy a structure from one layout to the other.
 fn convert(layout: &Layout, from: &[u8], to_x64: bool) -> Vec<u8> {
     let (source, _) = layout.offsets(!to_x64);
@@ -215,11 +269,6 @@ enum Dir {
 fn struct_args(name: &str) -> &'static [(usize, Layout, Dir)] {
     use Dir::*;
     match name {
-        "GetMessageW" | "GetMessageA" | "PeekMessageW" | "PeekMessageA" => &[(0, MSG, Out)],
-        "TranslateMessage" | "DispatchMessageW" | "DispatchMessageA" | "TranslateMDISysAccel" => &[(0, MSG, In)],
-        "IsDialogMessageW" | "IsDialogMessageA" => &[(1, MSG, In)],
-        "TranslateAcceleratorW" | "TranslateAcceleratorA" => &[(2, MSG, In)],
-        "CallMsgFilterW" | "CallMsgFilterA" => &[(0, MSG, In)],
         "RegisterClassW" | "RegisterClassA" => &[(0, WNDCLASS, In)],
         "RegisterClassExW" | "RegisterClassExA" => &[(0, WNDCLASSEX, In)],
         "GetClassInfoW" | "GetClassInfoA" => &[(2, WNDCLASS, Out)],
@@ -348,13 +397,15 @@ pub fn call(
     memory: &mut dyn GuestMemory,
     dll: &str,
     name: &ImportName,
-    args: &[u64],
+    args: &crate::kernel::syscall::Args,
     caller: u32,
-) -> Option<(u64, Option<u32>)> {
+) -> Option<ApiOutcome> {
+    let count = args.len();
+    let args = args.all_wide();
     let text = by_name(name).map(str::to_owned);
     if let Some(text) = text.as_deref() {
         if let Some(value) = x64_function(ctx, memory, text, args) {
-            return Some((value, None));
+            return Some(ApiOutcome::wide(value, count));
         }
     }
     let text = text.as_deref().map(alias);
@@ -410,17 +461,9 @@ pub fn call(
     if trace() {
         eprintln!("[x64] {dll}!{} {:x?} -> {:x?}", name.display(), args, narrow_args);
     }
-    let outcome: Option<ApiOutcome> =
-        crate::kernel::syscall::SystemCalls::call(ctx, memory, dll, &name, &narrow_args, caller);
+    let outcome: Option<ApiOutcome> = crate::win32::dispatch_with_memory(ctx, memory, dll, &name, &narrow_args, caller);
     if let Some((msg, original, copy)) = message_copy {
         message_back_to64(ctx, memory, msg, original, copy);
-    }
-    for &index in text.map(pointer_outs).unwrap_or(&[]) {
-        if let Some(&out) = narrow_args.get(index) {
-            if out != 0 {
-                let _ = memory.write_u32(out + 4, 0);
-            }
-        }
     }
     for (_, layout, dir, original, copy) in copies {
         if dir != Dir::In {
@@ -429,32 +472,8 @@ pub fn call(
         free(ctx, copy);
     }
     let outcome = outcome?;
-    Some((widen(outcome.value), outcome.exit_code))
-}
-
-/// Arguments pointing to a pointer-sized result (a handle or an interface
-/// pointer) that the subsystem writes as 32 bits: the upper half is
-/// cleared after the call.
-fn pointer_outs(name: &str) -> &'static [usize] {
-    if name.ends_with("_QueryInterface") {
-        return &[2];
-    }
-    match name {
-        "CoCreateInstance" | "CoGetClassObject" | "SHGetFolderLocation" | "RegOpenKeyExW" | "RegOpenKeyExA" => &[4],
-        "RegCreateKeyExW" | "RegCreateKeyExA" => &[7],
-        "RegOpenKeyW" | "RegOpenKeyA" | "RegCreateKeyW" | "RegCreateKeyA" | "GetModuleHandleExW"
-        | "GetModuleHandleExA" | "SHGetSpecialFolderLocation" | "RegConnectRegistryW" => &[2],
-        "SHGetMalloc" | "SHGetDesktopFolder" | "OleGetClipboard" => &[0],
-        "SHGetKnownFolderPath" | "SHCreateItemFromParsingName" => &[3],
-        "CoGetMalloc" | "CreateBindCtx" | "StringFromCLSID" | "StringFromIID" | "ProgIDFromCLSID"
-        | "GetRunningObjectTable" => &[1],
-        "ShellFolder_BindToObject" | "ShellFolder_BindToStorage" => &[4],
-        "ShellFolder_EnumObjects" | "ShellFolder_CreateViewObject" => &[3],
-        "ShellFolder_ParseDisplayName" => &[5],
-        "ShellFolder_GetUIObjectOf" => &[6],
-        "ShellLinkW_GetIDList" | "ShellLinkA_GetIDList" => &[1],
-        _ => &[],
-    }
+    let value = outcome.wide.unwrap_or_else(|| widen(outcome.value));
+    Some(ApiOutcome { value: value as u32, wide: Some(value), arg_count: count, exit_code: outcome.exit_code })
 }
 
 /// Where the message and lParam are among a messaging function's arguments.
@@ -513,7 +532,7 @@ fn message_back_to64(ctx: &ApiContext, memory: &mut dyn GuestMemory, msg: u32, o
 /// Functions with a 64-bit form of their own.
 fn x64_function(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, args: &[u64]) -> Option<u64> {
     let call = |memory: &mut dyn GuestMemory, function: &str, narrow: &[u32]| {
-        crate::kernel::syscall::SystemCalls::call(ctx, memory, "KERNEL32.dll", &ImportName::ByName(function.into()), narrow, 0)
+        crate::win32::dispatch_with_memory(ctx, memory, "KERNEL32.dll", &ImportName::ByName(function.into()), narrow, 0)
             .map(|o| widen(o.value))
             .unwrap_or(0)
     };

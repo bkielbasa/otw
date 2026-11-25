@@ -277,6 +277,7 @@ pub fn throw<M: GuestMemory + ?Sized>(
             None => {
                 eprintln!("[eh] rethrow with no active exception; terminating");
                 return ApiOutcome {
+                    wide: None,
                     value: 0,
                     arg_count: 2,
                     exit_code: Some(3),

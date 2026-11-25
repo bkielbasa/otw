@@ -95,6 +95,7 @@ pub fn raise<M: GuestMemory + ?Sized>(
     let Some(dispatcher) = memory.exception_dispatcher() else {
         eprintln!("[eh] exception {code:#010x} with no dispatcher; terminating");
         return ApiOutcome {
+            wide: None,
             value: 0,
             arg_count,
             exit_code: Some(code),
@@ -178,6 +179,7 @@ pub fn dispatcher<M: GuestMemory + ?Sized>(
         outcome = Dispatch::Unhandled;
     }
     let terminate = |code: u32| ApiOutcome {
+        wide: None,
         value: 0,
         arg_count: 2,
         exit_code: Some(code),

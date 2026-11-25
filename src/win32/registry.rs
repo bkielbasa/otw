@@ -688,14 +688,14 @@ fn call<M: GuestMemory + ?Sized>(memory: &mut M, name: &str, wide: bool, args: &
             });
             match result {
                 Some((handle, existed)) => {
-                    let _ = memory.write_u32(out, handle);
+                    let _ = memory.write_ptr(out, u64::from(handle));
                     if name == "RegCreateKeyEx" && args[8] != 0 {
                         let _ = memory.write_u32(args[8], if existed { 2 } else { 1 });
                     }
                     SUCCESS
                 }
                 None => {
-                    let _ = memory.write_u32(out, 0);
+                    let _ = memory.write_ptr(out, 0);
                     NOT_FOUND
                 }
             }

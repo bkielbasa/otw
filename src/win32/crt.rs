@@ -954,6 +954,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "?set_terminate@@YAP6AXXZP6AXXZ@Z" | "?_set_new_handler@@YAP6AHI@ZP6AHI@Z@Z" => cdecl(0),
         "abort" => Some(ApiOutcome {
+            wide: None,
             value: 0,
             arg_count: 0,
             exit_code: Some(3),
@@ -963,6 +964,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             cdecl(0)
         }
         "_endthreadex" => Some(ApiOutcome {
+            wide: None,
             value: 0,
             arg_count: 0,
             exit_code: Some(0),

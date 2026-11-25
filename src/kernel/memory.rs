@@ -30,10 +30,52 @@ pub trait GuestMemory {
         Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    fn read_u64(&mut self, va: u32) -> Option<u64> {
+        let bytes = self.read_bytes(va, 8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn write_u64(&mut self, va: u32, value: u64) -> Option<()> {
+        self.write_bytes(va, &value.to_le_bytes())
+    }
+
+    /// The size of a pointer (and of handles and `*_PTR` values) in the
+    /// process: 8 in a 64-bit one.
+    fn ptr_size(&self) -> u32 {
+        4
+    }
+
+    /// Read a pointer-sized value.
+    fn read_ptr(&mut self, va: u32) -> Option<u64> {
+        if self.ptr_size() == 8 {
+            self.read_u64(va)
+        } else {
+            self.read_u32(va).map(u64::from)
+        }
+    }
+
+    /// Write a pointer-sized value (a handle, an address, an interface
+    /// pointer): all of it, so a 64-bit program's variable holds no stale
+    /// upper half.
+    fn write_ptr(&mut self, va: u32, value: u64) -> Option<()> {
+        if self.ptr_size() == 8 {
+            self.write_u64(va, value)
+        } else {
+            self.write_u32(va, value as u32)
+        }
+    }
+
     /// Call guest code `func` as `stdcall(args...)` and return its EAX. Only
     /// a running CPU backend can do this; other views return `None`.
     fn call_guest(&mut self, func: u32, args: &[u32]) -> Option<u32> {
         self.call_guest_ex(func, args, None, None)
+    }
+
+    /// Call guest code with full 64-bit arguments, returning all of RAX (EAX
+    /// in a 32-bit process).
+    fn call_guest_wide(&mut self, func: u32, args: &[u64]) -> Option<u64> {
+        let narrow: Vec<u32> = args.iter().map(|&value| value as u32).collect();
+        self.call_guest(func, &narrow).map(u64::from)
     }
 
     /// Like [`GuestMemory::call_guest`], optionally setting EBP (exception
@@ -168,6 +210,10 @@ pub struct Resume {
 pub struct ApiOutcome {
     /// Value returned to the guest in EAX.
     pub value: u32,
+    /// The full 64-bit result (RAX) when the function produced one; a
+    /// 64-bit caller otherwise gets `value` widened (see
+    /// [`crate::kernel::syscall::widen`]).
+    pub wide: Option<u64>,
     /// Number of `stdcall` bytes-worth of arguments the backend must pop.
     pub arg_count: usize,
     /// Set when the guest asked the VM to terminate.
@@ -178,9 +224,25 @@ impl ApiOutcome {
     pub const fn new(value: u32, arg_count: usize) -> Self {
         Self {
             value,
+            wide: None,
             arg_count,
             exit_code: None,
         }
+    }
+
+    /// A result with all 64 bits given (for a 32-bit caller, the low half).
+    pub const fn wide(value: u64, arg_count: usize) -> Self {
+        Self {
+            value: value as u32,
+            wide: Some(value),
+            arg_count,
+            exit_code: None,
+        }
+    }
+
+    /// A signed result: -1 is all ones in RAX too.
+    pub const fn signed(value: i32, arg_count: usize) -> Self {
+        Self::wide(value as i64 as u64, arg_count)
     }
 
     /// Result of a `cdecl` call: arguments are popped by the guest caller.

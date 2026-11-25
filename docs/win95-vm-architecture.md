@@ -155,6 +155,19 @@ The browser itself is IE's genuine code: SHDOCVW and BROWSEUI build the frame, U
 - OLE32 serves the component categories manager (`src/win32/catmgr.rs`) that ActiveX controls register with; DCOM95's COMCAT.DLL forwards to it.
 - A restart runs `RunOnce` again while IE's `RunOnceEx` list is unfinished: its processor stops for another restart when a DLL it registered must replace one in use.
 
+### 64-bit programs
+
+PE32+ images (`kernel::pe`) are loaded below 4 GiB, relocated with their DIR64 fixups when linked above it, and run in a 64-bit CPU (`kernel::cpu`): the TEB is reached through the GS base, imports use the x64 convention (RCX, RDX, R8, R9, then the stack above the home area; the caller cleans up), and the subsystem calls back into 64-bit code the same way (window procedures, hooks, thread start routines).
+
+The subsystem is moving from 32-bit-only towards being bitness-aware:
+
+- Calls carry their arguments as `kernel::syscall::Args`, 64 bits per argument from 64-bit code (dereferencing to the 32-bit values the existing functions take), and results as `ApiOutcome` with an exact 64-bit `wide` value when a function produces one.
+- `GuestMemory::ptr_size`, `read_ptr` and `write_ptr` read and write pointer-sized values (handles, interface pointers, `*_PTR`) at the process's width; COM objects built by the subsystem get vtables of pointer-sized entries (`win32::set_vtable`); `call_guest_wide` passes and returns full 64-bit values.
+- `win32::x64::View` reads and writes a structure in the process's own layout (MSG is handled this way).
+- What is not converted yet is translated at the boundary by `win32::x64`: structures by pointer are copied to and from 32-bit layouts, as are structures in window messages, and 64-bit values passed by value (`SetFilePointerEx`'s distance, a POINT) are split into the halves the 32-bit signatures take. A result without a `wide` value is widened, sign-extending small negative values (error codes such as -1).
+
+Not yet: addresses above 4 GiB (guest addresses are 32-bit), 64-bit exception handling (table-based unwinding; a fault stops the program), 64-bit DLLs that cannot be relocated below 4 GiB.
+
 ### Read-only FAT32 Explorer
 
 `src/fat32.rs` reads a raw FAT32 image as an owned byte vector. Boot-sector checks cover the `0x55aa` signature, bytes/sector and sectors/cluster, reserved and FAT regions, root cluster bounds, and declared volume length. Directory reading validates LFN checksums, filters volume labels and deleted entries, decodes OEM short names, and follows cluster chains while rejecting loops or out-of-range clusters. The API surface is deliberately small: `list(path)` and `read_file(path)` (plus `read_file_entry` for rows already in hand). There is no write path, host mount, or guest `CreateFileA`/`ReadFile` integration yet.

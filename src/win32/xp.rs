@@ -72,7 +72,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         }
         "TerminateProcess" => {
             if args[0] == u32::MAX {
-                Some(ApiOutcome { value: 1, arg_count: count, exit_code: Some(args[1]) })
+                Some(ApiOutcome { wide: None, value: 1, arg_count: count, exit_code: Some(args[1]) })
             } else {
                 ok(0)
             }

@@ -890,7 +890,7 @@ fn native<M: GuestMemory + ?Sized>(
                 let module = ansi_arg(ctx, memory, &mut temps, args[1]);
                 call_a(ctx, memory, dll, "GetModuleHandleA", &[module], caller)
             };
-            let _ = memory.write_u32(args[2], module);
+            let _ = memory.write_ptr(args[2], u64::from(module));
             u32::from(module != 0)
         }
         // ── USER32 ──
@@ -1226,11 +1226,11 @@ fn native<M: GuestMemory + ?Sized>(
             }) {
                 Some(list) => {
                     let pidl = crate::win32::shellfolder::alloc_list(ctx, memory, &list);
-                    let _ = memory.write_u32(args[2], pidl);
+                    let _ = memory.write_ptr(args[2], u64::from(pidl));
                     0
                 }
                 None => {
-                    let _ = memory.write_u32(args[2], 0);
+                    let _ = memory.write_ptr(args[2], 0);
                     0x8000_4005 // E_FAIL
                 }
             }

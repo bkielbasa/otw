@@ -5628,6 +5628,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                         // once it has been idle a few times over.
                         if message.message == WM_QUIT && ctx.shared.borrow().gui.idle_exits >= 3 {
                             return Some(ApiOutcome {
+                                wide: None,
                                 value: 0,
                                 arg_count: count,
                                 exit_code: Some(0),
@@ -6372,30 +6373,21 @@ pub fn write_message<M: GuestMemory + ?Sized>(
         shared.gui.message_time = time;
         (time, shared.gui.cursor)
     };
-    let values = [
-        message.hwnd,
-        message.message,
-        message.wparam,
-        message.lparam,
-        time,
-        x as u32,
-        y as u32,
-    ];
-    let mut bytes = Vec::with_capacity(28);
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
+    // MSG in the process's layout (pointer-sized hwnd, wParam, lParam).
+    let view = crate::win32::x64::View::new(memory, &crate::win32::x64::MSG, va);
+    let values = [message.hwnd, message.message, message.wparam, message.lparam, time, x as u32, y as u32];
+    for (index, value) in values.into_iter().enumerate() {
+        view.set(memory, index, value);
     }
-    let _ = memory.write_bytes(va, &bytes);
 }
 
 pub fn read_message<M: GuestMemory + ?Sized>(memory: &mut M, va: u32) -> GuestMessage {
-    let bytes = memory.read_bytes(va, 16).unwrap_or_else(|| vec![0; 16]);
-    let v = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    let view = crate::win32::x64::View::new(memory, &crate::win32::x64::MSG, va);
     GuestMessage {
-        hwnd: v(0),
-        message: v(4),
-        wparam: v(8),
-        lparam: v(12),
+        hwnd: view.get32(memory, 0),
+        message: view.get32(memory, 1),
+        wparam: view.get32(memory, 2),
+        lparam: view.get32(memory, 3),
     }
 }
 

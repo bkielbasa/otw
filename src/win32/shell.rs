@@ -444,7 +444,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         "Shell_GetImageLists" => {
             for out in [args[0], args[1]] {
                 if out != 0 {
-                    let _ = memory.write_u32(out, 0);
+                    let _ = memory.write_ptr(out, 0);
                 }
             }
             0

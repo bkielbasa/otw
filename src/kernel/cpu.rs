@@ -444,6 +444,94 @@ const SAVED_REGISTERS_64: [Reg; 18] = [
 const MAX_CALLBACK_DEPTH: usize = 48;
 
 impl UnicornGuestMemory<'_, '_, '_, '_> {
+    /// Run guest code synchronously: arguments as the process's calling
+    /// convention passes them, a sentinel return address, every register
+    /// restored afterwards. Returns RAX (EAX in a 32-bit process).
+    fn call_guest_full(&mut self, func: u32, args: &[u64], ebp: Option<u32>, ecx: Option<u32>) -> Option<u64> {
+        let run = self.run?;
+
+        if func == 0 {
+            return None;
+        }
+        {
+            let state = run.borrow();
+            if state.exit_code.is_some()
+                || state.error.is_some()
+                || state.resume.is_some()
+                || state.callback_depth >= MAX_CALLBACK_DEPTH
+            {
+                return None;
+            }
+        }
+        let x64 = run.borrow().x64;
+        let registers: &[Reg] = if x64 { &SAVED_REGISTERS_64 } else { &SAVED_REGISTERS };
+        let mut saved = vec![0u64; registers.len()];
+        for (slot, register) in registers.iter().enumerate() {
+            saved[slot] = self.uc.reg_read(*register).ok()?;
+        }
+        let esp = saved[7] as u32;
+        if x64 {
+            // The x64 convention: RCX, RDX, R8, R9, then the stack above a
+            // 32-byte home area; RSP is 8 off 16-byte alignment at entry.
+            let slots = args.len().max(4) as u32;
+            let frame = ((esp.wrapping_sub(0x80 + 8 * (slots + 1))) & !0xF).wrapping_sub(8);
+            let mut bytes = vec![0u8; 8 * (slots as usize + 1)];
+            bytes[..8].copy_from_slice(&(SENTINEL_BASE as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate().skip(4) {
+                bytes[8 + index * 8..16 + index * 8].copy_from_slice(&arg.to_le_bytes());
+            }
+            self.uc.mem_write(frame as u64, &bytes).ok()?;
+            self.uc.reg_write(Reg::RSP, frame as u64).ok()?;
+            for (register, arg) in [Reg::RCX, Reg::RDX, Reg::R8, Reg::R9].iter().zip(args) {
+                self.uc.reg_write(*register, *arg).ok()?;
+            }
+        } else {
+            // Leave a gap so the interrupted frame's locals are never touched.
+            let frame = (esp.wrapping_sub(0x80 + 4 * (args.len() as u32 + 1))) & !0xF;
+            let mut bytes = Vec::with_capacity(4 * (args.len() + 1));
+            bytes.extend_from_slice(&SENTINEL_BASE.to_le_bytes());
+            for arg in args {
+                bytes.extend_from_slice(&(*arg as u32).to_le_bytes());
+            }
+            self.uc.mem_write(frame as u64, &bytes).ok()?;
+            self.uc.reg_write(Reg::ESP, frame as u64).ok()?;
+        }
+        if let Some(ebp) = ebp {
+            self.uc.reg_write(Reg::EBP, ebp as u64).ok()?;
+        }
+        if let Some(ecx) = ecx {
+            self.uc.reg_write(Reg::ECX, ecx as u64).ok()?;
+        }
+        {
+            let mut state = run.borrow_mut();
+            state.callback_depth += 1;
+            state.levels.push(esp);
+        }
+        let result = emulate(self.uc, run, func, SENTINEL_BASE, 0, 0);
+        {
+            let mut state = run.borrow_mut();
+            state.callback_depth -= 1;
+            state.levels.pop();
+        }
+        let eax = if x64 { self.uc.reg_read(Reg::RAX).unwrap_or(0) } else { self.uc.reg_read(Reg::EAX).unwrap_or(0) & 0xFFFF_FFFF };
+        for (slot, register) in registers.iter().enumerate() {
+            let _ = self.uc.reg_write(*register, saved[slot]);
+        }
+        if let Err(error) = result {
+            let mut state = run.borrow_mut();
+            if state.error.is_none() && state.exit_code.is_none() {
+                state.error = Some(format!("guest callback {func:#010x} failed: {error:?}"));
+            }
+            return None;
+        }
+        let state = run.borrow();
+        if state.exit_code.is_some() || state.error.is_some() || state.resume.is_some() {
+            // A pending resume belongs to an outer level: unwind out.
+            return None;
+        }
+        Some(eax)
+    }
+
     /// A thread of a 64-bit process: its TEB through the GS base, the
     /// parameter in RCX, returning to the thread-end thunk.
     fn create_thread64(&mut self, entry: u32, param: u32, stack: u32, top: u32, teb: u32) -> Option<u32> {
@@ -502,88 +590,14 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         ebp: Option<u32>,
         ecx: Option<u32>,
     ) -> Option<u32> {
-        let run = self.run?;
-        if func == 0 {
-            return None;
-        }
-        {
-            let state = run.borrow();
-            if state.exit_code.is_some()
-                || state.error.is_some()
-                || state.resume.is_some()
-                || state.callback_depth >= MAX_CALLBACK_DEPTH
-            {
-                return None;
-            }
-        }
-        let x64 = run.borrow().x64;
-        let registers: &[Reg] = if x64 { &SAVED_REGISTERS_64 } else { &SAVED_REGISTERS };
-        let mut saved = vec![0u64; registers.len()];
-        for (slot, register) in registers.iter().enumerate() {
-            saved[slot] = self.uc.reg_read(*register).ok()?;
-        }
-        let esp = saved[7] as u32;
-        if x64 {
-            // The x64 convention: RCX, RDX, R8, R9, then the stack above a
-            // 32-byte home area; RSP is 8 off 16-byte alignment at entry.
-            let slots = args.len().max(4) as u32;
-            let frame = ((esp.wrapping_sub(0x80 + 8 * (slots + 1))) & !0xF).wrapping_sub(8);
-            let mut bytes = vec![0u8; 8 * (slots as usize + 1)];
-            bytes[..8].copy_from_slice(&(SENTINEL_BASE as u64).to_le_bytes());
-            for (index, arg) in args.iter().enumerate().skip(4) {
-                bytes[8 + index * 8..16 + index * 8].copy_from_slice(&(*arg as u64).to_le_bytes());
-            }
-            self.uc.mem_write(frame as u64, &bytes).ok()?;
-            self.uc.reg_write(Reg::RSP, frame as u64).ok()?;
-            for (register, arg) in [Reg::RCX, Reg::RDX, Reg::R8, Reg::R9].iter().zip(args) {
-                self.uc.reg_write(*register, *arg as u64).ok()?;
-            }
-        } else {
-            // Leave a gap so the interrupted frame's locals are never touched.
-            let frame = (esp.wrapping_sub(0x80 + 4 * (args.len() as u32 + 1))) & !0xF;
-            let mut bytes = Vec::with_capacity(4 * (args.len() + 1));
-            bytes.extend_from_slice(&SENTINEL_BASE.to_le_bytes());
-            for arg in args {
-                bytes.extend_from_slice(&arg.to_le_bytes());
-            }
-            self.uc.mem_write(frame as u64, &bytes).ok()?;
-            self.uc.reg_write(Reg::ESP, frame as u64).ok()?;
-        }
-        if let Some(ebp) = ebp {
-            self.uc.reg_write(Reg::EBP, ebp as u64).ok()?;
-        }
-        if let Some(ecx) = ecx {
-            self.uc.reg_write(Reg::ECX, ecx as u64).ok()?;
-        }
-        {
-            let mut state = run.borrow_mut();
-            state.callback_depth += 1;
-            state.levels.push(esp);
-        }
-        let result = emulate(self.uc, run, func, SENTINEL_BASE, 0, 0);
-        {
-            let mut state = run.borrow_mut();
-            state.callback_depth -= 1;
-            state.levels.pop();
-        }
-        let eax = self.uc.reg_read(Reg::EAX).unwrap_or(0) as u32;
-        for (slot, register) in registers.iter().enumerate() {
-            let _ = self.uc.reg_write(*register, saved[slot]);
-        }
-        if let Err(error) = result {
-            let mut state = run.borrow_mut();
-            if state.error.is_none() && state.exit_code.is_none() {
-                state.error = Some(format!("guest callback {func:#010x} failed: {error:?}"));
-            }
-            return None;
-        }
-        let state = run.borrow();
-        if state.exit_code.is_some() || state.error.is_some() || state.resume.is_some() {
-            // A pending resume belongs to an outer level: unwind out.
-            return None;
-        }
-        Some(eax)
+        let wide: Vec<u64> = args.iter().map(|&value| value as u64).collect();
+        self.call_guest_full(func, &wide, ebp, ecx).map(|value| value as u32)
     }
+
+    fn call_guest_wide(&mut self, func: u32, args: &[u64]) -> Option<u64> {
+        self.call_guest_full(func, args, None, None)
+    }
+
 
     fn map_region(&mut self, preferred: u32, size: u32) -> Option<u32> {
         const GRANULE: u64 = 0x1_0000;
@@ -682,6 +696,10 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         self.run
             .and_then(|run| run.borrow().running.last().copied())
             .unwrap_or(1)
+    }
+
+    fn ptr_size(&self) -> u32 {
+        if self.run.is_some_and(|run| run.borrow().x64) { 8 } else { 4 }
     }
 
     fn current_tib(&self) -> u32 {
@@ -1554,7 +1572,6 @@ fn build<'a>(
                 );
             }
 
-            let mut wide_result = 0u64;
             let outcome = {
                 let mut memory = UnicornGuestMemory {
                     uc,
@@ -1563,15 +1580,9 @@ fn build<'a>(
                 if kernel_entry {
                     // The exception dispatcher: (record, context) on the stack.
                     Some(super::eh::dispatcher(&mut memory, args[0], args[1]))
-                } else if x64 {
-                    thunk_calls
-                        .call64(&mut memory, &entry.dll, &entry.name, &wide_args, return_address)
-                        .map(|(value, exit_code)| {
-                            wide_result = value;
-                            super::memory::ApiOutcome { value: value as u32, arg_count, exit_code }
-                        })
                 } else {
-                    thunk_calls.call(&mut memory, &entry.dll, &entry.name, &args, return_address)
+                    let call_args = super::syscall::Args::new(wide_args.clone(), x64);
+                    thunk_calls.call(&mut memory, &entry.dll, &entry.name, &call_args, return_address)
                 }
             };
             // A nested guest callback may have exited the process or faulted.
@@ -1690,7 +1701,7 @@ fn build<'a>(
 
             // stdcall pops the arguments; in x64 the caller does.
             let register_writes = if x64 {
-                let value = if kernel_entry { outcome.value as u64 } else { wide_result };
+                let value = outcome.wide.unwrap_or_else(|| super::syscall::widen(outcome.value));
                 let return_address = {
                     let mut bytes = [0u8; 8];
                     let _ = uc.mem_read(esp as u64, &mut bytes);

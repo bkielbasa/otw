@@ -98,7 +98,7 @@ pub fn get_class_object<M: GuestMemory + ?Sized>(
     iid: u32,
     out: u32,
 ) -> u32 {
-    let _ = memory.write_u32(out, 0);
+    let _ = memory.write_ptr(out, 0);
     let registered = ctx
         .shared
         .borrow()
@@ -154,7 +154,7 @@ pub fn create_instance<M: GuestMemory + ?Sized>(
     iid: u32,
     out: u32,
 ) -> u32 {
-    let _ = memory.write_u32(out, 0);
+    let _ = memory.write_ptr(out, 0);
     let factory_iid = temp_guid(ctx, memory, &IID_ICLASSFACTORY);
     let slot = ctx.shared.borrow_mut().heap.alloc(4).unwrap_or(0);
     let status = get_class_object(ctx, memory, clsid, factory_iid, slot);
@@ -273,7 +273,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "CreateBindCtx" => {
             let object = crate::win32::bindctx::create(ctx, memory);
-            let _ = memory.write_u32(args[1], object);
+            let _ = memory.write_ptr(args[1], u64::from(object));
             S_OK
         }
         "StringFromCLSID" | "StringFromIID" => {
@@ -283,7 +283,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             let wide: Vec<u8> = text.bytes().flat_map(|b| [b, 0]).chain([0, 0]).collect();
             let block = ctx.shared.borrow_mut().heap.alloc(wide.len() as u32).unwrap_or(0);
             let _ = memory.write_bytes(block, &wide);
-            let _ = memory.write_u32(args[1], block);
+            let _ = memory.write_ptr(args[1], u64::from(block));
             S_OK
         }
         "CoTaskMemRealloc" => {
@@ -368,7 +368,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     let wide: Vec<u8> = text.iter().flat_map(|&b| [b, 0]).chain([0, 0]).collect();
                     let block = ctx.shared.borrow_mut().heap.alloc(wide.len() as u32).unwrap_or(0);
                     let _ = memory.write_bytes(block, &wide);
-                    let _ = memory.write_u32(args[1], block);
+                    let _ = memory.write_ptr(args[1], u64::from(block));
                     S_OK
                 }
                 None => REGDB_E_CLASSNOTREG,
