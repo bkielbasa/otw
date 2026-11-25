@@ -259,11 +259,7 @@ pub(crate) fn x64_only(name: &str) -> Option<usize> {
     Some(match name {
         "InitializeCriticalSectionEx" => 3,
         "VerSetConditionMask" => 3,
-        "RtlCaptureContext" => 1,
-        "RtlLookupFunctionEntry" => 3,
         "RtlPcToFileHeader" => 2,
-        "RtlVirtualUnwind" => 8,
-        "RtlUnwindEx" => 6,
         _ => return None,
     })
 }
@@ -276,6 +272,9 @@ fn by_name(name: &ImportName) -> Option<&str> {
 pub fn arg_count(ctx: &ApiContext, dll: &str, name: &ImportName) -> Option<usize> {
     if crate::win32::is_ucrt(crate::win32::api_set_host(dll).unwrap_or(dll)) {
         return crate::win32::ucrt::arg_count(by_name(name)?);
+    }
+    if let Some(count) = by_name(name).and_then(crate::win32::seh64::arg_count) {
+        return Some(count);
     }
     if let Some(count) = by_name(name).and_then(crate::win32::nt::arg_count) {
         return Some(count);
@@ -308,6 +307,9 @@ pub fn call(
     let args = args.all_wide();
     if crate::win32::is_ucrt(crate::win32::api_set_host(dll).unwrap_or(dll)) {
         return crate::win32::ucrt::call(ctx, memory, by_name(name)?, args);
+    }
+    if let Some(outcome) = by_name(name).and_then(|text| crate::win32::seh64::call(ctx, memory, text, args)) {
+        return Some(outcome);
     }
     if let Some(outcome) = by_name(name).and_then(|text| crate::win32::nt::call(ctx, memory, text, args)) {
         return Some(outcome);
@@ -360,24 +362,11 @@ fn x64_function(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, args
             }
             mask
         }
-        // Exception unwinding information: none yet.
-        "RtlCaptureContext" => {
-            let _ = memory.write_bytes(args[0] as u32, &[0u8; 0x4D0]);
-            0
-        }
-        "RtlLookupFunctionEntry" => {
-            if args[1] != 0 {
-                let base = module_base(ctx, args[0] as u32);
-                let _ = memory.write_bytes(args[1] as u32, &(base as u64).to_le_bytes());
-            }
-            0
-        }
         "RtlPcToFileHeader" => {
             let base = module_base(ctx, args[0] as u32);
             let _ = memory.write_bytes(args[1] as u32, &(base as u64).to_le_bytes());
             base as u64
         }
-        "RtlVirtualUnwind" | "RtlUnwindEx" => 0,
         _ => return None,
     })
 }

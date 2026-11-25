@@ -4393,19 +4393,8 @@ pub fn resource_string<M: GuestMemory + ?Sized>(
             if units == 0 {
                 return None;
             }
-            return Some(
-                bytes[offset..end]
-                    .chunks_exact(2)
-                    .map(|c| {
-                        let unit = u16::from_le_bytes([c[0], c[1]]);
-                        if unit <= 0xFF {
-                            unit as u8
-                        } else {
-                            b'?'
-                        }
-                    })
-                    .collect(),
-            );
+            let units: Vec<u16> = bytes[offset..end].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            return Some(crate::win32::unicode::wide_to_ansi(&units));
         }
         offset = end;
     }

@@ -176,6 +176,23 @@ pub trait GuestMemory {
     /// the current API call, unwinding nested callbacks as needed.
     fn request_resume(&mut self, _resume: Resume) {}
 
+    /// Resume with every register of a 64-bit thread set.
+    fn request_resume_full(&mut self, _registers: FullRegisters) {}
+
+    /// Set the running thread's general and XMM registers (not RIP).
+    fn set_full_registers(&mut self, _registers: &FullRegisters) {}
+
+    /// The running thread's registers (64-bit processes).
+    fn full_registers(&mut self) -> Option<FullRegisters> {
+        None
+    }
+
+    /// The stack pointers at which the subsystem called into guest code
+    /// (outermost first): where each callback's caller continues.
+    fn callback_levels(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
     fn resume_pending(&self) -> bool {
         false
     }
@@ -224,6 +241,17 @@ pub struct Registers {
     pub edi: u32,
     pub ebp: u32,
     pub esp: u32,
+}
+
+/// Every register of a 64-bit thread that exception handling saves and
+/// restores (CONTEXT order: RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FullRegisters {
+    pub gpr: [u64; 16],
+    pub rip: u64,
+    pub eflags: u64,
+    pub mxcsr: u32,
+    pub xmm: [[u8; 16]; 16],
 }
 
 /// A non-local transfer of control requested by exception handling.

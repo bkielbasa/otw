@@ -78,7 +78,7 @@ pub fn load_menu_template<M: GuestMemory + ?Sized>(
 }
 
 fn read_wide<M: GuestMemory + ?Sized>(memory: &mut M, cursor: &mut u32) -> Vec<u8> {
-    let mut text = Vec::new();
+    let mut text: Vec<u16> = Vec::new();
     for _ in 0..512 {
         let unit = memory
             .read_bytes(*cursor, 2)
@@ -88,9 +88,9 @@ fn read_wide<M: GuestMemory + ?Sized>(memory: &mut M, cursor: &mut u32) -> Vec<u
         if unit == 0 {
             break;
         }
-        text.push(if unit <= 0xFF { unit as u8 } else { b'?' });
+        text.push(unit);
     }
-    text
+    crate::win32::unicode::wide_to_ansi(&text)
 }
 
 /// MENUEX items: { type, state, ID (DWORDs), flags (WORD), text (UTF-16,

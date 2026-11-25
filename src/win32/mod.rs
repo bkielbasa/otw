@@ -8,6 +8,7 @@
 
 pub mod advpack;
 pub mod bindctx;
+pub mod seh64;
 pub mod env;
 pub mod vmem;
 pub mod nt;
@@ -712,6 +713,7 @@ pub struct SharedState {
     pub crt_tables: crate::win32::crt::CrtTables,
     pub ucrt: ucrt::State,
     pub nt: nt::State,
+    pub seh: seh64::State,
     pub vmem: vmem::State,
     pub env: env::State,
     /// A floating-point result the CPU backend must load into ST(0).
@@ -803,6 +805,7 @@ impl Default for SharedState {
             crt_tables: crate::win32::crt::CrtTables::default(),
             ucrt: ucrt::State::default(),
             nt: nt::State::default(),
+            seh: seh64::State::default(),
             vmem: vmem::State::default(),
             env: env::State::default(),
             fpu_result: None,
@@ -2409,7 +2412,13 @@ mod kernel32_base {
                 if (args[3] as i32) < 0 {
                     source.push(0);
                 }
-                let needed = source.len() as u32;
+                // UTF-8 (CP_UTF8) or the ANSI code page.
+                let units: Vec<u16> = if args[0] == 65001 {
+                    String::from_utf8_lossy(&source).encode_utf16().collect()
+                } else {
+                    crate::win32::unicode::ansi_to_wide(&source)
+                };
+                let needed = units.len() as u32;
                 let capacity = args[5];
                 let destination = args[4];
                 if capacity == 0 {
@@ -2418,7 +2427,7 @@ mod kernel32_base {
                     ctx.shared.borrow_mut().last_error = 122; // ERROR_INSUFFICIENT_BUFFER
                     ApiOutcome::new(0, count)
                 } else {
-                    let wide: Vec<u8> = source.iter().flat_map(|&b| [b, 0]).collect();
+                    let wide: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
                     let _ = memory.write_bytes(destination, &wide);
                     ApiOutcome::new(needed, count)
                 }

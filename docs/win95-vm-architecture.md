@@ -175,7 +175,10 @@ A 64-bit program is told it runs on Windows 10 (10.0.19045) and gets what such p
 - A process environment (`win32::env`) with the usual variables; host variables `OTW_ENV_<NAME>` add `<NAME>` (for example settings a program reads from its environment).
 - Delay-loaded imports a module declares get thunks from `GetProcAddress` even when unimplemented, so a missing function stops the program by name when it is called rather than when it is resolved. `OTW_STUB_MISSING=1` lets unimplemented 64-bit functions return 0 instead, for exploring what a program needs.
 
-Not yet: addresses above 4 GiB (guest addresses are 32-bit), 64-bit exception handling (table-based unwinding; a fault or `RaiseException` stops the program), 64-bit DLLs that cannot be relocated below 4 GiB, child processes of 64-bit programs.
+- Structured exception handling as x64 Windows does it (`win32::seh64`): functions are found in the modules' exception directories (and tables added for generated code), frames are unwound by their unwind codes (and epilogs recognised), and an exception — a CPU fault, which the kernel delivers with an x64 `CONTEXT` to `OTW_DispatchException64`, or `RaiseException` — goes to the vectored handlers, then to each frame's language handler (`__C_specific_handler`, the C++ runtime's `__CxxFrameHandler`). `RtlUnwindEx` calls the termination handlers up to the target and resumes there with every register restored (`GuestMemory::request_resume_full`); a C++ `catch` runs in the runtime's consolidation callback first, and a stack walk from inside it continues at the target frame, as through Windows' machine frame. Walks cross the subsystem's calls into guest code (window procedures, handlers) to the code that called the subsystem. `binaries/guests/SEH64.EXE` (`scripts/build-seh64-pe.py`) tests a software exception and an access violation; Notepad++ catches its own C++ exceptions.
+- Text converts between UTF-16 and UTF-8 (`CP_UTF8`) in `MultiByteToWideChar`/`WideCharToMultiByte`; symbols programs use as labels (▼ ✕ ＋ ●, ...) have glyphs of their own in the built-in font (`unicode::SYMBOLS`), at byte positions Latin-1 leaves to control characters.
+
+Not yet: addresses above 4 GiB (guest addresses are 32-bit), 64-bit DLLs that cannot be relocated below 4 GiB, child processes of 64-bit programs.
 
 ### Read-only FAT32 Explorer
 

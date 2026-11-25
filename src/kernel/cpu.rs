@@ -60,7 +60,7 @@ const VXD_GATES: [u32; 5] = [
 const PAGE_SIZE: u32 = 0x1000;
 /// A single `ret` instruction used as the return address for synthetic
 /// DllMain calls. Unicorn stops before executing it.
-const SENTINEL_BASE: u32 = 0x6FFF_0000;
+pub const SENTINEL_BASE: u32 = 0x6FFF_0000;
 /// Top-level emulation runs until EIP reaches this address; a program that
 /// yields jumps here, which ends the run like the sentinel ends callbacks.
 const YIELD_ADDRESS: u32 = SENTINEL_BASE + 0x100;
@@ -126,6 +126,8 @@ struct RunState<'a> {
     levels: Vec<u32>,
     /// A pending exception-handling transfer of control.
     resume: Option<memory::Resume>,
+    /// All registers to set with `resume` (64-bit exception handling).
+    resume_full: Option<memory::FullRegisters>,
     /// A CPU fault that stopped emulation and has yet to be raised as an
     /// exception in the guest.
     fault: Option<Fault>,
@@ -392,10 +394,29 @@ fn deliver_fault(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>) ->
     };
     eprintln!("[eh] {}", fault.describe());
     if state.borrow().x64 {
-        // 64-bit exception dispatch (table-based unwinding) is not there yet.
-        let rip = uc.reg_read(Reg::RIP).unwrap_or(0);
-        state.borrow_mut().error = Some(format!("{} (rip={rip:#x}; exceptions in 64-bit programs are not supported yet)", fault.describe()));
-        return false;
+        // x64: the record and context below the faulting frame; the
+        // dispatcher gets them in RCX and RDX.
+        use crate::kernel::context64;
+        let mut full = read_full(uc);
+        full.rip = fault.eip as u64;
+        let rsp = full.gpr[4] as u32;
+        let base = rsp.wrapping_sub(0x200 + context64::RECORD_SIZE + context64::CONTEXT_SIZE) & !0xF;
+        let record = base + 0x30;
+        let context = (record + context64::RECORD_SIZE + 15) & !15;
+        let params: Vec<u64> = fault.params.iter().take(fault.param_count as usize).map(|&p| p as u64).collect();
+        let delivered = uc
+            .mem_write(record as u64, &context64::record(fault.code, 0, fault.eip as u64, &params))
+            .and_then(|()| uc.mem_write(context as u64, &context64::encode(&full)))
+            .and_then(|()| uc.mem_write(base as u64, &(fault.eip as u64).to_le_bytes()))
+            .and_then(|()| uc.reg_write(Reg::RSP, base as u64))
+            .and_then(|()| uc.reg_write(Reg::RCX, record as u64))
+            .and_then(|()| uc.reg_write(Reg::RDX, context as u64))
+            .and_then(|()| uc.reg_write(Reg::RIP, dispatcher as u64));
+        if dispatcher == 0 || delivered.is_err() {
+            state.borrow_mut().error = Some(format!("{} (cannot raise it)", fault.describe()));
+            return false;
+        }
+        return true;
     }
     let read = |uc: &Unicorn<'_, ()>, register| uc.reg_read(register).unwrap_or(0) as u32;
     let esp = read(uc, Reg::ESP);
@@ -496,6 +517,52 @@ fn emulate(
 }
 
 /// Write a resume target into the CPU registers.
+const FULL_GPRS: [Reg; 16] = [
+    Reg::RAX, Reg::RCX, Reg::RDX, Reg::RBX, Reg::RSP, Reg::RBP, Reg::RSI, Reg::RDI,
+    Reg::R8, Reg::R9, Reg::R10, Reg::R11, Reg::R12, Reg::R13, Reg::R14, Reg::R15,
+];
+const XMMS: [Reg; 16] = [
+    Reg::XMM0, Reg::XMM1, Reg::XMM2, Reg::XMM3, Reg::XMM4, Reg::XMM5, Reg::XMM6, Reg::XMM7,
+    Reg::XMM8, Reg::XMM9, Reg::XMM10, Reg::XMM11, Reg::XMM12, Reg::XMM13, Reg::XMM14, Reg::XMM15,
+];
+
+fn read_full(uc: &Unicorn<'_, ()>) -> memory::FullRegisters {
+    let mut full = memory::FullRegisters::default();
+    for (slot, register) in FULL_GPRS.iter().enumerate() {
+        full.gpr[slot] = uc.reg_read(*register).unwrap_or(0);
+    }
+    full.rip = uc.reg_read(Reg::RIP).unwrap_or(0);
+    full.eflags = uc.reg_read(Reg::EFLAGS).unwrap_or(0x202);
+    full.mxcsr = uc.reg_read(Reg::MXCSR).unwrap_or(0x1F80) as u32;
+    for (slot, register) in XMMS.iter().enumerate() {
+        if let Ok(bytes) = uc.reg_read_long(*register) {
+            let n = bytes.len().min(16);
+            full.xmm[slot][..n].copy_from_slice(&bytes[..n]);
+        }
+    }
+    full
+}
+
+fn write_full(uc: &mut Unicorn<'_, ()>, full: &memory::FullRegisters) -> Result<(), uc_error> {
+    for (slot, register) in FULL_GPRS.iter().enumerate() {
+        uc.reg_write(*register, full.gpr[slot])?;
+    }
+    uc.reg_write(Reg::EFLAGS, full.eflags | 0x2)?;
+    let _ = uc.reg_write(Reg::MXCSR, full.mxcsr as u64);
+    for (slot, register) in XMMS.iter().enumerate() {
+        uc.reg_write_long(*register, &full.xmm[slot])?;
+    }
+    uc.reg_write(Reg::RIP, full.rip)
+}
+
+fn apply_resume_full(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>, resume: &memory::Resume) -> Result<(), uc_error> {
+    let full = state.borrow_mut().resume_full.take();
+    match full {
+        Some(full) => write_full(uc, &full),
+        None => apply_resume(uc, resume),
+    }
+}
+
 fn apply_resume(uc: &mut Unicorn<'_, ()>, resume: &memory::Resume) -> Result<(), uc_error> {
     if let Some([eax, ebx, ecx, edx, esi, edi]) = resume.regs {
         for (register, value) in [
@@ -1025,6 +1092,34 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         }
     }
 
+    fn request_resume_full(&mut self, registers: memory::FullRegisters) {
+        if let Some(run) = self.run {
+            let mut state = run.borrow_mut();
+            state.resume = Some(memory::Resume {
+                eip: registers.rip as u32,
+                esp: registers.gpr[4] as u32,
+                ebp: registers.gpr[5] as u32,
+                regs: None,
+            });
+            state.resume_full = Some(registers);
+        }
+    }
+
+    fn set_full_registers(&mut self, registers: &memory::FullRegisters) {
+        let rip = self.uc.reg_read(Reg::RIP).unwrap_or(0);
+        let mut registers = registers.clone();
+        registers.rip = rip;
+        let _ = write_full(self.uc, &registers);
+    }
+
+    fn full_registers(&mut self) -> Option<memory::FullRegisters> {
+        Some(read_full(self.uc))
+    }
+
+    fn callback_levels(&self) -> Vec<u32> {
+        self.run.map(|run| run.borrow().levels.clone()).unwrap_or_default()
+    }
+
     fn resume_pending(&self) -> bool {
         self.run
             .map(|run| run.borrow().resume.is_some())
@@ -1369,7 +1464,7 @@ impl<'a> Process<'a> {
             let Some(resume) = resume else {
                 break;
             };
-            if let Err(error) = apply_resume(uc, &resume) {
+            if let Err(error) = apply_resume_full(uc, &state, &resume) {
                 return Err(RunError::Unicorn("resuming after an exception", error));
             }
             emulation = emulate(
@@ -1807,7 +1902,13 @@ fn build<'a>(
                     uc,
                     run: Some(&thunk_state),
                 };
-                if kernel_entry {
+                if kernel_entry && x64 {
+                    // The 64-bit exception dispatcher is the subsystem's
+                    // (it unwinds through the modules' function tables).
+                    let call_args = super::syscall::Args::new(wide_args.clone(), true);
+                    let name = super::pe::ImportName::ByName("OTW_DispatchException64".into());
+                    thunk_calls.call(&mut memory, "KERNEL32.dll", &name, &call_args, return_address)
+                } else if kernel_entry {
                     // The exception dispatcher: (record, context) on the stack.
                     Some(super::eh::dispatcher(&mut memory, args[0], args[1]))
                 } else {
@@ -1874,7 +1975,7 @@ fn build<'a>(
                         state.resume = None;
                         state.api_calls += 1;
                         drop(state);
-                        if let Err(error) = apply_resume(uc, &resume) {
+                        if let Err(error) = apply_resume_full(uc, &thunk_state, &resume) {
                             abort(
                                 &thunk_state,
                                 uc,

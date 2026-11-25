@@ -1280,10 +1280,12 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             };
-            let bytes: Vec<u8> = units
-                .iter()
-                .map(|u| if *u <= 0xFF { *u as u8 } else { b'?' })
-                .collect();
+            // UTF-8 (CP_UTF8) or the ANSI code page.
+            let bytes: Vec<u8> = if args[0] == 65001 {
+                String::from_utf16_lossy(&units).into_bytes()
+            } else {
+                crate::win32::unicode::wide_to_ansi(&units)
+            };
             if args[5] == 0 {
                 return ok(bytes.len() as u32);
             }

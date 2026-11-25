@@ -1167,7 +1167,61 @@ static FONT_BLOB: &[u8] = include_bytes!("../../binaries/fonts/OTWSANS.FNT");
 /// All faces of the built-in font, parsed once.
 pub fn font_faces() -> &'static [FontFace] {
     static FACES: OnceLock<Vec<FontFace>> = OnceLock::new();
-    FACES.get_or_init(|| parse_font(FONT_BLOB))
+    FACES.get_or_init(|| {
+        let mut faces = parse_font(FONT_BLOB);
+        for face in &mut faces {
+            draw_symbols(face);
+        }
+        faces
+    })
+}
+
+/// Draw the symbols of `unicode::SYMBOLS` (triangles, crosses, plus signs)
+/// into the face's otherwise empty glyphs at their byte positions.
+fn draw_symbols(face: &mut FontFace) {
+    let height = face.height.max(8);
+    let size = ((height * 2) / 3) | 1; // odd, so shapes have a centre
+    let advance = size + 3;
+    let top = (face.ascent - size).max(0);
+    for (_, byte) in crate::win32::unicode::SYMBOLS {
+        let stride = (advance as usize).div_ceil(8);
+        let mut bits = vec![0u8; stride * height as usize];
+        let mut set = |x: i32, y: i32| {
+            if x >= 0 && x < advance && y >= 0 && y < height {
+                bits[y as usize * stride + x as usize / 8] |= 0x80 >> (x % 8);
+            }
+        };
+        let (left, middle) = (1, size / 2);
+        for i in 0..size {
+            for j in 0..size {
+                let on = match byte {
+                    // ▼ and ▲: rows narrowing to a point.
+                    0x80 => i <= size / 2 && j >= i && j < size - i,
+                    0x81 => i >= size / 2 && j >= size - 1 - i && j <= i,
+                    // ▶ and ◀.
+                    0x87 => j <= size / 2 && i >= j && i < size - j,
+                    0x88 => j >= size / 2 && i >= size - 1 - j && i <= j,
+                    // ●: a disc; ˄ and ˅: small chevrons.
+                    0x89 => (2 * i - (size - 1)).pow(2) + (2 * j - (size - 1)).pow(2) <= size * size,
+                    0x8A => i >= size / 3 && (j - middle).abs() == i - size / 3,
+                    0x8B => i <= 2 * size / 3 && (j - middle).abs() == 2 * size / 3 - i,
+                    // ✕ (thin), ✖ and ❌ (heavy): two diagonals.
+                    0x82 => i == j || i + j == size - 1,
+                    0x83 | 0x84 => (i - j).abs() <= 1 || (i + j - (size - 1)).abs() <= 1,
+                    // ➕ and ＋: a cross.
+                    _ => (i - middle).abs() <= if byte == 0x85 { 1 } else { 0 } || (j - middle).abs() <= if byte == 0x85 { 1 } else { 0 },
+                };
+                if on {
+                    let row = if matches!(byte, 0x80 | 0x81) { top + i + size / 4 - if byte == 0x81 { size / 2 } else { 0 } } else { top + i };
+                    set(left + j, row);
+                }
+            }
+        }
+        let index = (byte - 32) as usize;
+        if index < face.glyphs.len() {
+            face.glyphs[index] = Glyph { advance, stride, bits };
+        }
+    }
 }
 
 fn parse_font(blob: &[u8]) -> Vec<FontFace> {

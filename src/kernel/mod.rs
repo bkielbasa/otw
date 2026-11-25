@@ -7,6 +7,7 @@
 //! The kernel does not know Win32: imports that are not bound to genuine DLL
 //! code reach the environment subsystem through the system call interface.
 
+pub mod context64;
 pub mod cpu;
 pub mod eh;
 pub mod iat;

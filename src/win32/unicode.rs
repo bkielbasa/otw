@@ -19,16 +19,45 @@ use crate::{
 
 // ── Text ─────────────────────────────────────────────────────────────────
 
+/// Symbols programs use as labels (menu bar buttons, arrows) that the
+/// built-in font draws in byte positions Latin-1 leaves to control
+/// characters: (character, byte).
+pub const SYMBOLS: [(u16, u8); 12] = [
+    (0x25BC, 0x80), // ▼
+    (0x25B2, 0x81), // ▲
+    (0x2715, 0x82), // ✕
+    (0x2716, 0x83), // ✖
+    (0x274C, 0x84), // ❌
+    (0x2795, 0x85), // ➕
+    (0xFF0B, 0x86), // ＋
+    (0x25B6, 0x87), // ▶
+    (0x25C0, 0x88), // ◀
+    (0x25CF, 0x89), // ●
+    (0x02C4, 0x8A), // ˄
+    (0x02C5, 0x8B), // ˅
+];
+
 pub fn wide_to_ansi(units: &[u16]) -> Vec<u8> {
     units
         .iter()
         .filter(|&&unit| unit != 0xFEFF) // byte-order mark / zero-width no-break space
-        .map(|&unit| if unit < 0x100 { unit as u8 } else { b'?' })
+        .map(|&unit| match unit {
+            0..=0xFF => unit as u8,
+            _ => SYMBOLS.iter().find(|(c, _)| *c == unit).map(|(_, b)| *b).unwrap_or_else(|| {
+                if std::env::var_os("OTW_TRACE_UNMAPPED").is_some() {
+                    eprintln!("[unicode] no ANSI form for U+{unit:04X}");
+                }
+                b'?'
+            }),
+        })
         .collect()
 }
 
 pub fn ansi_to_wide(bytes: &[u8]) -> Vec<u16> {
-    bytes.iter().map(|&byte| byte as u16).collect()
+    bytes
+        .iter()
+        .map(|&byte| SYMBOLS.iter().find(|(_, b)| *b == byte).map(|(c, _)| *c).unwrap_or(byte as u16))
+        .collect()
 }
 
 /// Read a NUL-terminated UTF-16 string (at most 32K characters).
