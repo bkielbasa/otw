@@ -1586,6 +1586,10 @@ fn build<'a>(
         }
         cursor = cursor.max(end);
     }
+    if x64 {
+        uc.mem_map(memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64, Prot::ALL)
+            .map_err(|error| RunError::Unicorn("mapping the 64-bit heap", error))?;
+    }
 
     uc.mem_map(TIB_BASE as u64, if x64 { TEB64_SIZE } else { TIB_SIZE } as u64, Prot::ALL)
         .map_err(|error| RunError::Unicorn("mapping guest TIB", error))?;
@@ -1719,6 +1723,24 @@ fn build<'a>(
     let trace_results = std::env::var_os("OTW_TRACE_RESULTS").is_some();
     let trace_code = std::env::var_os("OTW_TRACE_CODE").is_some();
     let code_trace = Rc::new(RefCell::new(VecDeque::<String>::new()));
+    // OTW_TRACE_PC=addr,addr,...: show the registers whenever those
+    // instructions run (a debugging breakpoint that does not stop).
+    if let Ok(list) = std::env::var("OTW_TRACE_PC") {
+        let trace_state = state.clone();
+        for address in list.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()) {
+            let trace_state = trace_state.clone();
+            let _ = uc.add_code_hook(address, address, move |uc, at, _| {
+                let read = |r| uc.reg_read(r).unwrap_or(0);
+                let thread = trace_state.borrow().running.last().copied().unwrap_or(0);
+                let mut ret = [0u8; 8];
+                let _ = uc.mem_read(read(Reg::RSP), &mut ret);
+                eprintln!(
+                    "[pc] {at:#x} thread {thread} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} rsp={:#x} ret={:#x}",
+                    read(Reg::RCX), read(Reg::RDX), read(Reg::R8), read(Reg::R9), read(Reg::RSP), u64::from_le_bytes(ret)
+                );
+            });
+        }
+    }
     if trace_code {
         let trace = code_trace.clone();
         uc.add_code_hook(
@@ -1890,8 +1912,9 @@ fn build<'a>(
             let args: Vec<u32> = wide_args.iter().map(|&value| value as u32).collect();
 
             if trace_api {
+                let thread = thunk_state.borrow().running.last().copied().unwrap_or(1);
                 eprintln!(
-                    "api {} esp={esp:#010x} ret={return_address:#010x} args={:08x?}",
+                    "api {} esp={esp:#010x} ret={return_address:#010x} args={:08x?} t={thread}",
                     thunk_calls.describe(&entry.dll, &entry.name),
                     args
                 );

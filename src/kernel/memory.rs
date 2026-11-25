@@ -9,6 +9,9 @@
 pub const HEAP_BASE: u32 = 0x0080_0000;
 /// Size of the guest heap (120 MiB, ending at 0x0800_0000).
 pub const HEAP_SIZE: u32 = 0x0780_0000;
+/// More heap for 64-bit processes, whose programs allocate far more.
+pub const HEAP64_EXTRA_BASE: u32 = 0x4000_0000;
+pub const HEAP64_EXTRA_SIZE: u32 = 0x1000_0000;
 
 /// What became of a thread given the CPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

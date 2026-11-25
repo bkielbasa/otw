@@ -166,6 +166,11 @@ impl GuestHeap {
         }
     }
 
+    /// More free space (a region the CPU has mapped).
+    pub fn add_range(&mut self, start: u32, length: u32) {
+        self.free.insert(start, length);
+    }
+
     pub fn size_of(&self, address: u32) -> Option<u32> {
         self.used.get(&address).copied()
     }
@@ -758,6 +763,9 @@ pub struct SharedState {
     pub file_mappings: HashMap<u32, (u32, u32)>,
     /// Mapped views: address to (mapping handle, offset, size).
     pub mapped_views: HashMap<u32, (u32, u32, u32)>,
+    /// The contents of mappings backed by the paging file (no file),
+    /// as of the last view unmapped or synchronised.
+    pub section_bytes: HashMap<u32, Vec<u8>>,
     /// ShowCursor's display count.
     pub cursor_count: i32,
     /// The large and small system image lists (SHGetFileInfo).
@@ -843,6 +851,7 @@ impl Default for SharedState {
             virtual_allocs: HashMap::new(),
             file_mappings: HashMap::new(),
             mapped_views: HashMap::new(),
+            section_bytes: HashMap::new(),
         }
     }
 }
@@ -1035,6 +1044,9 @@ impl ApiContext {
             shared.borrow_mut().heap.reserve(start, end);
         }
         shared.borrow_mut().x64 = image.main().is64;
+        if image.main().is64 {
+            shared.borrow_mut().heap.add_range(crate::kernel::memory::HEAP64_EXTRA_BASE, crate::kernel::memory::HEAP64_EXTRA_SIZE);
+        }
         builtin.insert(
             "__dynamic_base".to_owned(),
             image.entry_point(DYNAMIC_DLL, "slot0").unwrap_or(0),
@@ -1389,7 +1401,7 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
     {
         return Some(count);
     }
-    if dll.eq_ignore_ascii_case("wsock32.dll") || dll.eq_ignore_ascii_case("winsock.dll") {
+    if dll.eq_ignore_ascii_case("wsock32.dll") || dll.eq_ignore_ascii_case("winsock.dll") || dll.eq_ignore_ascii_case("ws2_32.dll") {
         crate::win32::winsock::arg_count(name)
     } else if dll.eq_ignore_ascii_case("msvcrt20.dll") {
         msvcrt20::arg_count(name)
@@ -1625,7 +1637,7 @@ pub fn dispatch_with_memory<M: GuestMemory + ?Sized>(
             return modern::dispatch(ctx, memory, text, args);
         }
     }
-    if dll.eq_ignore_ascii_case("wsock32.dll") || dll.eq_ignore_ascii_case("winsock.dll") {
+    if dll.eq_ignore_ascii_case("wsock32.dll") || dll.eq_ignore_ascii_case("winsock.dll") || dll.eq_ignore_ascii_case("ws2_32.dll") {
         crate::win32::winsock::dispatch(ctx, memory, name, args)
     } else if dll.eq_ignore_ascii_case("msvcrt20.dll") {
         msvcrt20::dispatch(ctx, memory, name, args)

@@ -139,6 +139,21 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "GetProcessWindowStation" => 0,
         "CoGetApartmentType" => 2,
         "CommandLineToArgvW" => 2,
+        "MsgWaitForMultipleObjectsEx" => 5,
+        "LockFileEx" | "UnlockFileEx" => 6,
+        "VirtualQueryEx" => 4,
+        "GetNamedSecurityInfoW" => 8,
+        "SetupDiGetClassDevsW" => 4,
+        "SetupDiDestroyDeviceInfoList" => 1,
+        "SetupDiEnumDeviceInfo" => 3,
+        "SetWinEventHook" => 7,
+        "UnhookWinEvent" | "UnregisterDeviceNotification" => 1,
+        "RegisterDeviceNotificationW" => 3,
+        "EnumDisplayDevicesW" => 4,
+        "SHGetPropertyStoreForWindow" | "SetCurrentProcessExplicitAppUserModelID" | "GetCurrentProcessExplicitAppUserModelID" => 3,
+        "GetComputerNameExA" | "GetComputerNameExW" => 3,
+        "CreateWaitableTimerW" | "CreateWaitableTimerA" => 3,
+        "CancelWaitableTimer" => 1,
         "RtlAddGrowableFunctionTable" => 6,
         "RtlGrowFunctionTable" => 2,
         "RtlDeleteGrowableFunctionTable" | "RtlDeleteFunctionTable" => 1,
@@ -315,7 +330,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         "SetThreadAffinityMask" => ok(1),
         "SetThreadInformation" | "SetProcessMitigationPolicy" | "HeapSetInformation" | "SetDefaultDllDirectories"
         | "SetHandleInformation" | "SetFileInformationByHandle" | "SetInformationJobObject" | "TerminateJobObject"
-        | "AssignProcessToJobObject" | "UpdateProcThreadAttribute" | "SetWaitableTimerEx" | "SetWaitableTimer"
+        | "AssignProcessToJobObject" | "UpdateProcThreadAttribute"
         | "UnregisterWaitEx" | "EnumSystemLocalesEx" => ok(1),
         "GetProcessMitigationPolicy" | "QueryInformationJobObject" | "GetLogicalProcessorInformationEx"
         | "GetThreadContext" | "SetThreadContext" | "CreateHardLinkW" | "CreateSymbolicLinkW" | "AttachConsole"
@@ -595,8 +610,24 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         "CreateSemaphoreExW" => {
             ok(win32(ctx, memory, "KERNEL32.dll", "CreateSemaphoreW", &[p(0), p(1), p(2), p(3)]) as u64)
         }
-        "CreateWaitableTimerExW" | "CreateWaitableTimerExA" => {
-            ok(win32(ctx, memory, "KERNEL32.dll", "CreateEventW", &[0, 1, 0, 0]) as u64)
+        // (security, name, flags: 1 manual reset, access)
+        "CreateWaitableTimerExW" | "CreateWaitableTimerExA" => ok(crate::win32::sync::create_timer(ctx, p(2) & 1 != 0) as u64),
+        "CreateWaitableTimerW" | "CreateWaitableTimerA" => ok(crate::win32::sync::create_timer(ctx, p(1) != 0) as u64),
+        "CancelWaitableTimer" => ok(u64::from(crate::win32::sync::cancel_timer(ctx, p(0)))),
+        "SetWaitableTimerEx" | "SetWaitableTimer" => {
+            // (timer, &due time, period ms, ...): a negative due time is
+            // relative in 100 ns units, a positive one a FILETIME.
+            let due = memory.read_u64(p(1)).unwrap_or(0) as i64;
+            let delay = if due < 0 {
+                due.unsigned_abs() / 10_000
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64 / 100 + 116_444_736_000_000_000)
+                    .unwrap_or(0);
+                (due as u64).saturating_sub(now) / 10_000
+            };
+            ok(u64::from(crate::win32::sync::set_timer(ctx, p(0), delay, p(2) as u64)))
         }
         // ── Completion ports ──
         "CreateIoCompletionPort" => {
@@ -794,6 +825,75 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(1)
         }
         "SetThreadStackGuarantee" => ok(1),
+        // (count, handles, timeout, wake mask, flags: 1 = wait for all)
+        "MsgWaitForMultipleObjectsEx" => {
+            ok(win32(ctx, memory, "USER32.dll", "MsgWaitForMultipleObjects", &[p(0), p(1), p(4) & 1, p(2), p(3)]) as u64)
+        }
+        "LockFileEx" | "UnlockFileEx" => ok(1),
+        "VirtualQueryEx" => ok(win32(ctx, memory, "KERNEL32.dll", "VirtualQuery", &[p(1), p(2), p(3)]) as u64),
+        "GetNamedSecurityInfoW" => {
+            for index in 3..7 {
+                if p(index) != 0 {
+                    let _ = memory.write_ptr(p(index), 0);
+                }
+            }
+            if p(7) != 0 {
+                let descriptor = alloc(ctx, 40);
+                let _ = memory.write_bytes(descriptor, &[1, 0, 0x04, 0x80, 0, 0, 0, 0]);
+                let _ = memory.write_ptr(p(7), descriptor as u64);
+            }
+            ok(0)
+        }
+        // No devices to enumerate.
+        "SetupDiGetClassDevsW" => ok(u64::MAX),
+        "SetupDiDestroyDeviceInfoList" => ok(1),
+        "SetupDiEnumDeviceInfo" => {
+            set_error(ctx, 259); // ERROR_NO_MORE_ITEMS
+            ok(0)
+        }
+        "SetWinEventHook" => ok(0x3E70),
+        "UnhookWinEvent" | "UnregisterDeviceNotification" => ok(1),
+        "RegisterDeviceNotificationW" => ok(0xDE70),
+        "EnumDisplayDevicesW" => {
+            // (device, index, DISPLAY_DEVICEW, flags): one display.
+            if p(0) != 0 || p(1) != 0 {
+                return ok(0);
+            }
+            let info = p(2);
+            let size = memory.read_u32(info).unwrap_or(840);
+            let _ = memory.write_bytes(info + 4, &vec![0u8; size.saturating_sub(4).min(836) as usize]);
+            let name: Vec<u16> = r"\\.\DISPLAY1".encode_utf16().collect();
+            unicode::write_wide(memory, info + 4, &name, true);
+            let string: Vec<u16> = "OTW Display".encode_utf16().collect();
+            unicode::write_wide(memory, info + 68, &string, true);
+            let _ = memory.write_u32(info + 324, 0x5); // ATTACHED_TO_DESKTOP | PRIMARY_DEVICE
+            ok(1)
+        }
+        "SHGetPropertyStoreForWindow" => {
+            let _ = memory.write_ptr(p(2), 0);
+            ok(0x8000_4001)
+        }
+        "SetCurrentProcessExplicitAppUserModelID" => ok(0),
+        "GetCurrentProcessExplicitAppUserModelID" => {
+            let _ = memory.write_ptr(p(0), 0);
+            ok(0x8000_4005)
+        }
+        "GetComputerNameExA" | "GetComputerNameExW" => {
+            // (format, buffer, &size)
+            let text = "OTW";
+            let capacity = memory.read_u32(p(2)).unwrap_or(0);
+            let _ = memory.write_u32(p(2), if (capacity as usize) > text.len() { text.len() } else { text.len() + 1 } as u32);
+            if p(1) == 0 || (capacity as usize) <= text.len() {
+                set_error(ctx, 234); // ERROR_MORE_DATA
+                return ok(0);
+            }
+            if name.ends_with('W') {
+                unicode::write_wide(memory, p(1), &text.encode_utf16().collect::<Vec<_>>(), true);
+            } else {
+                let _ = memory.write_bytes(p(1), b"OTW\0");
+            }
+            ok(1)
+        }
         // A 64-bit request: sizes past 4 GiB cannot be met.
         "VirtualAlloc" => {
             if arg(1) > u32::MAX as u64 || arg(0) > u32::MAX as u64 {

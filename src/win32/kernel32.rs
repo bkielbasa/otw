@@ -929,7 +929,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 }
             };
             if args[3] != 0 {
-                let _ = memory.write_u32(args[3], duplicate);
+                let _ = memory.write_ptr(args[3], crate::kernel::syscall::widen(duplicate));
             }
             ok(1)
         }

@@ -221,7 +221,7 @@ fn post_async(shared: &mut SharedState, handle: u32, event: u16) {
 /// The function a WSOCK32 (or 16-bit-era WINSOCK) export ordinal names;
 /// WinINet imports WSOCK32 by ordinal.
 pub fn ordinal_name(dll: &str, ordinal: u16) -> Option<&'static str> {
-    if !dll.eq_ignore_ascii_case("wsock32.dll") && !dll.eq_ignore_ascii_case("winsock.dll") {
+    if !dll.eq_ignore_ascii_case("wsock32.dll") && !dll.eq_ignore_ascii_case("winsock.dll") && !dll.eq_ignore_ascii_case("ws2_32.dll") {
         return None;
     }
     Some(match ordinal {
@@ -1221,9 +1221,12 @@ fn read_fd_set<M: GuestMemory + ?Sized>(memory: &mut M, va: u32) -> Option<Vec<u
     if count > FD_SETSIZE {
         return None;
     }
+    // fd_set: a count, then SOCKETs (pointer-sized, so aligned to 8 in a
+    // 64-bit process).
+    let size = memory.ptr_size();
     let mut sockets = Vec::with_capacity(count);
     for index in 0..count {
-        sockets.push(memory.read_u32(va.wrapping_add(4 + index as u32 * 4))?);
+        sockets.push(memory.read_ptr(va.wrapping_add(size + index as u32 * size))? as u32);
     }
     Some(sockets)
 }
@@ -1234,8 +1237,9 @@ fn write_fd_set<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, sockets: &[u32
     }
     let count = sockets.len().min(FD_SETSIZE);
     memory.write_u32(va, count as u32)?;
+    let size = memory.ptr_size();
     for (index, socket) in sockets.iter().take(count).enumerate() {
-        memory.write_u32(va.wrapping_add(4 + index as u32 * 4), *socket)?;
+        memory.write_ptr(va.wrapping_add(size + index as u32 * size), *socket as u64)?;
     }
     Some(())
 }

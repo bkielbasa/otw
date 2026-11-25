@@ -250,10 +250,25 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             };
             let offset = args[3];
             let length = if args[4] != 0 { args[4] } else { size.saturating_sub(offset) };
-            let Some(view) = ctx.shared.borrow_mut().heap.alloc(length.max(1)) else {
+            // 64-bit programs map big files (Firefox its 50 MB archives):
+            // their views get address space of their own.
+            let x64 = ctx.shared.borrow().x64;
+            let view = if x64 { memory.map_region(0x2000_0000, length.max(1)) } else { ctx.shared.borrow_mut().heap.alloc(length.max(1)) };
+            let Some(view) = view else {
                 return ok(0);
             };
             let mut contents = vec![0u8; length as usize];
+            if file == 0 {
+                // Memory shared through the paging file: what the views
+                // wrote (views of one section are synchronised when one is
+                // mapped or unmapped).
+                sync_section_views(ctx, memory, args[0]);
+                if let Some(bytes) = ctx.shared.borrow().section_bytes.get(&args[0]) {
+                    let start = (offset as usize).min(bytes.len());
+                    let end = (start + length as usize).min(bytes.len());
+                    contents[..end - start].copy_from_slice(&bytes[start..end]);
+                }
+            }
             if file != 0 {
                 use std::io::{Read, Seek, SeekFrom};
                 let mut shared = ctx.shared.borrow_mut();
@@ -276,11 +291,20 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(view)
         }
         "UnmapViewOfFile" => {
-            let mut shared = ctx.shared.borrow_mut();
-            let removed = shared.mapped_views.remove(&args[0]).is_some();
-            if removed {
-                shared.heap.free(args[0]);
+            let view = ctx.shared.borrow().mapped_views.get(&args[0]).copied();
+            if let Some((mapping, offset, length)) = view {
+                save_view(ctx, memory, mapping, args[0], offset, length);
             }
+            let x64 = ctx.shared.borrow().x64;
+            let removed = ctx.shared.borrow_mut().mapped_views.remove(&args[0]);
+            if let Some((_, _, length)) = removed {
+                if x64 {
+                    memory.unmap(args[0], length.max(1));
+                } else {
+                    ctx.shared.borrow_mut().heap.free(args[0]);
+                }
+            }
+            let removed = removed.is_some();
             ok(u32::from(removed))
         }
         "GetDiskFreeSpaceExW" | "GetDiskFreeSpaceExA" => {
@@ -383,5 +407,37 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(args[3])
         }
         _ => None,
+    }
+}
+
+/// Copy a view of a paging-file section back into the section.
+fn save_view<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mapping: u32, view: u32, offset: u32, length: u32) {
+    let anonymous = ctx.shared.borrow().file_mappings.get(&mapping).is_some_and(|(file, _)| *file == 0);
+    if !anonymous {
+        return;
+    }
+    let bytes = memory.read_bytes(view, length as usize).unwrap_or_default();
+    let mut shared = ctx.shared.borrow_mut();
+    let size = shared.file_mappings.get(&mapping).map(|(_, size)| *size).unwrap_or(0) as usize;
+    let section = shared.section_bytes.entry(mapping).or_default();
+    let end = (offset as usize + bytes.len()).max(size);
+    if section.len() < end {
+        section.resize(end, 0);
+    }
+    section[offset as usize..offset as usize + bytes.len()].copy_from_slice(&bytes);
+}
+
+/// Bring a paging-file section up to date with its mapped views.
+fn sync_section_views<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mapping: u32) {
+    let views: Vec<(u32, u32, u32)> = ctx
+        .shared
+        .borrow()
+        .mapped_views
+        .iter()
+        .filter(|(_, (m, _, _))| *m == mapping)
+        .map(|(view, (_, offset, length))| (*view, *offset, *length))
+        .collect();
+    for (view, offset, length) in views {
+        save_view(ctx, memory, mapping, view, offset, length);
     }
 }

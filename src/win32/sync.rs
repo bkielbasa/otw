@@ -28,6 +28,9 @@ pub enum Object {
     Thread { id: u32, exit: Option<u32> },
     /// A program started with CreateProcess (its process or main thread).
     Process { pid: u32, exit: Option<u32> },
+    /// A waitable timer: signalled from its due time (in VM ticks); an
+    /// auto-reset one is taken by a wait and, if periodic, set again.
+    Timer { manual: bool, due: Option<u64>, period: u64 },
 }
 
 /// What a thread that came off the CPU waits for.
@@ -47,6 +50,8 @@ pub struct Wait {
 #[derive(Debug, Default)]
 pub struct SyncState {
     pub objects: HashMap<u32, Object>,
+    /// The time waits are checked at (VM ticks), for timers.
+    now: u64,
     /// Named objects (`CreateEvent(..., "name")`), by lower-case name.
     names: HashMap<String, u32>,
     /// Waits of threads that are off the CPU.
@@ -146,6 +151,7 @@ fn signaled(sync: &SyncState, handle: u32, thread: u32) -> bool {
         Some(Object::Mutex { owner, .. }) => *owner == 0 || *owner == thread,
         Some(Object::Semaphore { count, .. }) => *count > 0,
         Some(Object::Thread { exit, .. }) | Some(Object::Process { exit, .. }) => exit.is_some(),
+        Some(Object::Timer { due, .. }) => due.is_some_and(|due| due <= sync.now),
         None => true,
     }
 }
@@ -160,7 +166,40 @@ fn acquire(sync: &mut SyncState, handle: u32, thread: u32) {
             *count += 1;
         }
         Some(Object::Semaphore { count, .. }) => *count -= 1,
+        Some(Object::Timer { manual: false, due, period }) => {
+            *due = (*period > 0).then(|| due.unwrap_or(0).max(0) + *period);
+        }
         _ => {}
+    }
+}
+
+/// CreateWaitableTimer: a timer not yet set.
+pub fn create_timer(ctx: &ApiContext, manual: bool) -> u32 {
+    create(ctx, None, Object::Timer { manual, due: None, period: 0 })
+}
+
+/// SetWaitableTimer: due in `delay` milliseconds, then every `period`.
+pub fn set_timer(ctx: &ApiContext, handle: u32, delay: u64, period: u64) -> bool {
+    let mut shared = ctx.shared.borrow_mut();
+    let now = shared.ticks();
+    match shared.sync.objects.get_mut(&handle) {
+        Some(Object::Timer { due, period: every, .. }) => {
+            *due = Some(now + delay);
+            *every = period;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// CancelWaitableTimer.
+pub fn cancel_timer(ctx: &ApiContext, handle: u32) -> bool {
+    match ctx.shared.borrow_mut().sync.objects.get_mut(&handle) {
+        Some(Object::Timer { due, .. }) => {
+            *due = None;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -234,6 +273,7 @@ fn ready<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, thread: u32,
 pub fn run_ready_threads<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) -> bool {
     let mut ran = false;
     let now = ctx.shared.borrow().ticks();
+    ctx.shared.borrow_mut().sync.now = now;
     for thread in memory.waiting_threads() {
         if !ready(ctx, memory, thread, now) {
             continue;
@@ -399,6 +439,7 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         refresh_processes(ctx);
         {
             let mut shared = ctx.shared.borrow_mut();
+            shared.sync.now = shared.ticks();
             if let Some(index) = try_wait(&mut shared.sync, &wait, thread) {
                 return Outcome::Signaled(index);
             }
@@ -555,7 +596,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         }
         "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" | "MsgWaitForMultipleObjects" => {
             // (count, handles, wait all, timeout[, wake mask or alertable])
-            let handles: Vec<u32> = (0..args[0].min(64)).map(|i| memory.read_u32(args[1] + i * 4).unwrap_or(0)).collect();
+            // HANDLEs: pointer-sized.
+            let size = memory.ptr_size();
+            let handles: Vec<u32> = (0..args[0].min(64)).map(|i| memory.read_ptr(args[1] + i * size).unwrap_or(0) as u32).collect();
             let spec = Wait {
                 handles,
                 all: args[2] != 0,
