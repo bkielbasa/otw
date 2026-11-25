@@ -438,7 +438,7 @@ fn index_of(ctx: &ApiContext, hwnd: u32, command: u32) -> Option<usize> {
 }
 
 fn paint_toolbar<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
-    let ps = user::scratch(ctx, 64);
+    let ps = user::scratch(ctx, 80);
     let hdc = user::begin_paint(ctx, memory, hwnd, ps);
     let toolbar = with_toolbar(ctx, hwnd, |t| t.clone());
     let rects = rects(ctx, hwnd);
@@ -590,7 +590,7 @@ pub fn toolbar_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, h
             if arrow_hit {
                 // TBN_DROPDOWN with an NMTOOLBAR: header, item, TBBUTTON, text, rect.
                 let (parent, id) = notify_parent(ctx, hwnd);
-                let block = user::scratch(ctx, 64);
+                let block = user::scratch(ctx, 80);
                 let r = rects[index];
                 let mut bytes = Vec::new();
                 for v in [hwnd, id, TBN_DROPDOWN, button.command, button.image as u32, button.command] {
@@ -1002,7 +1002,7 @@ fn place_status<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd:
 }
 
 fn paint_status<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
-    let ps = user::scratch(ctx, 64);
+    let ps = user::scratch(ctx, 80);
     let hdc = user::begin_paint(ctx, memory, hwnd, ps);
     let rects = status_rects(ctx, hwnd);
     let status = with_status(ctx, hwnd, |s| s.clone());

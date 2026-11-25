@@ -104,6 +104,11 @@ impl View {
         Self { va, offsets: layout.offsets(x64).0, fields: layout.fields, x64 }
     }
 
+    /// The address of field `index`.
+    pub fn at(&self, index: usize) -> u32 {
+        self.va + self.offsets[index]
+    }
+
     /// Field `index` (pointer-sized fields in full).
     pub fn get<M: GuestMemory + ?Sized>(&self, memory: &mut M, index: usize) -> u64 {
         let at = self.va + self.offsets[index];
@@ -275,8 +280,6 @@ enum Dir {
 fn struct_args(name: &str) -> &'static [(usize, Layout, Dir)] {
     use Dir::*;
     match name {
-        "BeginPaint" => &[(1, PAINTSTRUCT, Out)],
-        "EndPaint" => &[(1, PAINTSTRUCT, In)],
         "GetMenuItemInfoW" | "GetMenuItemInfoA" => &[(3, MENUITEMINFO, InOut)],
         "SetMenuItemInfoW" | "SetMenuItemInfoA" | "InsertMenuItemW" | "InsertMenuItemA" => &[(3, MENUITEMINFO, In)],
         "GetStartupInfoW" | "GetStartupInfoA" => &[(0, STARTUPINFO, Out)],
@@ -310,8 +313,6 @@ fn split_args(name: &str) -> &'static [usize] {
 fn message_struct(msg: u32) -> Option<(Layout, Dir)> {
     use Dir::*;
     Some(match msg {
-        0x0001 | 0x0081 => (CREATESTRUCT, InOut),         // WM_CREATE, WM_NCCREATE
-        0x0046 | 0x0047 => (WINDOWPOS, InOut),            // WM_WINDOWPOSCHANGING/CHANGED
         0x004E => (NMHDR, InOut),                         // WM_NOTIFY (header only)
         0x002B => (DRAWITEMSTRUCT, In),                   // WM_DRAWITEM
         0x002C => (MEASUREITEMSTRUCT, InOut),             // WM_MEASUREITEM
@@ -624,7 +625,6 @@ pub fn call_hook<M: GuestMemory + ?Sized>(
     lparam: u32,
 ) -> Option<u32> {
     let pair = match (kind, code) {
-        (5, 3) => Some((CBT_CREATEWND, Some(CREATESTRUCT))), // WH_CBT, HCBT_CREATEWND
         (4, _) => Some((CWPSTRUCT, None)),                   // WH_CALLWNDPROC
         (12, _) => Some((CWPRETSTRUCT, None)),               // WH_CALLWNDPROCRET
         (3, _) => Some((MSG, None)),                         // WH_GETMESSAGE

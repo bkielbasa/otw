@@ -439,7 +439,7 @@ pub fn color_panel_proc<M: GuestMemory + ?Sized>(
         .unwrap_or(0);
     match msg {
         user::WM_PAINT => {
-            let ps = user::scratch(ctx, 64);
+            let ps = user::scratch(ctx, 80);
             let hdc = user::begin_paint(ctx, memory, hwnd, ps);
             paint_panel(ctx, hwnd, id);
             user::end_paint(ctx, hwnd, hdc);

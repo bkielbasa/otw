@@ -354,7 +354,7 @@ fn scroll_to<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u3
 
 fn paint<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
     sync_scroll(ctx, memory, hwnd);
-    let ps = user::scratch(ctx, 64);
+    let ps = user::scratch(ctx, 80);
     let hdc = user::begin_paint(ctx, memory, hwnd, ps);
     let tree = with_tree(ctx, hwnd, |tree| tree.clone());
     let style = style(ctx, hwnd);

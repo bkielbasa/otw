@@ -453,7 +453,7 @@ fn button_proc<M: GuestMemory + ?Sized>(
     let kind = window_style(ctx, hwnd) & 0xF;
     match msg {
         WM_PAINT => {
-            let ps = user::scratch(ctx, 64);
+            let ps = user::scratch(ctx, 80);
             let hdc = user::begin_paint(ctx, memory, hwnd, ps);
             paint_button(ctx, memory, hwnd, hdc);
             user::end_paint(ctx, hwnd, hdc);
@@ -621,7 +621,7 @@ fn static_proc<M: GuestMemory + ?Sized>(
 ) -> u32 {
     match msg {
         WM_PAINT => {
-            let ps = user::scratch(ctx, 64);
+            let ps = user::scratch(ctx, 80);
             let hdc = user::begin_paint(ctx, memory, hwnd, ps);
             let Some(window) = ctx.shared.borrow().gui.window(hwnd).cloned() else {
                 return 0;
@@ -1149,7 +1149,7 @@ fn edit_proc<M: GuestMemory + ?Sized>(
     let readonly = style & 0x800 != 0;
     match msg {
         WM_PAINT => {
-            let ps = user::scratch(ctx, 64);
+            let ps = user::scratch(ctx, 80);
             let hdc = user::begin_paint(ctx, memory, hwnd, ps);
             edit_paint(ctx, memory, hwnd, hdc);
             user::end_paint(ctx, hwnd, hdc);
@@ -1946,7 +1946,7 @@ fn listbox_proc<M: GuestMemory + ?Sized>(
     }
     match msg {
         WM_PAINT => {
-            let ps = user::scratch(ctx, 64);
+            let ps = user::scratch(ctx, 80);
             let hdc = user::begin_paint(ctx, memory, hwnd, ps);
             listbox_paint(ctx, memory, hwnd, hdc);
             user::end_paint(ctx, hwnd, hdc);
@@ -2244,7 +2244,7 @@ fn combo_proc<M: GuestMemory + ?Sized>(
     }
     match msg {
         WM_PAINT => {
-            let ps = user::scratch(ctx, 64);
+            let ps = user::scratch(ctx, 80);
             let hdc = user::begin_paint(ctx, memory, hwnd, ps);
             combo_paint(ctx, memory, hwnd, hdc);
             user::end_paint(ctx, hwnd, hdc);
@@ -2363,7 +2363,7 @@ fn scrollbar_proc<M: GuestMemory + ?Sized>(
     let vertical = window_style(ctx, hwnd) & 0x1 != 0;
     match msg {
         WM_PAINT => {
-            let ps = user::scratch(ctx, 64);
+            let ps = user::scratch(ctx, 80);
             let hdc = user::begin_paint(ctx, memory, hwnd, ps);
             let window = ctx.shared.borrow().gui.window(hwnd).cloned();
             if let Some(window) = window {

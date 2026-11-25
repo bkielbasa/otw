@@ -1648,8 +1648,10 @@ pub fn create_window<M: GuestMemory + ?Sized>(
         hwnd
     };
 
-    // CREATESTRUCTA in guest memory.
-    let cs = scratch(ctx, 64);
+    // CREATESTRUCT in guest memory, in the process's layout, followed by
+    // the CBT_CREATEWND that points to it.
+    let cs = scratch(ctx, 112);
+    let cs_view = crate::win32::x64::View::new(memory, &crate::win32::x64::CREATESTRUCT, cs);
     let fields = [
         params.param,
         params.instance,
@@ -1665,13 +1667,14 @@ pub fn create_window<M: GuestMemory + ?Sized>(
         ex_style,
     ];
     for (index, value) in fields.iter().enumerate() {
-        let _ = memory.write_u32(cs + index as u32 * 4, *value);
+        cs_view.set(memory, index, *value);
     }
 
     // WH_CBT HCBT_CREATEWND lets MFC subclass the window before WM_NCCREATE.
-    let cbt = cs + 48;
-    let _ = memory.write_u32(cbt, cs);
-    let _ = memory.write_u32(cbt + 4, 0);
+    let cbt = cs + crate::win32::x64::CREATESTRUCT.size(memory.ptr_size() == 8);
+    let cbt_view = crate::win32::x64::View::new(memory, &crate::win32::x64::CBT_CREATEWND, cbt);
+    cbt_view.set(memory, 0, cs);
+    cbt_view.set(memory, 1, 0);
     if let Some(result) = call_hooks(ctx, memory, 5, 0, 3, hwnd, cbt) {
         if result != 0 {
             destroy_window_record(ctx, hwnd);
@@ -2280,7 +2283,9 @@ pub fn set_window_pos<M: GuestMemory + ?Sized>(
         new = Rect::sized(new.left, new.top, cx.max(0), cy.max(0));
     }
     // WM_WINDOWPOSCHANGING lets the window adjust the new placement.
-    let wp = scratch(ctx, 32);
+    // WINDOWPOS in the process's layout.
+    let wp = scratch(ctx, 48);
+    let wp_view = crate::win32::x64::View::new(memory, &crate::win32::x64::WINDOWPOS, wp);
     let write_wp = |memory: &mut M, rect: Rect, flags: u32| {
         for (index, value) in [
             hwnd,
@@ -2294,7 +2299,7 @@ pub fn set_window_pos<M: GuestMemory + ?Sized>(
         .iter()
         .enumerate()
         {
-            let _ = memory.write_u32(wp + index as u32 * 4, *value);
+            wp_view.set(memory, index, *value);
         }
     };
     let moved = new.left != old.left || new.top != old.top;
@@ -2311,12 +2316,8 @@ pub fn set_window_pos<M: GuestMemory + ?Sized>(
         || effective & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED) != 0
     {
         send(ctx, memory, hwnd, WM_WINDOWPOSCHANGING, 0, wp);
-        let bytes = memory.read_bytes(wp + 8, 16).unwrap_or_default();
-        if bytes.len() == 16 {
-            let v =
-                |i: usize| i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-            new = Rect::sized(v(0), v(4), v(8).max(0), v(12).max(0));
-        }
+        let v = |memory: &mut M, index: usize| wp_view.get32(memory, index) as i32;
+        new = Rect::sized(v(memory, 2), v(memory, 3), v(memory, 4).max(0), v(memory, 5).max(0));
     }
     let moved = new.left != old.left || new.top != old.top;
     let sized = new.width() != old.width() || new.height() != old.height();
@@ -2442,7 +2443,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
     match msg {
         WM_NCCREATE => {
             if lparam != 0 {
-                let title_va = memory.read_u32(lparam + 36).unwrap_or(0);
+                let title_va = crate::win32::x64::View::new(memory, &crate::win32::x64::CREATESTRUCT, lparam).get32(memory, 9);
                 if title_va >= 0x10000 {
                     let title = read_cstr(memory, title_va);
                     let mut shared = ctx.shared.borrow_mut();
@@ -2505,7 +2506,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
             1
         }
         WM_PAINT => {
-            let ps = scratch(ctx, 64);
+            let ps = scratch(ctx, 80);
             let hdc = begin_paint(ctx, memory, hwnd, ps);
             end_paint(ctx, hwnd, hdc);
             free_scratch(ctx, ps);
@@ -2604,7 +2605,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
         }
         WM_WINDOWPOSCHANGED => {
             if lparam != 0 {
-                let flags = memory.read_u32(lparam + 24).unwrap_or(0);
+                let flags = crate::win32::x64::View::new(memory, &crate::win32::x64::WINDOWPOS, lparam).get32(memory, 6);
                 let (cw, ch, x, y) = {
                     let shared = ctx.shared.borrow();
                     match shared.gui.window(hwnd) {
@@ -2910,11 +2911,14 @@ pub fn begin_paint<M: GuestMemory + ?Sized>(
         true
     };
     if ps != 0 {
+        // PAINTSTRUCT in the process's layout: hdc, fErase, rcPaint, and
+        // the reserved rest zeroed.
         let bounds = update.bounds();
-        let _ = memory.write_u32(ps, hdc);
-        let _ = memory.write_u32(ps + 4, (!erased) as u32);
-        let _ = write_rect(memory, ps + 8, bounds);
-        let _ = memory.write_bytes(ps + 24, &[0u8; 40]);
+        let view = crate::win32::x64::View::new(memory, &crate::win32::x64::PAINTSTRUCT, ps);
+        view.set(memory, 0, hdc);
+        view.set(memory, 1, (!erased) as u32);
+        let _ = write_rect(memory, view.at(2), bounds);
+        let _ = memory.write_bytes(view.at(3), &[0u8; 40]);
     }
     hdc
 }
@@ -3677,7 +3681,7 @@ pub fn dispatch_message<M: GuestMemory + ?Sized>(
             .map(|w| !w.update.is_empty())
             .unwrap_or(false);
         if pending {
-            let ps = scratch(ctx, 64);
+            let ps = scratch(ctx, 80);
             let hdc = begin_paint(ctx, memory, message.hwnd, ps);
             end_paint(ctx, message.hwnd, hdc);
             free_scratch(ctx, ps);
@@ -5412,7 +5416,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         // ── Painting ──
         "BeginPaint" => ok(begin_paint(ctx, memory, args[0], args[1])),
         "EndPaint" => {
-            let hdc = memory.read_u32(args[1]).unwrap_or(0);
+            let hdc = crate::win32::x64::View::new(memory, &crate::win32::x64::PAINTSTRUCT, args[1]).get32(memory, 0);
             end_paint(ctx, args[0], hdc);
             ok(1)
         }

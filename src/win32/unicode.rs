@@ -485,15 +485,19 @@ pub fn convert_message<M: GuestMemory + ?Sized>(
         }
         copied
     } else if lparam != 0 && matches!(msg, WM_CREATE | WM_NCCREATE) {
-        // CREATESTRUCT: lpszName at 36, lpszClass at 40.
-        let block = memory.read_bytes(lparam, 48).unwrap_or_else(|| vec![0; 48]);
+        // CREATESTRUCT (in the process's layout): lpszName and lpszClass,
+        // fields 9 and 10.
+        let layout = crate::win32::x64::CREATESTRUCT;
+        let size = layout.size(memory.ptr_size() == 8) as usize;
+        let block = memory.read_bytes(lparam, size).unwrap_or_else(|| vec![0; size]);
         let copy = temps.bytes(ctx, memory, &block);
-        for offset in [36, 40] {
-            let va = u32::from_le_bytes(block[offset..offset + 4].try_into().unwrap());
+        let view = crate::win32::x64::View::new(memory, &layout, copy);
+        for index in [9, 10] {
+            let va = view.get32(memory, index);
             if va >= 0x10000 {
                 let text = read(memory, va);
                 let converted = if to_wide { temps.wide(ctx, memory, &text) } else { temps.bytes(ctx, memory, &wide_to_ansi(&text)) };
-                let _ = memory.write_u32(copy + offset as u32, converted);
+                view.set(memory, index, converted);
             }
         }
         call(memory, wparam, copy)

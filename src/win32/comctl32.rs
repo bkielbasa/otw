@@ -891,7 +891,7 @@ fn ensure_visible(ctx: &ApiContext, hwnd: u32, index: usize) {
 }
 
 fn paint_list<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
-    let ps = user::scratch(ctx, 64);
+    let ps = user::scratch(ctx, 80);
     let hdc = user::begin_paint(ctx, memory, hwnd, ps);
     let list = with_list(ctx, hwnd, |list| list.clone());
     let (width, height) = client_size(ctx, hwnd);
