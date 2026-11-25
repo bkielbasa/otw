@@ -11,7 +11,9 @@ use super::{
     syscall::ImportPolicy,
 };
 
-/// Where the command line string is placed in the main module's memory.
+/// Where the command line string is placed in the main module's memory,
+/// unless the image itself reaches that far: then it goes on the page after
+/// the image.
 pub const COMMAND_LINE_VA: u32 = 0x0050_0000;
 
 /// Pseudo-DLL name of entry points implemented by the kernel itself.
@@ -20,6 +22,8 @@ pub const KERNEL_DLL: &str = "OTW_KERNEL";
 /// faulting and raising threads continue here with an `EXCEPTION_RECORD`
 /// and `CONTEXT` on their stack.
 pub const EXCEPTION_DISPATCHER: &str = "KiUserExceptionDispatcher";
+/// Where a thread's start routine returns to: the thread ends.
+pub const THREAD_RETURN: &str = "ThreadReturn";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImageError {
@@ -67,7 +71,9 @@ impl Image {
             loader::load(inputs, policy).map_err(|error| ImageError::Loader(error.to_string()))?;
         let mut modules = result.modules;
         let image_base = modules[0].image.image_base;
-        let cmd_offset = COMMAND_LINE_VA
+        let image_end = image_base as usize + modules[0].memory.len();
+        let command_line_va = (COMMAND_LINE_VA as usize).max((image_end + 0xFFF) & !0xFFF) as u32;
+        let cmd_offset = command_line_va
             .checked_sub(image_base)
             .ok_or(ImageError::CommandLineOutsideImage)? as usize;
         let cmd_size = command_line.len() + 1;
@@ -78,7 +84,10 @@ impl Image {
             .copy_from_slice(format!("{command_line}\0").as_bytes());
 
         let mut entries = result.iat.entries.clone();
-        let kernel_entries = [(KERNEL_DLL.to_string(), EXCEPTION_DISPATCHER.to_string())];
+        let kernel_entries = [
+            (KERNEL_DLL.to_string(), EXCEPTION_DISPATCHER.to_string()),
+            (KERNEL_DLL.to_string(), THREAD_RETURN.to_string()),
+        ];
         for (dll, name) in entry_points.iter().chain(&kernel_entries) {
             let thunk_va = THUNK_BASE.wrapping_add(entries.len() as u32 * THUNK_STRIDE);
             entries.push(IatEntry {
@@ -91,7 +100,7 @@ impl Image {
         Ok(Self {
             modules,
             iat: Iat::from_entries(entries),
-            command_line_va: COMMAND_LINE_VA,
+            command_line_va,
         })
     }
 

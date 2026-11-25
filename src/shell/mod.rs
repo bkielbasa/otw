@@ -10,7 +10,6 @@
 
 pub mod icons;
 pub mod launch;
-pub mod lnk;
 pub mod popup;
 pub mod setup;
 pub mod volume;
@@ -24,6 +23,7 @@ use std::{
 use crate::{
     shell::launch::LaunchRequest,
     win32::gdi::sys_color,
+    win32::lnk,
     win32::gfx::{Rect, Region, Surface},
     win32::user::{self, text_width, Painter},
 };
@@ -31,7 +31,7 @@ use icons::{Bitmap, Builtin};
 use popup::{Anchor, Command, Item, Menu, Outcome, Style};
 use volume::{extension, join, parse_path, path_text, Entry, VolPath, Volume};
 
-pub const TASKBAR_HEIGHT: i32 = 28;
+pub use crate::win32::user::TASKBAR_HEIGHT;
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 const CELL_WIDTH: i32 = 75;
 const CELL_HEIGHT: i32 = 70;

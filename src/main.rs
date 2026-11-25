@@ -47,6 +47,7 @@ fn main() -> ExitCode {
     let mut list_files = None;
 
     let mut video_dump = None;
+    let mut guest_arguments: Option<String> = None;
     let mut extra_modules = Vec::new();
     let mut positional = Vec::new();
     let mut index = 0;
@@ -58,6 +59,14 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 video_dump = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            "--args" => {
+                if index + 1 >= args.len() {
+                    eprintln!("--args requires the program's arguments");
+                    return ExitCode::FAILURE;
+                }
+                guest_arguments = Some(args[index + 1].clone());
                 index += 2;
             }
             "--module" => {
@@ -215,6 +224,10 @@ fn main() -> ExitCode {
     }
 
     let (bytes, source) = match explicit_path {
+        // RUNDLL32.EXE is built in (the drive holds a placeholder).
+        Some(path) if path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("rundll32.exe")) => {
+            (otw_vm::vm::stub_program("OTW_RunDll32"), path.display().to_string())
+        }
         Some(path) => match fs::read(&path) {
             Ok(bytes) => (bytes, path.display().to_string()),
             Err(error) => {
@@ -285,10 +298,14 @@ fn main() -> ExitCode {
             .unwrap_or_else(|| "target.exe".to_owned()),
         image,
     )];
-    for (name, path, bytes) in discover_companion_modules(&source, &inputs[0].1) {
+    let mut module_paths = Vec::new();
+    for (name, path, bytes) in otw_vm::vm::companion_modules(Path::new(&source), &inputs[0].1) {
         match PeImage::parse(bytes) {
             Ok(dll) => {
                 println!("companion DLL: {name} ({})", path.display());
+                if let Some(guest) = otw_vm::win32::crt::guest_path_of(&path) {
+                    module_paths.push((name.clone(), guest));
+                }
                 inputs.push((name, dll));
             }
             Err(error) => eprintln!("ignoring {}: {error}", path.display()),
@@ -317,7 +334,30 @@ fn main() -> ExitCode {
         }
     }
 
-    let machine = match Vm::with_modules(inputs) {
+    // A program outside drive C: sees its own folder as drive D:, as if it
+    // ran from a CD.
+    if otw_vm::win32::crt::guest_path_of(Path::new(&source)).is_none() && std::env::var_os("OTW_DRIVE_D").is_none() {
+        if let Some(folder) = Path::new(&source).canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+            std::env::set_var("OTW_DRIVE_D", folder);
+        }
+    }
+    let guest_path = otw_vm::win32::crt::guest_path_of(std::path::Path::new(&source));
+    let machine = match guest_arguments.as_deref() {
+        // The command line starts with the program, as Windows passes it.
+        Some(arguments) => {
+            let program = guest_path
+                .as_ref()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .unwrap_or_else(|| inputs[0].0.clone());
+            Vm::with_modules_shared(
+                inputs,
+                std::rc::Rc::new(std::cell::RefCell::new(otw_vm::win32::SharedState::default())),
+                format!("\"{program}\" {arguments}"),
+            )
+        }
+        None => Vm::with_modules(inputs),
+    };
+    let machine = match machine {
         Ok(machine) => machine,
         Err(error) => {
             eprintln!("failed to build VM: {error}");
@@ -325,6 +365,12 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(path) = &guest_path {
+        machine.set_program_path(path);
+    }
+    for (name, path) in &module_paths {
+        machine.set_module_path(name, path);
+    }
     let implemented = machine.implemented_imports();
     println!(
         "mapped {} bytes; {} IAT thunks installed; {} imports have Rust handlers",
@@ -358,7 +404,7 @@ fn main() -> ExitCode {
             } else {
                 None
             };
-            let mut gui = match otw_vm::host::display::GuiRuntime::new_with_explorer(
+            let gui = match otw_vm::host::display::GuiRuntime::new_with_explorer(
                 machine.api_context().shared.clone(),
                 explorer_fs,
                 false,
@@ -370,8 +416,21 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Programs it starts show in the same display.
+            let gui = Rc::new(RefCell::new(gui));
+            let session = gui.borrow().session();
+            let child_gui = gui.clone();
+            let child_pump: Rc<dyn Fn(bool)> = Rc::new(move |block| {
+                if let Ok(mut gui) = child_gui.try_borrow_mut() {
+                    gui.pump(std::time::Duration::from_millis(if block { 15 } else { 0 }));
+                }
+            });
+            let display: Rc<dyn otw_vm::vm::ProgramDisplay> = session;
+            otw_vm::vm::NestedLauncher::new(Some(child_pump), Some(display))
+                .install(&machine.api_context().shared);
             machine.run_with_pump(Box::new(move |block| {
-                gui.pump(std::time::Duration::from_millis(if block { 15 } else { 0 }))
+                gui.borrow_mut()
+                    .pump(std::time::Duration::from_millis(if block { 15 } else { 0 }))
             }))
         }
         #[cfg(not(feature = "display"))]
@@ -380,6 +439,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     } else {
+        otw_vm::vm::NestedLauncher::new(None, None).install(&machine.api_context().shared);
         machine.run()
     };
 
@@ -569,51 +629,6 @@ fn load_default_kernel() -> Result<(Vec<u8>, String), String> {
     fs::read(HELLO_KERNEL_TARGET)
         .map(|bytes| (bytes, HELLO_KERNEL_TARGET.to_string()))
         .map_err(|error| error.to_string())
-}
-
-/// Find genuine DLLs next to the target whose names match its imports. These
-/// are mapped as real modules instead of being replaced by Rust stubs.
-fn discover_companion_modules(source: &str, image: &PeImage) -> Vec<(String, PathBuf, Vec<u8>)> {
-    let Some(directory) = Path::new(source).parent() else {
-        return Vec::new();
-    };
-    let wanted: Vec<String> = image
-        .imports
-        .iter()
-        .map(|dll| dll.dll.to_ascii_lowercase())
-        .collect();
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Vec::new();
-    };
-
-    let mut modules = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file()
-            || !path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
-        {
-            continue;
-        }
-        let Some(name) = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-        else {
-            continue;
-        };
-        if !wanted.iter().any(|dll| dll == &name.to_ascii_lowercase()) {
-            continue;
-        }
-        if win32::is_rust_backed_dll(&name) {
-            continue;
-        }
-        if let Ok(bytes) = fs::read(&path) {
-            modules.push((name, path, bytes));
-        }
-    }
-    modules.sort_by(|left, right| left.0.cmp(&right.0));
-    modules
 }
 
 #[cfg(feature = "embedded-target")]

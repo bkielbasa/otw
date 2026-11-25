@@ -10,6 +10,15 @@ pub const HEAP_BASE: u32 = 0x0080_0000;
 /// Size of the guest heap (120 MiB, ending at 0x0800_0000).
 pub const HEAP_SIZE: u32 = 0x0780_0000;
 
+/// What became of a thread given the CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadRun {
+    /// It waits again.
+    Waiting,
+    /// It ended with this exit code.
+    Exited(u32),
+}
+
 /// Minimal guest-memory view available to API handlers.
 pub trait GuestMemory {
     fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>>;
@@ -37,6 +46,51 @@ pub trait GuestMemory {
         _ecx: Option<u32>,
     ) -> Option<u32> {
         None
+    }
+
+    /// Map `size` bytes of zeroed memory at `preferred` when that range is
+    /// free, otherwise at the lowest free 64 KiB-aligned range above it.
+    /// Returns the address, or `None` without a running CPU or space.
+    fn map_region(&mut self, _preferred: u32, _size: u32) -> Option<u32> {
+        None
+    }
+
+    /// Create a thread of this process that will run `entry(param)` on a
+    /// stack of its own. Returns its ID; it runs once given the CPU.
+    fn create_thread(&mut self, _entry: u32, _param: u32, _stack_size: u32) -> Option<u32> {
+        None
+    }
+
+    /// The running thread (1 is the process's first thread).
+    fn current_thread(&self) -> u32 {
+        1
+    }
+
+    /// The running thread's TIB (FS:0).
+    fn current_tib(&self) -> u32 {
+        crate::kernel::cpu::TIB_BASE
+    }
+
+    /// Threads that are not on the CPU and have not ended.
+    fn waiting_threads(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// Give a waiting thread the CPU until it waits again or ends.
+    fn run_thread(&mut self, _id: u32) -> Option<ThreadRun> {
+        None
+    }
+
+    /// Take the running thread off the CPU when this call returns; the call
+    /// is made again when the thread next runs. False when the thread cannot
+    /// stop here: it is the first thread, or inside a callback.
+    fn suspend_thread(&mut self) -> bool {
+        false
+    }
+
+    /// End the running thread (not the first one) when this call returns.
+    fn end_thread(&mut self, _code: u32) -> bool {
+        false
     }
 
     /// Register values at the current API call (ESP points at the return

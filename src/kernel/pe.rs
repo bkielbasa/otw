@@ -130,6 +130,8 @@ pub struct PeImage {
     pub sections: Vec<Section>,
     pub imports: Vec<DllImport>,
     pub export_directory: Option<ExportDirectory>,
+    /// The base relocation directory (RVA, size), if the image has one.
+    pub relocations: Option<(u32, u32)>,
 }
 
 impl PeImage {
@@ -182,6 +184,14 @@ impl PeImage {
             0
         };
 
+        let relocations = if directory_count >= 6 {
+            let rva = read_u32(&bytes, optional + 96 + 5 * 8)?;
+            let size = read_u32(&bytes, optional + 96 + 5 * 8 + 4)?;
+            (rva != 0 && size != 0).then_some((rva, size))
+        } else {
+            None
+        };
+
         let section_table = optional + optional_size;
         if section_table
             .checked_add(section_count.saturating_mul(SECTION_HEADER_SIZE))
@@ -214,6 +224,7 @@ impl PeImage {
             sections,
             imports: Vec::new(),
             export_directory: None,
+            relocations,
         };
         if export_rva != 0 {
             image.export_directory = Some(image.parse_exports(export_rva, export_size)?);

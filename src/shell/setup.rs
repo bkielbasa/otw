@@ -5,10 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{
-    lnk::{self, ShellLink},
-    volume::{join, parse_path, VolPath, Volume},
-};
+use super::volume::{join, parse_path, VolPath, Volume};
+use crate::win32::lnk::{self, ShellLink};
 
 pub const WINDOWS: &str = "\\WINDOWS";
 pub const DESKTOP: &str = "\\WINDOWS\\Desktop";

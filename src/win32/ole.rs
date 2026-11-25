@@ -63,7 +63,8 @@ fn ole32_args(name: &str) -> Option<usize> {
         | "EnumFmt_QueryInterface" => 3,
         "DataObj_SetData" | "EnumFmt_Next" => 4,
         "DataObj_DAdvise" => 5,
-        "CoFreeUnusedLibraries" | "OleFlushClipboard" | "OleUninitialize" => 0,
+        "CoFreeUnusedLibraries" | "OleFlushClipboard" | "OleUninitialize" | "CoUninitialize" => 0,
+        "CoInitializeEx" => 2,
         "CoRevokeClassObject"
         | "CoTaskMemAlloc"
         | "CoTaskMemFree"
@@ -84,8 +85,7 @@ fn ole32_args(name: &str) -> Option<usize> {
         | "RevokeDragDrop"
         | "StgIsStorageFile"
         | "StgIsStorageILockBytes"
-        | "CoInitialize"
-        | "CoUninitialize" => 1,
+        | "CoInitialize" => 1,
         "CLSIDFromProgID"
         | "CLSIDFromString"
         | "CoDisconnectObject"
@@ -269,7 +269,12 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
     match (dll.as_str(), name) {
         ("ole32.dll", ImportName::ByName(name)) => crate::win32::storage::method_args(name)
+            .or_else(|| crate::win32::shelllink::arg_count(name))
+            .or_else(|| crate::win32::shellfolder::arg_count(name))
+            .or_else(|| crate::win32::bindctx::arg_count(name))
+            .or_else(|| crate::win32::catmgr::arg_count(name))
             .or_else(|| crate::win32::storage::api_args(name))
+            .or_else(|| crate::win32::com::arg_count(name))
             .or_else(|| ole32_args(name)),
         ("oleaut32.dll", ImportName::Ordinal(ordinal)) => oleaut32_args(*ordinal),
         ("winspool.drv", ImportName::ByName(name)) => match name.as_str() {
@@ -369,6 +374,29 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     || crate::win32::storage::api_args(name).is_some())
             {
                 return crate::win32::storage::dispatch(ctx, memory, name, args, count);
+            }
+            if lower == "ole32.dll" && crate::win32::catmgr::arg_count(name).is_some() {
+                return crate::win32::catmgr::dispatch(ctx, memory, name, args);
+            }
+            if lower == "ole32.dll" && crate::win32::bindctx::arg_count(name).is_some() {
+                return crate::win32::bindctx::dispatch(ctx, memory, name, args);
+            }
+            if lower == "ole32.dll" && crate::win32::shellfolder::arg_count(name).is_some() {
+                return crate::win32::shellfolder::dispatch(ctx, memory, name, args);
+            }
+            if lower == "ole32.dll" && crate::win32::shelllink::arg_count(name).is_some() {
+                return crate::win32::shelllink::dispatch(ctx, memory, name, args);
+            }
+            if lower == "ole32.dll" && crate::win32::com::arg_count(name).is_some() {
+                return crate::win32::com::dispatch(ctx, memory, name, args);
+            }
+            if lower == "ole32.dll" && name == "CoCreateInstance" {
+                // CoCreateInstance(clsid, outer, context, iid, out)
+                let clsid = memory.read_bytes(args[0], 16).unwrap_or_default();
+                if clsid == crate::win32::shelllink::CLSID_SHELL_LINK && args[1] == 0 {
+                    let iid = memory.read_bytes(args[3], 16).unwrap_or_default();
+                    return ok(crate::win32::shelllink::create(ctx, memory, &iid, args[4]));
+                }
             }
             if lower == "winspool.drv" {
                 return ok(match name.as_str() {
@@ -675,7 +703,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     out(memory, args[1], object);
                     ok(if object == 0 { E_OUTOFMEMORY } else { S_OK })
                 }
-                "OleInitialize" | "CoInitialize" => ok(S_OK),
+                "OleInitialize" | "CoInitialize" | "CoInitializeEx" => ok(S_OK),
                 "OleUninitialize" | "CoUninitialize" | "CoFreeUnusedLibraries" => ok(0),
                 "CoRegisterMessageFilter" => {
                     out(memory, args[1], 0);

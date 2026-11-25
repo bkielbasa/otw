@@ -170,6 +170,24 @@ pub fn build_vm(
     if request.path.to_ascii_lowercase().ends_with(".com") {
         return Err(LaunchError::Unsupported(request.name.clone()));
     }
+    // A program on drive C: starts as Explorer starts it: its full path on
+    // the command line, its folder as the current directory, and its DLLs
+    // found and named the way Windows loads them. Installers find their
+    // files beside themselves this way.
+    if let Volume::Host(_) = fs {
+        let guest = format!("C:{}", super::volume::path_text(&parse_path(&request.path)));
+        let folder = match guest.rsplit_once('\\') {
+            Some((folder, _)) if folder.len() > 2 => folder.to_string(),
+            _ => "C:\\".to_string(),
+        };
+        shared.borrow_mut().current_dir = folder.into_bytes();
+        let command_line = if request.arguments.is_empty() {
+            format!("\"{guest}\"")
+        } else {
+            format!("\"{guest}\" {}", request.arguments)
+        };
+        return Vm::from_drive(guest.as_bytes(), command_line.as_bytes(), shared).map_err(LaunchError::Vm);
+    }
     let bytes = fs
         .read(&parse_path(&request.path))
         .map_err(|error| LaunchError::Fat32(error.to_string()))?;
@@ -212,8 +230,11 @@ pub fn build_vm(
         inputs.push((dll, dll_image));
     }
 
-    Vm::with_modules_shared(inputs, shared, command_line)
-        .map_err(|error| LaunchError::Vm(error.to_string()))
+    let vm = Vm::with_modules_shared(inputs, shared, command_line)
+        .map_err(|error| LaunchError::Vm(error.to_string()))?;
+    let guest_path = format!("C:{}", super::volume::path_text(&parse_path(&request.path)));
+    vm.set_program_path(guest_path.as_bytes());
+    Ok(vm)
 }
 
 /// Start a program from the volume in a desktop session, running beside

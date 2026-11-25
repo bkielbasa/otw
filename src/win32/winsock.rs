@@ -101,6 +101,8 @@ pub struct WinSockState {
     sockets: HashMap<u32, SocketEntry>,
     /// Guest address of the buffer returned by `inet_ntoa`.
     inet_buffer: u32,
+    /// `select` calls whose thread came off the CPU, by thread.
+    selects: HashMap<u32, PendingSelect>,
 }
 
 impl fmt::Debug for WinSockState {
@@ -123,6 +125,7 @@ impl Default for WinSockState {
             next_socket: 1,
             sockets: HashMap::new(),
             inet_buffer: 0,
+            selects: HashMap::new(),
         }
     }
 }
@@ -185,6 +188,9 @@ fn io_error_code(error: &io::Error) -> u32 {
 }
 
 fn io_failure(state: &mut WinSockState, error: &io::Error, count: usize) -> ApiOutcome {
+    if std::env::var_os("OTW_TRACE_NET").is_some() {
+        eprintln!("[net] failed: {error}");
+    }
     fail(state, io_error_code(error), count)
 }
 
@@ -210,6 +216,61 @@ fn post_async(shared: &mut SharedState, handle: u32, event: u16) {
         // Low word: network event. High word: error code (success here).
         lparam: event as u32,
     });
+}
+
+/// The function a WSOCK32 (or 16-bit-era WINSOCK) export ordinal names;
+/// WinINet imports WSOCK32 by ordinal.
+pub fn ordinal_name(dll: &str, ordinal: u16) -> Option<&'static str> {
+    if !dll.eq_ignore_ascii_case("wsock32.dll") && !dll.eq_ignore_ascii_case("winsock.dll") {
+        return None;
+    }
+    Some(match ordinal {
+        1 => "accept",
+        2 => "bind",
+        3 => "closesocket",
+        4 => "connect",
+        5 => "getpeername",
+        6 => "getsockname",
+        7 => "getsockopt",
+        8 => "htonl",
+        9 => "htons",
+        10 => "inet_addr",
+        11 => "inet_ntoa",
+        12 => "ioctlsocket",
+        13 => "listen",
+        14 => "ntohl",
+        15 => "ntohs",
+        16 => "recv",
+        17 => "recvfrom",
+        18 => "select",
+        19 => "send",
+        20 => "sendto",
+        21 => "setsockopt",
+        22 => "shutdown",
+        23 => "socket",
+        51 => "gethostbyaddr",
+        52 => "gethostbyname",
+        53 => "getprotobyname",
+        54 => "getprotobynumber",
+        55 => "getservbyname",
+        56 => "getservbyport",
+        57 => "gethostname",
+        101 => "WSAAsyncSelect",
+        102 => "WSAAsyncGetHostByAddr",
+        103 => "WSAAsyncGetHostByName",
+        108 => "WSACancelAsyncRequest",
+        109 => "WSASetBlockingHook",
+        110 => "WSAUnhookBlockingHook",
+        111 => "WSAGetLastError",
+        112 => "WSASetLastError",
+        113 => "WSACancelBlockingCall",
+        114 => "WSAIsBlocking",
+        115 => "WSAStartup",
+        116 => "WSACleanup",
+        151 => "__WSAFDIsSet",
+        1107 => "WSARecvEx",
+        _ => return None,
+    })
 }
 
 /// Number of dwords the guest pushes for each stdcall import.
@@ -257,6 +318,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
     let count = arg_count(name)?;
     if args.len() < count {
         return None;
+    }
+    if name == "select" {
+        return Some(select_waiting(ctx, memory, args, count));
     }
     // One borrow for the whole call: helpers receive `&mut SharedState` so no
     // nested `RefCell::borrow_mut` can panic.
@@ -374,7 +438,6 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 Err(error) => io_failure(&mut shared.winsock, &error, count),
             }
         }
-        "select" => select(&mut shared, memory, args, count),
         "ioctlsocket" => ioctlsocket(&mut shared, memory, args, count),
         "setsockopt" => {
             if shared.winsock.sockets.contains_key(&args[0]) {
@@ -496,16 +559,17 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         "inet_addr" => {
             let text = read_cstr_limited(memory, args[0], 16);
             match parse_ipv4(&text) {
+                // An in_addr: the octets in network order in memory.
                 Some(address) => ok(
                     &mut shared.winsock,
-                    u32::from_be_bytes(address.octets()),
+                    u32::from_le_bytes(address.octets()),
                     count,
                 ),
                 None => ok(&mut shared.winsock, INVALID_SOCKET, count),
             }
         }
         "inet_ntoa" => {
-            let address = Ipv4Addr::from(args[0].to_be_bytes());
+            let address = Ipv4Addr::from(args[0].to_le_bytes());
             let text = address.to_string();
             let buffer = if shared.winsock.inet_buffer == 0 {
                 let va = shared.bump_alloc(16);
@@ -595,14 +659,16 @@ fn write_wsadata<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, version: u16)
     if va == 0 {
         return None;
     }
-    // sizeof(WSADATA) == 528 with the default 4-byte packing.
-    let mut data = vec![0u8; 528];
+    // WSADATA: wVersion, wHighVersion, szDescription[257],
+    // szSystemStatus[129], iMaxSockets, iMaxUdpDg, lpVendorInfo (at 396,
+    // aligned): 400 bytes. Writing more overruns callers' stack buffers.
+    let mut data = vec![0u8; 400];
     data[0..2].copy_from_slice(&version.to_le_bytes());
     data[2..4].copy_from_slice(&0x0101u16.to_le_bytes());
     put_cstr(&mut data[4..261], b"WinSock 1.1");
-    put_cstr(&mut data[261..519], b"Running");
-    data[520..522].copy_from_slice(&256u16.to_le_bytes());
-    data[522..524].copy_from_slice(&8192u16.to_le_bytes());
+    put_cstr(&mut data[261..390], b"Running");
+    data[390..392].copy_from_slice(&256u16.to_le_bytes());
+    data[392..394].copy_from_slice(&8192u16.to_le_bytes());
     memory.write_bytes(va, &data)
 }
 
@@ -867,10 +933,16 @@ fn bind<M: GuestMemory + ?Sized>(
     };
     match bound {
         Ok(kind) => {
+            // The address the host gave (port 0 asks for any free port).
+            let actual = match &kind {
+                GuestSocket::TcpListener { listener, .. } => listener.local_addr().ok().and_then(ipv4),
+                GuestSocket::Udp(socket) => socket.local_addr().ok().and_then(ipv4),
+                _ => None,
+            };
             let entry = shared.winsock.sockets.get_mut(&args[0]).unwrap();
             entry.kind = kind;
             entry.nonblocking = nonblocking;
-            entry.local_addr = Some(address);
+            entry.local_addr = Some(actual.unwrap_or(address));
             ok(&mut shared.winsock, 0, count)
         }
         Err(error) => io_failure(&mut shared.winsock, &error, count),
@@ -897,7 +969,23 @@ fn connect<M: GuestMemory + ?Sized>(
             shared.winsock.sockets[&args[0]].nonblocking,
         ),
         GuestSocket::TcpStream(_) => return fail(&mut shared.winsock, WSAEISCONN, count),
-        GuestSocket::Udp(_) => return ok(&mut shared.winsock, 0, count),
+        GuestSocket::Udp(socket) => {
+            // A bound datagram socket gets a default peer.
+            let result = socket.connect(address);
+            return match result {
+                Ok(()) => {
+                    shared.winsock.sockets.get_mut(&args[0]).unwrap().remote_addr = Some(address);
+                    ok(&mut shared.winsock, 0, count)
+                }
+                Err(error) => io_failure(&mut shared.winsock, &error, count),
+            };
+        }
+        // A stream socket bound (WinINet binds to any address and port 0
+        // first) but not accepting yet connects like a fresh one; the host
+        // picks its local address.
+        GuestSocket::TcpListener { pending, .. } if pending.is_empty() => {
+            (AF_INET as i32, SOCK_STREAM, 0, shared.winsock.sockets[&args[0]].nonblocking)
+        }
         GuestSocket::TcpListener { .. } => return fail(&mut shared.winsock, WSAEOPNOTSUPP, count),
     };
     if af != AF_INET as i32 {
@@ -909,8 +997,11 @@ fn connect<M: GuestMemory + ?Sized>(
     {
         return fail(&mut shared.winsock, WSAEPROTONOSUPPORT, count);
     }
+    if std::env::var_os("OTW_TRACE_NET").is_some() {
+        eprintln!("[net] connect socket {} to {address}", args[0]);
+    }
     let result = match kind {
-        SOCK_STREAM => TcpStream::connect(address).map(|stream| {
+        SOCK_STREAM => TcpStream::connect_timeout(&address.into(), Duration::from_secs(20)).map(|stream| {
             let _ = stream.set_nonblocking(nonblocking);
             GuestSocket::TcpStream(stream)
         }),
@@ -1150,14 +1241,26 @@ fn write_fd_set<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, sockets: &[u32
 }
 
 fn is_readable(entry: &mut SocketEntry) -> bool {
+    // Probes never block: the socket is non-blocking for the peek and then
+    // restored to the guest's mode.
+    let restore = !entry.nonblocking;
+    let mut probe = [0u8; 1];
     match &mut entry.kind {
         GuestSocket::TcpStream(stream) => {
-            let mut probe = [0u8; 1];
-            !matches!(stream.peek(&mut probe), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock)
+            let _ = stream.set_nonblocking(true);
+            let ready = !matches!(stream.peek(&mut probe), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock);
+            if restore {
+                let _ = stream.set_nonblocking(false);
+            }
+            ready
         }
         GuestSocket::Udp(socket) => {
-            let mut probe = [0u8; 1];
-            !matches!(socket.peek(&mut probe), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock)
+            let _ = socket.set_nonblocking(true);
+            let ready = !matches!(socket.peek(&mut probe), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock);
+            if restore {
+                let _ = socket.set_nonblocking(false);
+            }
+            ready
         }
         GuestSocket::TcpListener { listener, pending } => {
             if !pending.is_empty() {
@@ -1176,57 +1279,105 @@ fn is_readable(entry: &mut SocketEntry) -> bool {
     }
 }
 
-fn select<M: GuestMemory + ?Sized>(
+/// A `select` waiting off the CPU: its deadline and the sockets it reads
+/// and writes.
+struct PendingSelect {
+    deadline: Option<Instant>,
+    read: Vec<u32>,
+    write: Vec<u32>,
+}
+
+/// Whether a thread waiting in `select` can go on: `None` when it is not
+/// in `select`.
+pub fn select_ready(shared: &mut SharedState, thread: u32) -> Option<bool> {
+    let state = &mut shared.winsock;
+    let pending = state.selects.get(&thread)?;
+    if pending.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Some(true);
+    }
+    let (read, write) = (pending.read.clone(), pending.write.clone());
+    let writable = write.iter().any(|h| state.sockets.get(h).is_some_and(|e| !matches!(e.kind, GuestSocket::Unbound { .. } | GuestSocket::TcpListener { .. })));
+    Some(writable || read.iter().any(|h| state.entry(*h).is_some_and(is_readable)))
+}
+
+/// `select`: sockets are polled; while none is ready and the timeout has
+/// not passed, a thread that can come off the CPU does (the call is made
+/// again when it next runs), so the program's other threads keep running.
+fn select_waiting<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, args: &[u32], count: usize) -> ApiOutcome {
+    let thread = memory.current_thread();
+    let deadline = match ctx.shared.borrow_mut().winsock.selects.remove(&thread) {
+        Some(pending) => pending.deadline,
+        None if args[4] == 0 => None,
+        None => {
+            let seconds = memory.read_u32(args[4]).unwrap_or(0);
+            let micros = memory.read_u32(args[4].wrapping_add(4)).unwrap_or(0);
+            Some(Instant::now() + Duration::from_secs(seconds as u64) + Duration::from_micros(micros as u64))
+        }
+    };
+    loop {
+        let expired = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if let Some(outcome) = select_poll(&mut ctx.shared.borrow_mut(), memory, args, count, expired) {
+            return outcome;
+        }
+        let suspended = memory.suspend_thread();
+        if std::env::var_os("OTW_TRACE_THREADS").is_some() {
+            eprintln!("[thread] {thread} select: not ready, suspended={suspended} deadline in {:?}", deadline.map(|d| d.saturating_duration_since(Instant::now())));
+        }
+        if suspended {
+            let read = read_fd_set(memory, args[1]).unwrap_or_default();
+            let write = read_fd_set(memory, args[2]).unwrap_or_default();
+            ctx.shared.borrow_mut().winsock.selects.insert(thread, PendingSelect { deadline, read, write });
+            return ApiOutcome::new(0, count);
+        }
+        if crate::win32::sync::run_ready_threads(ctx, memory) {
+            continue;
+        }
+        if memory.stopping() {
+            return select_poll(&mut ctx.shared.borrow_mut(), memory, args, count, true).expect("expired");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// One look at the sockets of a `select`: the result when some are ready
+/// or the time is up.
+fn select_poll<M: GuestMemory + ?Sized>(
     shared: &mut SharedState,
     memory: &mut M,
     args: &[u32],
     count: usize,
-) -> ApiOutcome {
+    expired: bool,
+) -> Option<ApiOutcome> {
     let read = read_fd_set(memory, args[1]).unwrap_or_default();
     let write = read_fd_set(memory, args[2]).unwrap_or_default();
     let except = read_fd_set(memory, args[3]).unwrap_or_default();
-
-    let deadline = if args[4] == 0 {
-        None
-    } else {
-        let seconds = memory.read_u32(args[4]).unwrap_or(0);
-        let micros = memory.read_u32(args[4].wrapping_add(4)).unwrap_or(0);
-        Some(
-            Instant::now()
-                + Duration::from_secs(seconds as u64)
-                + Duration::from_micros(micros as u64),
-        )
-    };
-
-    loop {
-        let mut ready_read = Vec::new();
-        for handle in &read {
-            if let Some(entry) = shared.winsock.entry(*handle) {
-                if is_readable(entry) {
-                    ready_read.push(*handle);
-                }
+    for handle in read.iter().chain(&write).chain(&except) {
+        if !shared.winsock.sockets.contains_key(handle) {
+            return Some(fail(&mut shared.winsock, WSAENOTSOCK, count));
+        }
+    }
+    let mut ready_read = Vec::new();
+    for handle in &read {
+        if let Some(entry) = shared.winsock.entry(*handle) {
+            if is_readable(entry) {
+                ready_read.push(*handle);
             }
         }
-        let ready_write: Vec<u32> = write
-            .iter()
-            .copied()
-            .filter(|handle| shared.winsock.sockets.contains_key(handle))
-            .collect();
-        let ready_except: Vec<u32> = except
-            .iter()
-            .copied()
-            .filter(|handle| shared.winsock.sockets.contains_key(handle))
-            .collect();
-        let total = ready_read.len() + ready_write.len() + ready_except.len();
-
-        if total != 0 || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let _ = write_fd_set(memory, args[1], &ready_read);
-            let _ = write_fd_set(memory, args[2], &ready_write);
-            let _ = write_fd_set(memory, args[3], &ready_except);
-            return ok(&mut shared.winsock, total as u32, count);
-        }
-        std::thread::sleep(Duration::from_millis(5));
     }
+    let ready_write: Vec<u32> = write
+        .iter()
+        .copied()
+        .filter(|handle| shared.winsock.sockets.get(handle).is_some_and(|e| !matches!(e.kind, GuestSocket::Unbound { .. } | GuestSocket::TcpListener { .. })))
+        .collect();
+    let ready_except: Vec<u32> = Vec::new();
+    let total = ready_read.len() + ready_write.len() + ready_except.len();
+    if total == 0 && !expired {
+        return None;
+    }
+    let _ = write_fd_set(memory, args[1], &ready_read);
+    let _ = write_fd_set(memory, args[2], &ready_write);
+    let _ = write_fd_set(memory, args[3], &ready_except);
+    Some(ok(&mut shared.winsock, total as u32, count))
 }
 
 fn ioctlsocket<M: GuestMemory + ?Sized>(
@@ -1301,13 +1452,16 @@ fn build_hostent<M: GuestMemory + ?Sized>(
     if addresses.is_empty() {
         return None;
     }
-    let (name_va, list_va, address_va, hostent_va) = (
+    let (name_va, list_va, address_va, hostent_va, aliases_va) = (
         shared.bump_alloc((name.len() + 1) as u32),
         shared.bump_alloc(((addresses.len() + 1) * 4) as u32),
         shared.bump_alloc((addresses.len() * 4) as u32),
         shared.bump_alloc(16),
+        shared.bump_alloc(4),
     );
     memory.write_bytes(name_va, format!("{name}\0").as_bytes())?;
+    // No aliases: an empty list, never a null pointer (WinINet walks it).
+    memory.write_u32(aliases_va, 0)?;
     for (index, address) in addresses.iter().enumerate() {
         let entry = address_va.wrapping_add(index as u32 * 4);
         memory.write_bytes(entry, &address.octets())?;
@@ -1317,6 +1471,7 @@ fn build_hostent<M: GuestMemory + ?Sized>(
 
     let mut hostent = [0u8; 16];
     hostent[0..4].copy_from_slice(&name_va.to_le_bytes());
+    hostent[4..8].copy_from_slice(&aliases_va.to_le_bytes());
     hostent[8..10].copy_from_slice(&AF_INET.to_le_bytes());
     hostent[10..12].copy_from_slice(&4u16.to_le_bytes());
     hostent[12..16].copy_from_slice(&list_va.to_le_bytes());

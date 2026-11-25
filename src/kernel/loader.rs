@@ -150,7 +150,8 @@ pub fn load(
     })
 }
 
-fn map_image(name: &str, image: &PeImage) -> Result<Vec<u8>, LoadError> {
+/// Lay out a PE image's headers and sections as they appear in memory.
+pub fn map_image(name: &str, image: &PeImage) -> Result<Vec<u8>, LoadError> {
     let size = image.size_of_image as usize;
     if size < image.size_of_headers as usize {
         return Err(LoadError::SectionOutsideImage(
@@ -234,4 +235,41 @@ fn resolve_export(
         return resolve_export(modules, target, &symbol, depth + 1);
     }
     Some(modules[index].image.image_base.wrapping_add(rva))
+}
+
+/// Apply base relocations to a mapped image moved by `delta` bytes from its
+/// preferred base. Only 32-bit (HIGHLOW) fixups occur in 32-bit images.
+pub fn relocate(memory: &mut [u8], relocations: Option<(u32, u32)>, delta: u32) {
+    let Some((rva, size)) = relocations else {
+        return;
+    };
+    let read = |memory: &[u8], at: usize| {
+        memory
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let mut block = rva as usize;
+    let end = (rva as usize + size as usize).min(memory.len());
+    while block + 8 <= end {
+        let (Some(page), Some(length)) = (read(memory, block), read(memory, block + 4)) else {
+            break;
+        };
+        if length < 8 {
+            break;
+        }
+        for entry in (block + 8..block + length as usize).step_by(2) {
+            let Some(bytes) = memory.get(entry..entry + 2) else {
+                break;
+            };
+            let value = u16::from_le_bytes([bytes[0], bytes[1]]);
+            if value >> 12 != 3 {
+                continue;
+            }
+            let at = page as usize + (value & 0xFFF) as usize;
+            if let Some(old) = read(memory, at) {
+                memory[at..at + 4].copy_from_slice(&old.wrapping_add(delta).to_le_bytes());
+            }
+        }
+        block += length as usize;
+    }
 }

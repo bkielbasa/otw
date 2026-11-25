@@ -17,8 +17,8 @@ use unicorn_engine::{
 
 use super::{
     iat::THUNK_BASE,
-    image::{Image, EXCEPTION_DISPATCHER, KERNEL_DLL},
-    memory::{self, GuestMemory, HEAP_BASE, HEAP_SIZE},
+    image::{Image, EXCEPTION_DISPATCHER, KERNEL_DLL, THREAD_RETURN},
+    memory::{self, GuestMemory, ThreadRun, HEAP_BASE, HEAP_SIZE},
     syscall::SystemCalls,
 };
 
@@ -60,6 +60,9 @@ const SENTINEL_BASE: u32 = 0x6FFF_0000;
 /// Top-level emulation runs until EIP reaches this address; a program that
 /// yields jumps here, which ends the run like the sentinel ends callbacks.
 const YIELD_ADDRESS: u32 = SENTINEL_BASE + 0x100;
+/// A thread given the CPU by another runs until EIP reaches this address:
+/// it waits again or has ended.
+const THREAD_STOP: u32 = SENTINEL_BASE + 0x200;
 /// Synthetic Win95 loader state. Real KERNEL32 receives these pointers in a
 /// private initialisation block from the Win95 loader; the PE entry point is
 /// not a normal DllMain. Providing the same globals lets genuine KERNEL32 code
@@ -133,6 +136,56 @@ struct RunState<'a> {
     yielded: bool,
     /// The API thunk to call again when a yielded program resumes.
     yield_eip: u32,
+    /// Threads that are off the CPU.
+    threads: Vec<ThreadSlot>,
+    /// Threads on the CPU, the first thread first: each runs nested inside
+    /// a wait of the one before it.
+    running: Vec<u32>,
+    /// Each thread's TIB.
+    tibs: Vec<(u32, u32)>,
+    next_thread: u32,
+    /// The running thread is to come off the CPU after its current call.
+    thread_signal: Option<ThreadSignal>,
+    /// The thunk start routines return to.
+    thread_return: u32,
+}
+
+/// A thread off the CPU.
+struct ThreadSlot {
+    id: u32,
+    context: unicorn_engine::Context,
+    /// Its callback levels (empty: it stopped at its own top level).
+    levels: Vec<u32>,
+    callback_depth: usize,
+    /// The API thunk to call again when it next runs.
+    retry_eip: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ThreadSignal {
+    Suspend,
+    Exit(u32),
+}
+
+/// The FS descriptor: a data segment based at a TIB.
+fn fs_descriptor(base: u32) -> [u8; 8] {
+    let limit = TIB_SIZE - 1;
+    [
+        limit as u8,
+        (limit >> 8) as u8,
+        base as u8,
+        (base >> 8) as u8,
+        (base >> 16) as u8,
+        0x92, // present, DPL 0, data segment, read/write
+        0x40, // 32-bit segment, byte granularity
+        (base >> 24) as u8,
+    ]
+}
+
+/// Point FS at another TIB.
+fn set_fs_base(uc: &mut Unicorn<'_, ()>, base: u32) -> Result<(), uc_error> {
+    uc.mem_write((GDT_BASE + FS_SELECTOR) as u64, &fs_descriptor(base))?;
+    uc.reg_write(Reg::FS, FS_SELECTOR as u64)
 }
 
 /// A hardware fault to deliver as a Win32 exception.
@@ -169,6 +222,12 @@ impl Fault {
 }
 
 /// Raise the pending fault in the guest, as Windows does: push an
+/// The running thread's TIB.
+fn current_tib(state: &RunState<'_>) -> u32 {
+    let id = state.running.last().copied().unwrap_or(1);
+    state.tibs.iter().find(|(t, _)| *t == id).map(|(_, b)| *b).unwrap_or(TIB_BASE)
+}
+
 /// EXCEPTION_RECORD and CONTEXT for the faulting instruction onto the
 /// thread's stack and continue in the exception dispatcher, which walks the
 /// SEH chain. Returns false when there is nothing to deliver.
@@ -187,9 +246,28 @@ fn deliver_fault(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>) ->
     eprintln!("[eh] {}", fault.describe());
     let read = |uc: &Unicorn<'_, ()>, register| uc.reg_read(register).unwrap_or(0) as u32;
     let esp = read(uc, Reg::ESP);
+    if std::env::var_os("OTW_TRACE_FAULTS").is_some() {
+        let mut words = [0u8; 32];
+        let _ = uc.mem_read(esp as u64, &mut words);
+        let stack: Vec<String> = words.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes([w[0], w[1], w[2], w[3]]))).collect();
+        eprintln!(
+            "[eh] eax={:08x} ebx={:08x} ecx={:08x} edx={:08x} esi={:08x} edi={:08x} ebp={:08x} esp={esp:08x} stack {}",
+            read(uc, Reg::EAX), read(uc, Reg::EBX), read(uc, Reg::ECX), read(uc, Reg::EDX),
+            read(uc, Reg::ESI), read(uc, Reg::EDI), read(uc, Reg::EBP), stack.join(" ")
+        );
+    }
     // Below the faulting frame: return address, &record, &context, record, context.
     let base = esp.wrapping_sub(0x40 + 12 + RECORD_SIZE + CONTEXT_SIZE) & !0xF;
-    if dispatcher == 0 || !(STACK_BASE + 0x1000..STACK_TOP).contains(&base) {
+    // The faulting thread's own stack (its TIB holds the bounds).
+    let (stack_base, stack_top) = {
+        let tib = current_tib(&state.borrow());
+        let mut bounds = [0u8; 8];
+        let _ = uc.mem_read(tib as u64 + 4, &mut bounds);
+        let top = u32::from_le_bytes([bounds[0], bounds[1], bounds[2], bounds[3]]);
+        let bottom = u32::from_le_bytes([bounds[4], bounds[5], bounds[6], bounds[7]]);
+        (bottom, top)
+    };
+    if dispatcher == 0 || !(stack_base + 0x1000..stack_top).contains(&base) {
         state.borrow_mut().error = Some(format!(
             "{} (cannot raise it: stack overflow)",
             fault.describe()
@@ -402,6 +480,207 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         Some(eax)
     }
 
+    fn map_region(&mut self, preferred: u32, size: u32) -> Option<u32> {
+        const GRANULE: u64 = 0x1_0000;
+        let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+        let regions: Vec<(u64, u64)> = self
+            .uc
+            .mem_regions()
+            .ok()?
+            .iter()
+            .map(|region| (region.begin, region.end))
+            .collect();
+        let free = |start: u64| {
+            start >= GRANULE
+                && start + size <= 0xC000_0000
+                && regions.iter().all(|&(begin, end)| start + size <= begin || start > end)
+        };
+        let mut start = (preferred as u64) & !(PAGE_SIZE as u64 - 1);
+        if !free(start) {
+            start = ((preferred as u64).max(0x1000_0000) + GRANULE - 1) & !(GRANULE - 1);
+            while start + size <= 0xC000_0000 && !free(start) {
+                start += GRANULE;
+            }
+            if !free(start) {
+                return None;
+            }
+        }
+        self.uc.mem_map(start, size, Prot::ALL).ok()?;
+        Some(start as u32)
+    }
+
+    fn create_thread(&mut self, entry: u32, param: u32, stack_size: u32) -> Option<u32> {
+        let run = self.run?;
+        let stack_size = align_up(stack_size.clamp(0x1_0000, 0x100_0000), PAGE_SIZE);
+        let stack = self.map_region(0x1000_0000, stack_size)?;
+        let tib = self.map_region(0x1000_0000, PAGE_SIZE)?;
+        // A copy of the first thread's TIB with its own exception chain,
+        // stack bounds and self pointer.
+        let top = stack + stack_size;
+        let mut page = self.uc.mem_read_as_vec(TIB_BASE as u64, TIB_SIZE as usize).ok()?;
+        for (offset, value) in [(0usize, u32::MAX), (4, top), (8, stack), (0x18, tib)] {
+            page[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        self.uc.mem_write(tib as u64, &page).ok()?;
+        // The start routine returns to the thread-end thunk.
+        let esp = top - 0x10;
+        let thread_return = run.borrow().thread_return;
+        let mut frame = thread_return.to_le_bytes().to_vec();
+        frame.extend_from_slice(&param.to_le_bytes());
+        self.uc.mem_write(esp as u64, &frame).ok()?;
+        // Its registers: the running thread's, with the new stack, TIB and
+        // start address.
+        let mut current = self.uc.context_alloc().ok()?;
+        self.uc.context_save(&mut current).ok()?;
+        set_fs_base(self.uc, tib).ok()?;
+        for (register, value) in [
+            (Reg::ESP, esp),
+            (Reg::EBP, 0),
+            (Reg::EIP, entry),
+            (Reg::EAX, 0),
+            (Reg::EBX, 0),
+            (Reg::ECX, 0),
+            (Reg::EDX, 0),
+            (Reg::ESI, 0),
+            (Reg::EDI, 0),
+            (Reg::EFLAGS, 0x202),
+        ] {
+            self.uc.reg_write(register, value as u64).ok()?;
+        }
+        let mut context = self.uc.context_alloc().ok()?;
+        self.uc.context_save(&mut context).ok()?;
+        let current_tib = {
+            let state = run.borrow();
+            let id = *state.running.last()?;
+            state.tibs.iter().find(|(t, _)| *t == id).map(|(_, b)| *b)?
+        };
+        let _ = self.uc.mem_write((GDT_BASE + FS_SELECTOR) as u64, &fs_descriptor(current_tib));
+        self.uc.context_restore(&current).ok()?;
+        let mut state = run.borrow_mut();
+        let id = state.next_thread;
+        state.next_thread += 1;
+        state.tibs.push((id, tib));
+        state.threads.push(ThreadSlot {
+            id,
+            context,
+            levels: Vec::new(),
+            callback_depth: 0,
+            retry_eip: None,
+        });
+        Some(id)
+    }
+
+    fn current_thread(&self) -> u32 {
+        self.run
+            .and_then(|run| run.borrow().running.last().copied())
+            .unwrap_or(1)
+    }
+
+    fn current_tib(&self) -> u32 {
+        self.run.map(|run| current_tib(&run.borrow())).unwrap_or(TIB_BASE)
+    }
+
+    fn waiting_threads(&self) -> Vec<u32> {
+        self.run
+            .map(|run| run.borrow().threads.iter().map(|t| t.id).collect())
+            .unwrap_or_default()
+    }
+
+    fn run_thread(&mut self, id: u32) -> Option<ThreadRun> {
+        let run = self.run?;
+        let slot = {
+            let mut state = run.borrow_mut();
+            if state.exit_code.is_some() || state.error.is_some() || state.resume.is_some() {
+                return None;
+            }
+            let index = state.threads.iter().position(|t| t.id == id)?;
+            state.threads.remove(index)
+        };
+        let mut current = self.uc.context_alloc().ok()?;
+        self.uc.context_save(&mut current).ok()?;
+        let (outer_levels, outer_depth, outer_tib) = {
+            let mut state = run.borrow_mut();
+            let outer_id = *state.running.last().unwrap_or(&1);
+            let outer_tib = state.tibs.iter().find(|(t, _)| *t == outer_id).map(|(_, b)| *b).unwrap_or(TIB_BASE);
+            let levels = std::mem::replace(&mut state.levels, slot.levels);
+            let depth = std::mem::replace(&mut state.callback_depth, slot.callback_depth);
+            state.running.push(id);
+            (levels, depth, outer_tib)
+        };
+        let tib = run.borrow().tibs.iter().find(|(t, _)| *t == id).map(|(_, b)| *b).unwrap_or(TIB_BASE);
+        let _ = self.uc.mem_write((GDT_BASE + FS_SELECTOR) as u64, &fs_descriptor(tib));
+        let _ = self.uc.context_restore(&slot.context);
+        let begin = slot
+            .retry_eip
+            .unwrap_or_else(|| self.uc.reg_read(Reg::EIP).unwrap_or(0) as u32);
+        let result = emulate(self.uc, run, begin, THREAD_STOP, 0, 0);
+        let signal = run.borrow_mut().thread_signal.take();
+        let outcome = match signal {
+            Some(ThreadSignal::Suspend) => {
+                let retry = run.borrow().yield_eip;
+                let mut context = self.uc.context_alloc().ok()?;
+                let _ = self.uc.context_save(&mut context);
+                let mut state = run.borrow_mut();
+                let levels = std::mem::take(&mut state.levels);
+                let depth = state.callback_depth;
+                state.threads.push(ThreadSlot {
+                    id,
+                    context,
+                    levels,
+                    callback_depth: depth,
+                    retry_eip: Some(retry),
+                });
+                ThreadRun::Waiting
+            }
+            Some(ThreadSignal::Exit(code)) => ThreadRun::Exited(code),
+            None => {
+                let mut state = run.borrow_mut();
+                if let Err(error) = result {
+                    if state.error.is_none() && state.exit_code.is_none() {
+                        state.error = Some(format!("thread {id} failed: {error:?}"));
+                    }
+                }
+                ThreadRun::Exited(0)
+            }
+        };
+        {
+            let mut state = run.borrow_mut();
+            state.levels = outer_levels;
+            state.callback_depth = outer_depth;
+            state.running.pop();
+            if matches!(outcome, ThreadRun::Exited(_)) {
+                state.tibs.retain(|(t, _)| *t != id);
+            }
+        }
+        let _ = self.uc.mem_write((GDT_BASE + FS_SELECTOR) as u64, &fs_descriptor(outer_tib));
+        let _ = self.uc.context_restore(&current);
+        Some(outcome)
+    }
+
+    fn suspend_thread(&mut self) -> bool {
+        let Some(run) = self.run else {
+            return false;
+        };
+        let mut state = run.borrow_mut();
+        if state.running.len() < 2 || !state.levels.is_empty() || state.resume.is_some() {
+            return false;
+        }
+        state.thread_signal = Some(ThreadSignal::Suspend);
+        true
+    }
+
+    fn end_thread(&mut self, code: u32) -> bool {
+        let Some(run) = self.run else {
+            return false;
+        };
+        let mut state = run.borrow_mut();
+        if state.running.len() < 2 || !state.levels.is_empty() {
+            return false;
+        }
+        state.thread_signal = Some(ThreadSignal::Exit(code));
+        true
+    }
+
     fn registers(&mut self) -> Option<memory::Registers> {
         let read = |uc: &Unicorn<'_, ()>, register| uc.reg_read(register).map(|v| v as u32).ok();
         Some(memory::Registers {
@@ -440,6 +719,7 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
                 let state = run.borrow();
                 state.can_yield
                     && state.levels.is_empty()
+                    && state.running.len() == 1
                     && state.resume.is_none()
                     && state.exit_code.is_none()
                     && state.error.is_none()
@@ -851,12 +1131,31 @@ fn build<'a>(
         .map_err(|error| RunError::Unicorn("writing DllMain sentinel", error))?;
     uc.mem_write(YIELD_ADDRESS as u64, &[0xC3])
         .map_err(|error| RunError::Unicorn("writing yield address", error))?;
+    uc.mem_write(THREAD_STOP as u64, &[0xC3])
+        .map_err(|error| RunError::Unicorn("writing thread stop address", error))?;
 
     uc.mem_map(STACK_BASE as u64, STACK_SIZE as u64, Prot::ALL)
         .map_err(|error| RunError::Unicorn("mapping guest stack", error))?;
 
-    uc.mem_map(HEAP_BASE as u64, HEAP_SIZE as u64, Prot::ALL)
-        .map_err(|error| RunError::Unicorn("mapping guest heap", error))?;
+    // The heap's range, except where a program image already lies in it.
+    let mut images: Vec<(u32, u32)> = process
+        .modules
+        .iter()
+        .map(|module| {
+            let start = align_down(module.image.image_base, PAGE_SIZE);
+            (start, align_up(module.image.image_base + module.memory.len() as u32, PAGE_SIZE))
+        })
+        .filter(|&(start, end)| start < HEAP_BASE + HEAP_SIZE && end > HEAP_BASE)
+        .collect();
+    images.sort();
+    let mut cursor = HEAP_BASE;
+    for (start, end) in images.into_iter().chain([(HEAP_BASE + HEAP_SIZE, HEAP_BASE + HEAP_SIZE)]) {
+        if start > cursor {
+            uc.mem_map(cursor as u64, (start - cursor) as u64, Prot::ALL)
+                .map_err(|error| RunError::Unicorn("mapping guest heap", error))?;
+        }
+        cursor = cursor.max(end);
+    }
 
     uc.mem_map(TIB_BASE as u64, TIB_SIZE as u64, Prot::ALL)
         .map_err(|error| RunError::Unicorn("mapping guest TIB", error))?;
@@ -872,6 +1171,9 @@ fn build<'a>(
         // FS:[0x10]. It expects a linked list of mapped free blocks, not zero.
         (0x10, LOCAL_HANDLE_LIST_BASE),
         (0x18, TIB_BASE),
+        // FS:[0x30] (NT's PEB): a zeroed block. MSHTML's allocator reads
+        // flags from it; KERNEL32's own code must not find the PDB there.
+        (0x30, WIN95_STATE_BASE + 0x3000),
         // Win95 heap helpers load GS from FS:[0x0c] and test flag bits at
         // GS:[0x16]. Point GS at the synthetic state page, whose flags stay
         // zero so the simple (non-thunking) allocation path is used.
@@ -891,18 +1193,7 @@ fn build<'a>(
     // based at the synthetic Win95 state page for GS.
     gdt[8..16].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x9A, 0xCF, 0]);
     gdt[16..24].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x92, 0xCF, 0]);
-    let fs_base = TIB_BASE;
-    let fs_limit = TIB_SIZE - 1;
-    gdt[24..32].copy_from_slice(&[
-        fs_limit as u8,
-        (fs_limit >> 8) as u8,
-        fs_base as u8,
-        (fs_base >> 8) as u8,
-        (fs_base >> 16) as u8,
-        0x92, // present, DPL 0, data segment, read/write
-        0x40, // 32-bit segment, byte granularity, 4 KiB limit
-        (fs_base >> 24) as u8,
-    ]);
+    gdt[24..32].copy_from_slice(&fs_descriptor(TIB_BASE));
     let gs_base = WIN95_STATE_BASE;
     let gs_limit = WIN95_STATE_SIZE - 1;
     gdt[32..40].copy_from_slice(&[
@@ -950,18 +1241,28 @@ fn build<'a>(
         .map_err(|error| RunError::Unicorn("initialising ESP", error))?;
     uc.reg_write(Reg::EBP, 0)
         .map_err(|error| RunError::Unicorn("initialising EBP", error))?;
+    // The x87 state a Windows process starts with: every exception masked,
+    // 53-bit precision, round to nearest. C runtimes check these masks and
+    // raise floating-point exceptions for any that are clear.
+    uc.reg_write(Reg::FPCW, 0x027F)
+        .map_err(|error| RunError::Unicorn("initialising the FPU control word", error))?;
 
     let mut initial_state = RunState::default();
     initial_state.pump = pump;
     initial_state.dispatcher = process
         .entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER)
         .unwrap_or(0);
+    initial_state.thread_return = process.entry_point(KERNEL_DLL, THREAD_RETURN).unwrap_or(0);
+    initial_state.running = vec![1];
+    initial_state.tibs = vec![(1, TIB_BASE)];
+    initial_state.next_thread = 2;
     let state = Rc::new(RefCell::new(initial_state));
 
     let thunk_state = state.clone();
     let thunk_iat = iat.clone();
     let thunk_calls = syscalls;
     let trace_api = std::env::var_os("OTW_TRACE_API").is_some();
+    let trace_results = std::env::var_os("OTW_TRACE_RESULTS").is_some();
     let trace_code = std::env::var_os("OTW_TRACE_CODE").is_some();
     let code_trace = Rc::new(RefCell::new(VecDeque::<String>::new()));
     if trace_code {
@@ -1014,6 +1315,7 @@ fn build<'a>(
         )
         .map_err(|error| RunError::Unicorn("installing instruction trace hook", error))?;
     }
+    let mut last_pump = std::time::Instant::now();
     uc.add_code_hook(
         THUNK_BASE as u64,
         (thunk_end - 1) as u64,
@@ -1021,6 +1323,17 @@ fn build<'a>(
             let Some(entry) = thunk_iat.entry_for_thunk(address as u32) else {
                 return;
             };
+            // A program busy for a while (an installer extracting files on a
+            // worker thread, a long wait on other threads) still lets the
+            // host window redraw and take input every few frames.
+            if last_pump.elapsed() >= std::time::Duration::from_millis(30) {
+                last_pump = std::time::Instant::now();
+                let pump = thunk_state.borrow_mut().pump.take();
+                if let Some(mut pump) = pump {
+                    pump(false);
+                    thunk_state.borrow_mut().pump = Some(pump);
+                }
+            }
             let esp = match uc.reg_read(Reg::ESP) {
                 Ok(value) => value as u32,
                 Err(error) => {
@@ -1041,6 +1354,21 @@ fn build<'a>(
             };
 
             let kernel_entry = entry.dll == KERNEL_DLL;
+            if kernel_entry && entry.name.as_str() == Some(THREAD_RETURN) {
+                // A thread's start routine returned: the thread ends.
+                let code = uc.reg_read(Reg::EAX).unwrap_or(0) as u32;
+                let mut state = thunk_state.borrow_mut();
+                if state.running.len() > 1 {
+                    state.thread_signal = Some(ThreadSignal::Exit(code));
+                    drop(state);
+                    let _ = uc.reg_write(Reg::EIP, THREAD_STOP as u64);
+                } else {
+                    state.exit_code = Some(code);
+                    drop(state);
+                    let _ = uc.emu_stop();
+                }
+                return;
+            }
             let arg_count = if kernel_entry {
                 Some(2)
             } else {
@@ -1051,9 +1379,8 @@ fn build<'a>(
                     &thunk_state,
                     uc,
                     format!(
-                        "unimplemented import {}!{}",
-                        entry.dll,
-                        entry.name.display()
+                        "unimplemented import {}",
+                        thunk_calls.describe(&entry.dll, &entry.name)
                     ),
                 );
                 return;
@@ -1077,9 +1404,8 @@ fn build<'a>(
 
             if trace_api {
                 eprintln!(
-                    "api {}!{} esp={esp:#010x} ret={return_address:#010x} args={:08x?}",
-                    entry.dll,
-                    entry.name.display(),
+                    "api {} esp={esp:#010x} ret={return_address:#010x} args={:08x?}",
+                    thunk_calls.describe(&entry.dll, &entry.name),
                     args
                 );
             }
@@ -1102,6 +1428,19 @@ fn build<'a>(
                 if state.exit_code.is_some() || state.error.is_some() {
                     drop(state);
                     let _ = uc.emu_stop();
+                    return;
+                }
+            }
+            // The thread comes off the CPU: stop its run here (to make the
+            // same call again when it next runs, or for good).
+            {
+                let state = thunk_state.borrow();
+                if let Some(signal) = state.thread_signal {
+                    drop(state);
+                    if matches!(signal, ThreadSignal::Suspend) {
+                        thunk_state.borrow_mut().yield_eip = address as u32;
+                    }
+                    let _ = uc.reg_write(Reg::EIP, THREAD_STOP as u64);
                     return;
                 }
             }
@@ -1171,6 +1510,17 @@ fn build<'a>(
                 );
                 return;
             };
+            if trace_results {
+                eprintln!(
+                    "ret {} = {:#x} (ebx={:x} esi={:x} edi={:x} ebp={:x})",
+                    thunk_calls.describe(&entry.dll, &entry.name),
+                    outcome.value,
+                    uc.reg_read(Reg::EBX).unwrap_or(0),
+                    uc.reg_read(Reg::ESI).unwrap_or(0),
+                    uc.reg_read(Reg::EDI).unwrap_or(0),
+                    uc.reg_read(Reg::EBP).unwrap_or(0)
+                );
+            }
 
             if let Some(exit_code) = outcome.exit_code {
                 if let Err(error) = uc.reg_write(Reg::EAX, outcome.value as u64) {
@@ -1249,6 +1599,18 @@ fn build<'a>(
 
     let invalid_state = state.clone();
     let invalid_trace = code_trace.clone();
+    // Debugging: OTW_WATCH=address reports every write to that dword.
+    if let Some(watch) = std::env::var("OTW_WATCH")
+        .ok()
+        .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    {
+        uc.add_mem_hook(HookType::MEM_WRITE, watch as u64, watch as u64 + 3, move |uc, _, address, size, value| {
+            let eip = uc.reg_read(Reg::EIP).unwrap_or(0);
+            eprintln!("[watch] write {value:#x} ({size} bytes) at {address:#x} from eip={eip:#x}");
+            true
+        })
+        .map_err(|error| RunError::Unicorn("installing the write watch", error))?;
+    }
     uc.add_mem_hook(
         HookType::MEM_READ_UNMAPPED
             | HookType::MEM_WRITE_UNMAPPED
@@ -1328,8 +1690,6 @@ fn build<'a>(
             "comctl32.dll",
             "shell32.dll",
             "comdlg32.dll",
-            "shlwapi.dll",
-            "shdocvw.dll",
         ];
         if SYSTEM_DLLS
             .iter()

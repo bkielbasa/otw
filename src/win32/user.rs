@@ -145,7 +145,9 @@ pub const HTCLOSE: i32 = 20;
 pub const CAPTION_HEIGHT: i32 = 18;
 pub const MENU_HEIGHT: i32 = 19;
 pub const SCROLL_SIZE: i32 = 16;
-pub const TASKBAR_HEIGHT: i32 = 32;
+/// Height of the shell's taskbar along the bottom of the screen: the work
+/// area (SPI_GETWORKAREA, GetMonitorInfo, maximized windows) ends above it.
+pub const TASKBAR_HEIGHT: i32 = 28;
 
 const CW_USEDEFAULT: i32 = i32::MIN;
 
@@ -182,7 +184,17 @@ pub fn frame_width(style: u32, ex_style: u32) -> i32 {
 
 /// Non-client insets (left, top, right, bottom) of a window.
 pub fn nc_insets(window: &GuestWindow) -> (i32, i32, i32, i32) {
-    nc_insets_for(window.style, window.ex_style, has_menu_bar(window))
+    nc_insets_for(scroll_style(window), window.ex_style, has_menu_bar(window))
+}
+
+/// A window's style as far as its own scroll bars go: a combo box passes
+/// WS_VSCROLL/WS_HSCROLL on to its drop-down list and shows none itself.
+fn scroll_style(window: &GuestWindow) -> u32 {
+    if window.class.eq_ignore_ascii_case("ComboBox") {
+        window.style & !(WS_VSCROLL | WS_HSCROLL)
+    } else {
+        window.style
+    }
 }
 
 pub fn nc_insets_for(style: u32, ex_style: u32, menu: bool) -> (i32, i32, i32, i32) {
@@ -514,7 +526,7 @@ pub fn nc_hit_test(window: &GuestWindow, x: i32, y: i32) -> i32 {
         }
     }
     let (l, t, r, b) = nc_insets(window);
-    if window.style & WS_VSCROLL != 0
+    if scroll_style(window) & WS_VSCROLL != 0
         && x >= window.width - r
         && x < window.width - r + SCROLL_SIZE
         && y >= t
@@ -522,7 +534,7 @@ pub fn nc_hit_test(window: &GuestWindow, x: i32, y: i32) -> i32 {
     {
         return HTVSCROLL;
     }
-    if window.style & WS_HSCROLL != 0
+    if scroll_style(window) & WS_HSCROLL != 0
         && y >= window.height - b
         && y < window.height - b + SCROLL_SIZE
         && x >= l
@@ -895,17 +907,18 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
             );
         }
         let (l, t, r, b) = nc_insets(&window);
-        if window.style & WS_VSCROLL != 0 {
+        let style = scroll_style(&window);
+        if style & WS_VSCROLL != 0 {
             let rect = Rect::new(w - r, t, w - r + SCROLL_SIZE, h - b);
             let (min, max, pos, page) = window.scroll[1];
             draw_scroll_bar(p, rect, true, min, max, pos, page);
         }
-        if window.style & WS_HSCROLL != 0 {
+        if style & WS_HSCROLL != 0 {
             let rect = Rect::new(l, h - b, w - r, h - b + SCROLL_SIZE);
             let (min, max, pos, page) = window.scroll[0];
             draw_scroll_bar(p, rect, false, min, max, pos, page);
         }
-        if window.style & WS_VSCROLL != 0 && window.style & WS_HSCROLL != 0 {
+        if style & WS_VSCROLL != 0 && style & WS_HSCROLL != 0 {
             p.fill(
                 Rect::new(w - r, h - b, w - r + SCROLL_SIZE, h - b + SCROLL_SIZE),
                 sys_color(15),
@@ -1081,9 +1094,7 @@ pub fn call_wndproc<M: GuestMemory + ?Sized>(
         let args = [hwnd, msg, wparam, lparam];
         return builtin_proc(ctx, memory, &name, &args);
     }
-    memory
-        .call_guest(proc_va, &[hwnd, msg, wparam, lparam])
-        .unwrap_or(0)
+    crate::win32::unicode::call_proc(ctx, memory, proc_va, hwnd, msg, wparam, lparam).unwrap_or(0)
 }
 
 fn builtin_proc<M: GuestMemory + ?Sized>(
@@ -1102,6 +1113,13 @@ fn builtin_proc<M: GuestMemory + ?Sized>(
             crate::win32::controls::def_dlg_proc(ctx, memory, hwnd, msg, wparam, lparam)
         }
         "OTW_MenuProc" => def_window_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_PropSheetProc" => crate::win32::comctl32::sheet_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_TabProc" => crate::win32::comctl32::tab_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_ListViewProc" => crate::win32::comctl32::listview_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_TreeViewProc" => crate::win32::treeview::treeview_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_SubclassProc" => crate::win32::commctrl::subclass_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_ToolbarProc" => crate::win32::commctrl::toolbar_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_StatusProc" => crate::win32::commctrl::status_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_MDIClientProc" => def_window_proc(ctx, memory, hwnd, msg, wparam, lparam),
         other => {
             crate::win32::controls::control_proc(ctx, memory, other, hwnd, msg, wparam, lparam)
@@ -1301,10 +1319,10 @@ fn paint_order(gui: &GuiState) -> Vec<u32> {
 
 /// Paint pending non-client areas and pick the next window that needs
 /// WM_PAINT (optionally restricted to `filter` and its descendants).
-fn next_paint(shared: &mut SharedState, filter: u32) -> Option<u32> {
+fn next_paint(shared: &mut SharedState, filter: u32, thread: u32) -> Option<u32> {
     let order = paint_order(&shared.gui);
     for hwnd in order {
-        if !is_visible_chain(&shared.gui, hwnd) {
+        if !is_visible_chain(&shared.gui, hwnd) || !owned_by(&shared.gui, hwnd, thread) {
             continue;
         }
         if filter != 0 && hwnd != filter && !is_descendant(&shared.gui, hwnd, filter) {
@@ -1347,6 +1365,37 @@ pub fn is_descendant(gui: &GuiState, hwnd: u32, ancestor: u32) -> bool {
 // ── Window lifecycle ─────────────────────────────────────────────────────
 
 /// Register the built-in control classes once per process.
+/// LOGFONTA of the system's MS Sans Serif 8 at `weight`.
+fn system_logfont(weight: u32) -> Vec<u8> {
+    let mut font = vec![0u8; 60];
+    font[0..4].copy_from_slice(&(-11i32).to_le_bytes());
+    font[16..20].copy_from_slice(&weight.to_le_bytes());
+    font[28..41].copy_from_slice(b"MS Sans Serif");
+    font
+}
+
+/// The common controls COMCTL32 provides; a genuine COMCTL32 registers
+/// its own.
+pub const COMMON_CONTROL_CLASSES: [&str; 5] =
+    ["ToolbarWindow32", "msctls_statusbar32", "SysListView32", "SysTabControl32", "SysTreeView32"];
+
+fn has_genuine_comctl32(ctx: &ApiContext) -> bool {
+    ctx.modules
+        .borrow()
+        .iter()
+        .any(|m| m.name.eq_ignore_ascii_case("comctl32.dll"))
+}
+
+/// A genuine COMCTL32 is being loaded: drop the subsystem's versions of its
+/// classes so that it registers its own.
+pub fn yield_common_controls(ctx: &ApiContext) {
+    ctx.shared
+        .borrow_mut()
+        .gui
+        .classes
+        .retain(|c| !COMMON_CONTROL_CLASSES.iter().any(|n| c.name.eq_ignore_ascii_case(n)));
+}
+
 pub fn ensure_builtin_classes(ctx: &ApiContext) {
     let mut shared = ctx.shared.borrow_mut();
     if shared
@@ -1358,8 +1407,14 @@ pub fn ensure_builtin_classes(ctx: &ApiContext) {
         return;
     }
     let builtin = |name: &str| ctx.builtin_proc(name);
-    let classes: [(&str, &str, u32, u32); 11] = [
+    let classes: [(&str, &str, u32, u32); 17] = [
+        ("SysTreeView32", "OTW_TreeViewProc", 0x08, 0),
+        ("RICHEDIT", "OTW_RichEditProc", 0x08, 6),
         ("OTW_ColorPanel", "OTW_ColorPanelProc", 0x08, 0),
+        ("ToolbarWindow32", "OTW_ToolbarProc", 0x08, 0),
+        ("msctls_statusbar32", "OTW_StatusProc", 0x08, 0),
+        ("SysListView32", "OTW_ListViewProc", 0x08, 0),
+        ("SysTabControl32", "OTW_TabProc", 0x08, 0),
         ("Button", "OTW_ButtonProc", 0x0B, 16),
         ("Edit", "OTW_EditProc", 0x08, 6),
         ("Static", "OTW_StaticProc", 0x08, 16),
@@ -1371,7 +1426,11 @@ pub fn ensure_builtin_classes(ctx: &ApiContext) {
         ("#32770", "DefDlgProcA", 0x08, 30),
         ("#32768", "OTW_MenuProc", 0x08, 0),
     ];
+    let genuine_comctl32 = has_genuine_comctl32(ctx);
     for (name, proc_name, style, extra) in classes {
+        if genuine_comctl32 && COMMON_CONTROL_CLASSES.contains(&name) {
+            continue;
+        }
         let atom = 0xC000 + shared.gui.classes.len() as u32;
         shared.gui.classes.push(GuestClass {
             name: name.to_owned(),
@@ -1472,6 +1531,9 @@ pub fn create_window<M: GuestMemory + ?Sized>(
         return 0;
     }
     let (mut x, mut y, mut width, mut height) = (params.x, params.y, params.width, params.height);
+    if let Some(closed) = closed_combo_height(&class_record.name, style) {
+        height = closed;
+    }
     if !child {
         let cascade = {
             let shared = ctx.shared.borrow();
@@ -1537,6 +1599,7 @@ pub fn create_window<M: GuestMemory + ?Sized>(
         }
         let window = GuestWindow {
             hwnd,
+            thread: memory.current_thread(),
             class: class_record.name.clone(),
             title: String::from_utf8_lossy(&params.title).into_owned(),
             parent: parent_hwnd,
@@ -2163,6 +2226,13 @@ pub fn set_focus<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd
 
 /// `SetWindowPos` core. Coordinates are parent-client (child) or screen.
 #[allow(clippy::too_many_arguments)]
+/// A drop-down combo box's window is its edit field only: the height it is
+/// given sets how far its list drops down.
+fn closed_combo_height(class: &str, style: u32) -> Option<i32> {
+    const CBS_DROPDOWN: u32 = 2;
+    (class.eq_ignore_ascii_case("ComboBox") && style & 3 >= CBS_DROPDOWN).then_some(21)
+}
+
 pub fn set_window_pos<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
     memory: &mut M,
@@ -2202,6 +2272,8 @@ pub fn set_window_pos<M: GuestMemory + ?Sized>(
         new = Rect::sized(x, y, new.width(), new.height());
     }
     if flags & SWP_NOSIZE == 0 {
+        let class = ctx.shared.borrow().gui.window(hwnd).map(|w| w.class.clone()).unwrap_or_default();
+        let cy = closed_combo_height(&class, style).unwrap_or(cy);
         new = Rect::sized(new.left, new.top, cx.max(0), cy.max(0));
     }
     // WM_WINDOWPOSCHANGING lets the window adjust the new placement.
@@ -3130,6 +3202,25 @@ fn route_input<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, event:
 
 // ── Message retrieval ────────────────────────────────────────────────────
 
+/// Whether a window's messages go to `thread`'s message loop: each thread
+/// gets the messages of the windows it created.
+pub fn owned_by(gui: &GuiState, hwnd: u32, thread: u32) -> bool {
+    hwnd == 0 || gui.window(hwnd).is_none_or(|w| w.thread == 0 || w.thread == thread)
+}
+
+/// Whether `thread` has messages waiting (posted, queued, quit, a due
+/// timer or a window to paint).
+pub fn messages_for(gui: &GuiState, now: u64, thread: u32) -> bool {
+    gui.posted.iter().chain(&gui.queue).any(|m| owned_by(gui, m.hwnd, thread))
+        || !gui.input.is_empty()
+        || (gui.quit && (gui.quit_thread == 0 || gui.quit_thread == thread))
+        || gui.timers.iter().any(|t| t.due <= now && timer_for(gui, t, thread))
+}
+
+fn timer_for(gui: &GuiState, timer: &GuestTimer, thread: u32) -> bool {
+    (timer.thread == 0 || timer.thread == thread) && owned_by(gui, timer.hwnd, thread)
+}
+
 fn matches_filter(message: &GuestMessage, hwnd: u32, min: u32, max: u32, gui: &GuiState) -> bool {
     if hwnd != 0 && message.hwnd != hwnd && !is_descendant(gui, message.hwnd, hwnd) {
         return false;
@@ -3152,7 +3243,9 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
     block: bool,
 ) -> Option<GuestMessage> {
     let mut idle_rounds = 0u32;
+    let thread = memory.current_thread();
     loop {
+        advance_timed_script(ctx, memory);
         if memory.stopping() {
             return Some(GuestMessage {
                 hwnd: 0,
@@ -3194,7 +3287,7 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
                 };
                 let position = queue
                     .iter()
-                    .position(|m| matches_filter(m, hwnd, min, max, gui));
+                    .position(|m| matches_filter(m, hwnd, min, max, gui) && owned_by(gui, m.hwnd, thread));
                 if let Some(position) = position {
                     let message = if queue_index == 0 {
                         gui.posted[position]
@@ -3220,7 +3313,8 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
         }
         let quit = {
             let shared = ctx.shared.borrow();
-            shared.gui.quit.then_some(shared.gui.quit_code)
+            let mine = shared.gui.quit_thread == 0 || shared.gui.quit_thread == thread;
+            (shared.gui.quit && mine).then_some(shared.gui.quit_code)
         };
         if let Some(code) = quit {
             if remove {
@@ -3235,7 +3329,7 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
         }
         let wants_paint = min == 0 && max == 0 || (min..=max).contains(&WM_PAINT);
         if wants_paint {
-            let target = next_paint(&mut ctx.shared.borrow_mut(), hwnd);
+            let target = next_paint(&mut ctx.shared.borrow_mut(), hwnd, thread);
             if let Some(target) = target {
                 return Some(GuestMessage {
                     hwnd: target,
@@ -3253,7 +3347,7 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
                 .gui
                 .timers
                 .iter()
-                .position(|t| t.due <= now && (hwnd == 0 || t.hwnd == hwnd));
+                .position(|t| t.due <= now && (hwnd == 0 || t.hwnd == hwnd) && timer_for(&shared.gui, t, thread));
             if let Some(index) = due {
                 let timer = shared.gui.timers[index];
                 if remove {
@@ -3285,7 +3379,12 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
             }
             return None;
         }
-        // Nothing to do: wait for host input or the next timer.
+        // Nothing to do: other threads of the program run, then wait for
+        // host input or the next timer.
+        if crate::win32::sync::run_ready_threads(ctx, memory) {
+            idle_rounds = 0;
+            continue;
+        }
         if !memory.has_host() && feed_script(ctx) {
             idle_rounds = 0;
             continue;
@@ -3338,8 +3437,23 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
     }
 }
 
+/// A timed scripted wait (`t n`) that is over lets the script go on even
+/// while the program keeps busy (timers, painting).
+fn advance_timed_script<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &M) {
+    let timed_out = ctx.shared.borrow().gui.script_until.is_some_and(|until| std::time::Instant::now() >= until);
+    if timed_out && !memory.has_host() {
+        while feed_script(ctx) {
+            let shared = ctx.shared.borrow();
+            if shared.gui.script_wait > 0 || shared.gui.script_until.is_some() {
+                break;
+            }
+        }
+    }
+}
+
 /// Scripted input for headless runs (`OTW_INPUT`), e.g.
 /// `m 100 120; d; m 200 220; u; k 65 a; w 2; s /tmp/shot.ppm`:
+/// `t n` waits n seconds (and goes on even while the program is busy),
 /// `m x y` move, `d`/`u` left button, `rd`/`ru` right button, `k vk [ch]`
 /// key press and release, `w n` wait n idle rounds, `s path` screenshot.
 /// Returns true if an event was fed.
@@ -3357,6 +3471,14 @@ pub fn feed_script(ctx: &ApiContext) -> bool {
     if shared.gui.script_wait > 0 {
         shared.gui.script_wait -= 1;
         return true;
+    }
+    if let Some(until) = shared.gui.script_until {
+        if std::time::Instant::now() < until {
+            drop(shared);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            return true;
+        }
+        shared.gui.script_until = None;
     }
     let Some(command) = shared.gui.script.as_mut().and_then(|s| s.pop_front()) else {
         return false;
@@ -3425,6 +3547,9 @@ pub fn feed_script(ctx: &ApiContext) -> bool {
             }
         }
         "w" => shared.gui.script_wait = num(1).max(0) as u32,
+        "t" => {
+            shared.gui.script_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(num(1).max(0) as u64));
+        }
         "s" => {
             let path = parts.get(1).map(|p| p.to_string()).unwrap_or_default();
             drop(shared);
@@ -3447,9 +3572,22 @@ pub fn dump_screenshot(ctx: &ApiContext) {
         let shared = ctx.shared.borrow();
         for w in &shared.gui.windows {
             eprintln!(
-                "[window] {:#x} class={:?} title={:?} parent={:#x} owner={:#x} rect=({},{} {}x{}) style={:#010x} ex={:#x} visible={} min={} max={} menu={:#x} update={:?}",
-                w.hwnd, w.class, w.title, w.parent, w.owner, w.x, w.y, w.width, w.height, w.style, w.ex_style, w.visible, w.minimized, w.maximized, w.menu, w.update.bounds()
+                "[window] {:#x} class={:?} title={:?} parent={:#x} owner={:#x} rect=({},{} {}x{}) style={:#010x} ex={:#x} visible={} min={} max={} menu={:#x} proc={:#x} update={:?}",
+                w.hwnd, w.class, w.title, w.parent, w.owner, w.x, w.y, w.width, w.height, w.style, w.ex_style, w.visible, w.minimized, w.maximized, w.menu, w.wndproc, w.update.bounds()
             );
+        }
+        for class in &shared.gui.classes {
+            eprintln!("[class] {:?} proc={:#x}", class.name, class.wndproc);
+        }
+        let mut menus: Vec<_> = shared.gui.menus.iter().collect();
+        menus.sort_by_key(|(handle, _)| **handle);
+        for (handle, menu) in menus {
+            let items: Vec<String> = menu
+                .items
+                .iter()
+                .map(|item| format!("{}#{:x}{}", String::from_utf8_lossy(&item.text), item.id, if item.submenu != 0 { format!(">{:#x}", item.submenu) } else { String::new() }))
+                .collect();
+            eprintln!("[menu] {handle:#x} {items:?}");
         }
     }
     let Ok(path) = std::env::var("OTW_SCREENSHOT") else {
@@ -3460,7 +3598,11 @@ pub fn dump_screenshot(ctx: &ApiContext) {
 
 /// Composite all visible top-level windows into a PPM file.
 pub fn write_screenshot(ctx: &ApiContext, path: &str) {
-    let shared = ctx.shared.borrow();
+    write_screenshot_of(&ctx.shared.borrow(), path);
+}
+
+/// [`write_screenshot`] of a program's state.
+pub fn write_screenshot_of(shared: &SharedState, path: &str) {
     let (w, h) = shared.gui.screen;
     let mut pixels = vec![0x008080u32; (w * h) as usize];
     for window in &shared.gui.windows {
@@ -3596,7 +3738,7 @@ pub fn interactive<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &M) -> boo
     }
     let shared = ctx.shared.borrow();
     let pending = match &shared.gui.script {
-        Some(script) => !script.is_empty() || shared.gui.script_wait > 0,
+        Some(script) => !script.is_empty() || shared.gui.script_wait > 0 || shared.gui.script_until.is_some(),
         None => std::env::var_os("OTW_INPUT").is_some(),
     };
     pending || !shared.gui.input.is_empty()
@@ -3605,7 +3747,7 @@ pub fn interactive<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &M) -> boo
 /// Deliver all pending WM_PAINT messages synchronously.
 pub fn flush_paints<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) {
     for _ in 0..64 {
-        let target = next_paint(&mut ctx.shared.borrow_mut(), 0);
+        let target = next_paint(&mut ctx.shared.borrow_mut(), 0, memory.current_thread());
         let Some(target) = target else {
             break;
         };
@@ -4159,7 +4301,7 @@ pub fn find_resource_any<M: GuestMemory + ?Sized>(
         }
     }
     let candidates: Vec<u32> = std::iter::once(ctx.image_base)
-        .chain(ctx.modules.iter().map(|m| m.image_base))
+        .chain(ctx.modules.borrow().iter().map(|m| m.image_base))
         .collect();
     for candidate in candidates {
         if candidate == module {
@@ -4339,7 +4481,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "DefWindowProcA" | "DefMDIChildProcA" | "DefDlgProcA" => 4,
         "OTW_ButtonProc" | "OTW_EditProc" | "OTW_StaticProc" | "OTW_ListBoxProc"
         | "OTW_ComboBoxProc" | "OTW_ScrollBarProc" | "OTW_MDIClientProc" | "OTW_MenuProc"
-        | "OTW_ColorPanelProc" => 4,
+        | "OTW_ColorPanelProc" | "OTW_RichEditProc" => 4,
         "DefFrameProcA" | "CallWindowProcA" => 5,
         "RegisterClassA" | "RegisterClassExA" => 1,
         "UnregisterClassA" => 2,
@@ -4519,7 +4661,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
     match name {
         "DefWindowProcA" | "DefMDIChildProcA" | "DefDlgProcA" | "OTW_ButtonProc"
         | "OTW_EditProc" | "OTW_StaticProc" | "OTW_ListBoxProc" | "OTW_ComboBoxProc"
-        | "OTW_ScrollBarProc" | "OTW_MDIClientProc" | "OTW_MenuProc" | "OTW_ColorPanelProc" => {
+        | "OTW_ScrollBarProc" | "OTW_MDIClientProc" | "OTW_MenuProc" | "OTW_ColorPanelProc"
+        | "OTW_RichEditProc" => {
             ok(builtin_proc(ctx, memory, name, args))
         }
         "DefFrameProcA" => ok(def_window_proc(
@@ -4994,7 +5137,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             ok(previous)
         }
         "GetPropA" | "RemovePropA" => {
-            let key = prop_key(memory, args[1]);
+            let key = prop_key(ctx, memory, args[1]);
             let mut shared = ctx.shared.borrow_mut();
             let Some(window) = shared.gui.window_mut(args[0]) else {
                 return ok(0);
@@ -5011,7 +5154,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             ok(value)
         }
         "SetPropA" => {
-            let key = prop_key(memory, args[1]);
+            let key = prop_key(ctx, memory, args[1]);
             let mut shared = ctx.shared.borrow_mut();
             let Some(window) = shared.gui.window_mut(args[0]) else {
                 return ok(0);
@@ -5440,29 +5583,52 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "WaitMessage" => {
             loop {
+                advance_timed_script(ctx, memory);
+                let thread = memory.current_thread();
                 let ready = {
                     let mut shared = ctx.shared.borrow_mut();
                     let now = shared.ticks();
-                    !shared.gui.queue.is_empty()
-                        || !shared.gui.posted.is_empty()
-                        || !shared.gui.input.is_empty()
+                    messages_for(&shared.gui, now, thread)
                         || shared.gui.pending_activate.is_some()
                         || shared.gui.pending_deactivate
-                        || shared.gui.quit
-                        || shared.gui.timers.iter().any(|t| t.due <= now)
+                        // Only windows that are shown get painted.
                         || paint_order(&shared.gui).iter().any(|h| {
-                            shared
-                                .gui
-                                .window(*h)
-                                .map(|w| !w.update.is_empty() || w.nc_dirty)
-                                .unwrap_or(false)
+                            owned_by(&shared.gui, *h, thread)
+                                && is_visible_chain(&shared.gui, *h)
+                                && shared
+                                    .gui
+                                    .window(*h)
+                                    .map(|w| !w.update.is_empty() || w.nc_dirty)
+                                    .unwrap_or(false)
                         })
                         || {
                             let _ = &mut shared;
                             false
                         }
                 };
-                if ready || memory.stopping() || !memory.has_host() {
+                if ready || memory.stopping() {
+                    break;
+                }
+                // Other threads of the program run while this one waits.
+                if crate::win32::sync::run_ready_threads(ctx, memory) {
+                    continue;
+                }
+                if !memory.has_host() {
+                    // Headless: wait as GetMessage does (scripted input, idle
+                    // exit), then leave the message for the PeekMessage that
+                    // follows.
+                    if let Some(message) = fetch_message(ctx, memory, 0, 0, 0, true, true) {
+                        // A program whose loop ignores the idle WM_QUIT ends
+                        // once it has been idle a few times over.
+                        if message.message == WM_QUIT && ctx.shared.borrow().gui.idle_exits >= 3 {
+                            return Some(ApiOutcome {
+                                value: 0,
+                                arg_count: count,
+                                exit_code: Some(0),
+                            });
+                        }
+                        ctx.shared.borrow_mut().gui.posted.push_front(message);
+                    }
                     break;
                 }
                 if memory.yield_now() {
@@ -5506,7 +5672,21 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             let message = read_message(memory, args[0]);
             ok(dispatch_message(ctx, memory, message))
         }
-        "SendMessageA" => ok(send(ctx, memory, args[0], args[1], args[2], args[3])),
+        "SendMessageA" => {
+            let debug = std::env::var_os("OTW_DEBUG_REBAR").is_some() && matches!(args[1], 0x401 | 0x406 | 0x40A | 0x40B);
+            if debug {
+                let words: Vec<u32> = (0..20).map(|i| memory.read_u32(args[3] + i * 4).unwrap_or(0)).collect();
+                eprintln!("[rebar] msg={:#x} band={} info={:x?}", args[1], args[2], words);
+            }
+            let result = send(ctx, memory, args[0], args[1], args[2], args[3]);
+            if let Ok(target) = std::env::var("OTW_DEBUG_SEND") {
+                if u32::from_str_radix(target.trim_start_matches("0x"), 16).ok() == Some(args[0]) {
+                    let after: Vec<u32> = (0..4).map(|i| memory.read_u32(args[3].wrapping_add(i * 4)).unwrap_or(0)).collect();
+                    eprintln!("[send] {:#x} msg={:#x} w={:#x} l={:#x} -> {:#x} l*={:x?}", args[0], args[1], args[2], args[3], result, after);
+                }
+            }
+            ok(result)
+        }
         "PostMessageA" => {
             if args[0] == 0xFFFF {
                 let tops: Vec<u32> = ctx
@@ -5533,6 +5713,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         "PostQuitMessage" => {
             let mut shared = ctx.shared.borrow_mut();
             shared.gui.quit = true;
+            shared.gui.quit_thread = memory.current_thread();
             shared.gui.quit_code = args[0];
             ok(0)
         }
@@ -5595,6 +5776,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 .retain(|t| !(t.hwnd == args[0] && t.id == id));
             shared.gui.timers.push(GuestTimer {
                 hwnd: args[0],
+                thread: memory.current_thread(),
                 id,
                 interval: args[2],
                 proc_va: args[3],
@@ -5943,14 +6125,14 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 args[0]
             } else {
                 ctx.modules
-                    .iter()
+                    .borrow().iter()
                     .find(|m| caller >= m.image_base && caller < m.image_base.wrapping_add(m.size))
                     .map(|m| m.image_base)
                     .unwrap_or(ctx.image_base)
             };
             let mut text = resource_string(memory, module, args[1]).unwrap_or_default();
             if text.is_empty() {
-                for candidate in ctx.modules.iter().map(|m| m.image_base).collect::<Vec<_>>() {
+                for candidate in ctx.modules.borrow().iter().map(|m| m.image_base).collect::<Vec<_>>() {
                     if let Some(found) = resource_string(memory, candidate, args[1]) {
                         text = found;
                         break;
@@ -6004,12 +6186,32 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     let (sw, sh) = ctx.shared.borrow().gui.screen;
                     let _ = write_rect(memory, args[2], Rect::new(0, 0, sw, sh - TASKBAR_HEIGHT));
                 }
+                // SPI_GETICONTITLELOGFONT
                 0x1F => {
-                    let mut font = vec![0u8; 60];
-                    font[0..4].copy_from_slice(&(-11i32).to_le_bytes());
-                    font[16..20].copy_from_slice(&400u32.to_le_bytes());
-                    font[28..41].copy_from_slice(b"MS Sans Serif");
-                    let _ = memory.write_bytes(args[2], &font);
+                    let _ = memory.write_bytes(args[2], &system_logfont(400));
+                }
+                // SPI_GETNONCLIENTMETRICS: Windows 95's standard sizes, with
+                // MS Sans Serif 8 (bold for captions).
+                0x29 => {
+                    let mut metrics = Vec::with_capacity(340);
+                    metrics.extend_from_slice(&340u32.to_le_bytes());
+                    for value in [1u32, 16, 16, 18, 18] {
+                        metrics.extend_from_slice(&value.to_le_bytes());
+                    }
+                    metrics.extend(system_logfont(700));
+                    for value in [12u32, 14] {
+                        metrics.extend_from_slice(&value.to_le_bytes());
+                    }
+                    metrics.extend(system_logfont(700));
+                    for value in [18u32, 18] {
+                        metrics.extend_from_slice(&value.to_le_bytes());
+                    }
+                    for _ in 0..3 {
+                        metrics.extend(system_logfont(400));
+                    }
+                    if args[2] != 0 {
+                        let _ = memory.write_bytes(args[2], &metrics);
+                    }
                 }
                 0x05 => {
                     if args[2] != 0 {
@@ -6135,9 +6337,15 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
     }
 }
 
-fn prop_key<M: GuestMemory + ?Sized>(memory: &mut M, va: u32) -> String {
+/// A window property's name. A global atom names the same property as its
+/// string.
+fn prop_key<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, va: u32) -> String {
     if va < 0x10000 {
-        format!("#{va}")
+        let atom = va.checked_sub(0xC000).and_then(|index| ctx.shared.borrow().global_atoms.get(index as usize).cloned());
+        match atom {
+            Some(name) => name.to_ascii_lowercase(),
+            None => format!("#{va}"),
+        }
     } else {
         String::from_utf8_lossy(&read_cstr(memory, va)).to_ascii_lowercase()
     }
@@ -6431,7 +6639,7 @@ fn scroll_api<M: GuestMemory + ?Sized>(
     }
 }
 
-fn show_scroll_bar<M: GuestMemory + ?Sized>(
+pub(crate) fn show_scroll_bar<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
     memory: &mut M,
     hwnd: u32,

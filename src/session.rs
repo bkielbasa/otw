@@ -17,7 +17,7 @@ use crate::{
         cpu::RunResult,
         scheduler::{Scheduler, Turn},
     },
-    vm::Vm,
+    vm::{NestedLauncher, ProgramDisplay, Vm},
     win32::{clipboard::ClipFormat, SharedState},
 };
 
@@ -104,6 +104,15 @@ impl Session {
             clipboard.generation
         };
         let vm = load(shared.clone())?;
+        // Programs it starts run inside its calls, pumping as it does.
+        let weak = Rc::downgrade(self);
+        let pump: Rc<dyn Fn(bool)> = Rc::new(move |block| {
+            if let Some(session) = weak.upgrade() {
+                session.pump_from(pid, block);
+            }
+        });
+        let display: Rc<dyn ProgramDisplay> = self.clone();
+        NestedLauncher::new(Some(pump), Some(display)).install(&shared);
         let session = Rc::downgrade(self);
         let process = vm
             .start(Box::new(move |block| {
@@ -123,6 +132,31 @@ impl Session {
         Ok(pid)
     }
 
+}
+
+impl ProgramDisplay for Session {
+    /// Show a program that runs outside the scheduler (a child run inside
+    /// its parent's call) on the desktop, in the foreground.
+    fn attach(&self, pid: u32, name: &str, shared: Rc<RefCell<SharedState>>) {
+        self.deactivate_foreground();
+        let generation = self.clipboard.borrow().generation;
+        self.programs.borrow_mut().push(Rc::new(Program {
+            pid: 0x8000_0000 | pid,
+            name: name.to_string(),
+            shared,
+            synced: Cell::new(generation),
+        }));
+    }
+
+    /// Take an attached program off the desktop.
+    fn detach(&self, pid: u32) {
+        if let Some(program) = self.program(0x8000_0000 | pid) {
+            self.remove(&program);
+        }
+    }
+}
+
+impl Session {
     /// Tell the foreground program it lost the foreground (the user clicked
     /// another program, the shell, or the desktop).
     pub fn deactivate_foreground(&self) {

@@ -30,6 +30,11 @@ pub trait SystemCalls {
         args: &[u32],
         caller: u32,
     ) -> Option<ApiOutcome>;
+
+    /// How to name an import in diagnostics.
+    fn describe(&self, dll: &str, name: &ImportName) -> String {
+        format!("{dll}!{}", name.display())
+    }
 }
 
 /// How the loader binds imports.

@@ -1,3 +1,7 @@
+# Downloaded programs and installers dropped in the checkout
+/*.exe
+/*.zip
+
 # Build output
 /target/
 /dist/

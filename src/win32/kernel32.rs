@@ -11,8 +11,12 @@ const INVALID: u32 = u32::MAX;
 /// Synthetic module handles for system DLLs implemented in Rust.
 fn system_module(name: &str) -> Option<u32> {
     let base = name.to_ascii_lowercase();
-    let base = base.trim_end_matches(".dll");
+    let base = base.trim_end_matches(".dll").trim_end_matches(".drv");
     Some(match base {
+        "shlwapi" => 0xBFB8_0000,
+        "oleacc" => 0xBFB0_0000,
+        "winspool" => 0xBFA8_0000,
+        "comctl32" => 0xBFA0_0000,
         "kernel32" => 0xBFF7_0000,
         "user32" => 0xBFF6_0000,
         "gdi32" => 0xBFF3_0000,
@@ -22,6 +26,14 @@ fn system_module(name: &str) -> Option<u32> {
         "ole32" => 0xBFD0_0000,
         "oleaut32" => 0xBFC8_0000,
         "msvcrt20" => 0xBFC0_0000,
+        "rpcrt4" => 0xBF98_0000,
+        "advpack" => 0xBF90_0000,
+        "version" => 0xBF88_0000,
+        "mpr" => 0xBF84_0000,
+        "riched32" => 0xBF80_0000,
+        "lz32" => 0xBF7C_0000,
+        "wsock32" | "winsock" => 0xBF78_0000,
+        "imm32" => 0xBF74_0000,
         _ => return None,
     })
 }
@@ -38,34 +50,57 @@ pub fn system_module_name(handle: u32) -> Option<&'static str> {
         0xBFD0_0000 => "OLE32.dll",
         0xBFC8_0000 => "OLEAUT32.dll",
         0xBFC0_0000 => "MSVCRT20.dll",
+        0xBFB8_0000 => "SHLWAPI.dll",
+        0xBFB0_0000 => "OLEACC.dll",
+        0xBFA8_0000 => "WINSPOOL.DRV",
+        0xBFA0_0000 => "COMCTL32.dll",
+        0xBF98_0000 => "RPCRT4.dll",
+        0xBF90_0000 => "ADVPACK.dll",
+        0xBF88_0000 => "VERSION.dll",
+        0xBF84_0000 => "MPR.dll",
+        0xBF80_0000 => "RICHED32.dll",
+        0xBF7C_0000 => "LZ32.dll",
+        0xBF78_0000 => "WSOCK32.dll",
+        0xBF74_0000 => "IMM32.dll",
         _ => return None,
     })
 }
 
 /// Number of dynamic thunk slots reserved by the VM.
-pub const DYNAMIC_SLOTS: usize = 256;
+pub const DYNAMIC_SLOTS: usize = 16384;
 
 /// Give a Rust-implemented function a guest-callable address for
 /// GetProcAddress, using a reserved dynamic thunk slot.
 pub fn dynamic_thunk(ctx: &ApiContext, dll: &str, name: &str) -> Option<u32> {
-    let import = crate::kernel::pe::ImportName::ByName(name.to_owned());
+    let import = match name.strip_prefix('#').and_then(|n| n.parse::<u16>().ok()) {
+        Some(ordinal) => crate::kernel::pe::ImportName::Ordinal(ordinal),
+        None => crate::kernel::pe::ImportName::ByName(name.to_owned()),
+    };
     crate::win32::arg_count(dll, &import)?;
+    import_thunk(ctx, dll, name)
+}
+
+/// A dynamic thunk for `dll!name` (`#n` for an ordinal), implemented or
+/// not: calling an unimplemented one stops the program with its name.
+pub fn import_thunk(ctx: &ApiContext, dll: &str, name: &str) -> Option<u32> {
     let base = ctx.builtin.get("__dynamic_base").copied()?;
+    let key = (dll.to_ascii_lowercase(), name.to_owned());
     let mut shared = ctx.shared.borrow_mut();
-    if let Some(index) = shared
-        .dynamic_imports
-        .iter()
-        .position(|(d, n)| d.eq_ignore_ascii_case(dll) && n == name)
-    {
-        return Some(base + index as u32 * crate::kernel::iat::THUNK_STRIDE);
+    if let Some(index) = shared.dynamic_index.get(&key) {
+        return Some(base + *index as u32 * crate::kernel::iat::THUNK_STRIDE);
     }
     if shared.dynamic_imports.len() >= DYNAMIC_SLOTS {
         return None;
     }
-    shared
-        .dynamic_imports
-        .push((dll.to_owned(), name.to_owned()));
-    Some(base + (shared.dynamic_imports.len() as u32 - 1) * crate::kernel::iat::THUNK_STRIDE)
+    let index = shared.dynamic_imports.len();
+    shared.dynamic_imports.push((dll.to_owned(), name.to_owned()));
+    shared.dynamic_index.insert(key, index);
+    Some(base + index as u32 * crate::kernel::iat::THUNK_STRIDE)
+}
+
+/// The synthetic handle of a DLL the subsystem implements.
+pub fn system_module_handle(name: &str) -> Option<u32> {
+    system_module(name)
 }
 
 fn set_error(ctx: &ApiContext, code: u32) {
@@ -148,14 +183,21 @@ fn write_find_data<M: GuestMemory + ?Sized>(
 }
 
 fn module_path(ctx: &ApiContext, module: u32) -> Vec<u8> {
+    let program = ctx.shared.borrow().program_path.clone();
+    if !program.is_empty() && (module == 0 || module == ctx.image_base) {
+        return program;
+    }
+    if let Some(path) = crate::win32::module::module_path(ctx, module) {
+        return path;
+    }
     let name = if module == 0 || module == ctx.image_base {
         ctx.modules
-            .first()
+            .borrow().first()
             .map(|m| m.name.clone())
             .unwrap_or_else(|| "APP.EXE".into())
     } else {
         ctx.modules
-            .iter()
+            .borrow().iter()
             .find(|m| m.image_base == module)
             .map(|m| m.name.clone())
             .unwrap_or_default()
@@ -177,6 +219,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         | "GetOEMCP"
         | "GetProcessHeap" => 0,
         "Sleep"
+        | "GetSystemTime"
         | "FreeLibrary"
         | "SetLastError"
         | "IsDBCSLeadByte"
@@ -240,14 +283,14 @@ pub fn arg_count(name: &str) -> Option<usize> {
         | "_lopen"
         | "SizeofResource"
         | "CreateDirectoryA"
-        | "GetSystemTime"
         | "InterlockedExchange"
         | "CompareFileTime" => 2,
         "MulDiv" | "GetModuleFileNameA" | "GetShortPathNameA" | "FindResourceA"
         | "GlobalReAlloc" | "LocalReAlloc" | "RtlMoveMemory" | "RtlFillMemory"
         | "RtlZeroMemory" | "_lread" | "_lwrite" | "_llseek" | "GlobalGetAtomNameA"
-        | "GetAtomNameA" | "CopyFileA" | "HeapAlloc" | "HeapFree" | "HeapSize" => match name {
-            "RtlZeroMemory" | "HeapSize" => 2,
+        | "GetAtomNameA" | "CopyFileA" | "HeapAlloc" | "HeapFree" | "HeapSize"
+        | "LoadLibraryExA" => match name {
+            "RtlZeroMemory" => 2,
             _ => 3,
         },
         "SetFilePointer" | "GetFileTime" | "SetFileTime" | "GetFullPathNameA"
@@ -401,7 +444,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             ok(if name == "HeapFree" { 1 } else { 0 })
         }
         "LocalSize" | "GlobalSize" | "HeapSize" => {
-            let address = if name == "HeapSize" { args[1] } else { args[0] };
+            let address = if name == "HeapSize" { args[2] } else { args[0] };
             ok(ctx.shared.borrow().heap.size_of(address).unwrap_or(0))
         }
         "LocalReAlloc" | "GlobalReAlloc" | "HeapReAlloc" => {
@@ -444,7 +487,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 .trim_end_matches(".dll")
                 .trim_end_matches(".exe")
                 .to_string();
-            let found = ctx.modules.iter().find(|m| {
+            let found = ctx.modules.borrow().iter().find(|m| {
                 let n = m.name.to_ascii_lowercase();
                 let n = std::path::Path::new(&n)
                     .file_name()
@@ -452,9 +495,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     .unwrap_or(n);
                 n == requested
                     || n.trim_end_matches(".dll").trim_end_matches(".exe") == requested_base
-            });
+            }).map(|m| m.image_base);
             match found {
-                Some(module) => ok(module.image_base),
+                Some(base) => ok(base),
                 None => match system_module(&requested) {
                     Some(handle) => ok(handle),
                     None => {
@@ -464,23 +507,16 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 },
             }
         }
-        "LoadLibraryA" => {
+        "LoadLibraryA" | "LoadLibraryExA" => {
             let requested = String::from_utf8_lossy(&read_cstr(memory, args[0])).into_owned();
-            let file = std::path::Path::new(&requested.replace('\\', "/"))
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or(requested.clone());
-            if let Some(module) = ctx
-                .modules
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(&file))
-            {
-                return ok(module.image_base);
-            }
-            match system_module(&file) {
-                Some(handle) => ok(handle),
-                None => {
-                    set_error(ctx, 126);
+            let flags = if name == "LoadLibraryExA" { args[2] } else { 0 };
+            match crate::win32::module::load_library(ctx, memory, &requested, flags) {
+                Ok(handle) => ok(handle),
+                Err(error) => {
+                    if std::env::var_os("OTW_TRACE_MODULES").is_some() {
+                        eprintln!("[module] {requested}: error {error}");
+                    }
+                    set_error(ctx, error);
                     ok(0)
                 }
             }
@@ -578,7 +614,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 5 => (false, true, false),
                 _ => (false, false, false),
             };
-            let host = crt::host_path(&path);
+            let host = crt::host_path_in(ctx, &path);
+            if std::env::var_os("OTW_TRACE_FILES").is_some() {
+                eprintln!("[file] CreateFile {:?} access {access:#x} disposition {disposition} -> {:?}", String::from_utf8_lossy(&path), host);
+            }
             if !create && host.as_ref().map(|h| !h.exists()).unwrap_or(true) {
                 set_error(ctx, 2);
                 return ok(INVALID);
@@ -773,7 +812,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "GetFileAttributesA" => {
             let path = read_cstr(memory, args[0]);
-            match crt::host_path(&path).and_then(|p| std::fs::metadata(p).ok()) {
+            if std::env::var_os("OTW_TRACE_FILES").is_some() {
+                let found = crt::host_path_in(ctx, &path).is_some_and(|p| p.exists());
+                eprintln!("[file] GetFileAttributes {:?}: {}", String::from_utf8_lossy(&path), if found { "found" } else { "missing" });
+            }
+            match crt::host_path_in(ctx, &path).and_then(|p| std::fs::metadata(p).ok()) {
                 Some(metadata) => ok(if metadata.is_dir() { 0x10 } else { 0x20 }),
                 None => {
                     set_error(ctx, 2);
@@ -784,7 +827,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         "SetFileAttributesA" => ok(1),
         "DeleteFileA" => {
             let path = read_cstr(memory, args[0]);
-            let removed = crt::host_path(&path)
+            let removed = crt::host_path_in(ctx, &path)
                 .map(|p| std::fs::remove_file(p).is_ok())
                 .unwrap_or(false);
             if !removed {
@@ -795,7 +838,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         "MoveFileA" | "CopyFileA" => {
             let from = read_cstr(memory, args[0]);
             let to = read_cstr(memory, args[1]);
-            let done = match (crt::host_path(&from), crt::host_path(&to)) {
+            let done = match (crt::host_path_in(ctx, &from), crt::host_path_in(ctx, &to)) {
                 (Some(from), Some(to)) => {
                     if name == "MoveFileA" {
                         std::fs::rename(from, to).is_ok()
@@ -813,20 +856,35 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "CreateDirectoryA" | "RemoveDirectoryA" => {
             let path = read_cstr(memory, args[0]);
-            let done = crt::host_path(&path)
-                .map(|p| {
-                    if name == "CreateDirectoryA" {
-                        std::fs::create_dir(p).is_ok()
-                    } else {
-                        std::fs::remove_dir(p).is_ok()
-                    }
-                })
-                .unwrap_or(false);
-            ok(done as u32)
+            let result = match crt::host_path_in(ctx, &path) {
+                Some(p) if name == "CreateDirectoryA" => std::fs::create_dir(p),
+                Some(p) => std::fs::remove_dir(p),
+                None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            };
+            if std::env::var_os("OTW_TRACE_FILES").is_some() {
+                eprintln!("[file] {name} {:?} -> {result:?}", String::from_utf8_lossy(&path));
+            }
+            match result {
+                Ok(()) => ok(1),
+                Err(error) => {
+                    set_error(
+                        ctx,
+                        match error.kind() {
+                            std::io::ErrorKind::AlreadyExists => 183, // ERROR_ALREADY_EXISTS
+                            std::io::ErrorKind::NotFound => 3,        // ERROR_PATH_NOT_FOUND
+                            _ => 5,                                    // ERROR_ACCESS_DENIED
+                        },
+                    );
+                    ok(0)
+                }
+            }
         }
         "FindFirstFileA" | "FindNextFileA" => {
             let (pattern_dir, pattern, index) = if name == "FindFirstFileA" {
                 let path = read_cstr(memory, args[0]);
+                if std::env::var_os("OTW_TRACE_FILES").is_some() {
+                    eprintln!("[file] FindFirstFile {:?}", String::from_utf8_lossy(&path));
+                }
                 let split = path.iter().rposition(|b| *b == b'\\' || *b == b'/');
                 let (dir, pattern) = match split {
                     Some(p) => (path[..p].to_vec(), path[p + 1..].to_vec()),
@@ -840,11 +898,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     None => return ok(0),
                 }
             };
-            let host_dir = crt::host_path(if pattern_dir.is_empty() {
-                b"\\"
-            } else {
-                &pattern_dir
-            });
+            // A bare name is looked for in the current directory.
+            let current = ctx.shared.borrow().current_dir.clone();
+            let host_dir = crt::host_path_in(ctx, if pattern_dir.is_empty() { &current } else { &pattern_dir });
             let mut entries: Vec<(Vec<u8>, std::fs::Metadata)> = host_dir
                 .and_then(|d| std::fs::read_dir(d).ok())
                 .map(|it| {
@@ -891,8 +947,24 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             ctx.shared.borrow_mut().finds.remove(&args[0]);
             ok(1)
         }
-        "GetCurrentDirectoryA" => ok(crate::win32::copy_path(memory, args[1], args[0], b"C:\\")),
-        "SetCurrentDirectoryA" => ok(1),
+        "GetCurrentDirectoryA" => {
+            let current = ctx.shared.borrow().current_dir.clone();
+            ok(crate::win32::copy_path(memory, args[1], args[0], &current))
+        }
+        "SetCurrentDirectoryA" => {
+            let path = crt::absolute(ctx, &read_cstr(memory, args[0]));
+            if crt::host_path(&path).is_some_and(|p| p.is_dir()) {
+                let mut path = path;
+                while path.len() > 3 && path.ends_with(b"\\") {
+                    path.pop();
+                }
+                ctx.shared.borrow_mut().current_dir = path;
+                ok(1)
+            } else {
+                set_error(ctx, 3); // ERROR_PATH_NOT_FOUND
+                ok(0)
+            }
+        }
         "GetTempPathA" => {
             if let Some(path) = crt::host_path(b"C:\\TEMP") {
                 let _ = std::fs::create_dir_all(path);
@@ -919,7 +991,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             path.extend_from_slice(&prefix);
             path.extend_from_slice(format!("{unique:04X}.TMP").as_bytes());
             if args[2] == 0 {
-                if let Some(host) = crt::host_path(&path) {
+                if let Some(host) = crt::host_path_in(ctx, &path) {
                     let _ = std::fs::File::create(host);
                 }
             }
@@ -962,7 +1034,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 b"C:\\WINDOWS\\SYSTEM\\",
             ] {
                 let candidate = [directory, extended.as_slice()].concat();
-                if crt::host_path(&candidate)
+                if crt::host_path_in(ctx, &candidate)
                     .map(|p| p.exists())
                     .unwrap_or(false)
                 {
@@ -1035,6 +1107,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 .unwrap_or_else(|| vec![0; 16]);
             let f = |i: usize| u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]) as i64;
             let (year, month, day) = (f(0), f(1), f(3));
+            if !(1601..=30827).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+                set_error(ctx, 87);
+                return ok(0);
+            }
             let y = if month <= 2 { year - 1 } else { year };
             let era = y.div_euclid(400);
             let yoe = y - era * 400;

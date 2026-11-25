@@ -794,7 +794,12 @@ impl DibInfo {
             .saturating_mul(4)
     }
 
+    /// The size of the bits: run-length encoded bitmaps give theirs in the
+    /// header (and may be larger than the decoded rows).
     pub fn image_size(&self) -> usize {
+        if (self.compression == 1 || self.compression == 2) && self.size_image != 0 {
+            return self.size_image as usize;
+        }
         self.stride()
             .saturating_mul(self.height.unsigned_abs() as usize)
     }
@@ -1147,6 +1152,21 @@ fn sync_in<M: GuestMemory + ?Sized>(memory: &mut M, shared: &mut SharedState, ha
     }
 }
 
+/// A copy of a bitmap's pixels (DIB sections read from guest memory).
+pub fn bitmap_pixels<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, handle: u32) -> Option<Surface> {
+    let mut shared = ctx.shared.borrow_mut();
+    sync_in(memory, &mut shared, handle);
+    if let Some(surface) = shared.gdi.bitmap_surface(handle) {
+        return Some(surface.clone());
+    }
+    None
+}
+
+/// A new device-dependent bitmap object holding `surface`.
+pub fn insert_bitmap(ctx: &ApiContext, surface: Surface) -> u32 {
+    ctx.shared.borrow_mut().gdi.insert(GdiObject::Bitmap(Bitmap { surface, dib: None }))
+}
+
 /// Write a DIB section's host surface back to its guest bits.
 fn sync_out<M: GuestMemory + ?Sized>(memory: &mut M, shared: &SharedState, handle: u32) {
     if let Some(GdiObject::Bitmap(bitmap)) = shared.gdi.objects.get(&handle) {
@@ -1161,6 +1181,93 @@ fn sync_out<M: GuestMemory + ?Sized>(memory: &mut M, shared: &SharedState, handl
 
 /// Run `draw` on the surface behind `hdc`. Returns `None` for DCs without a
 /// surface (information contexts) or invalid handles.
+/// EnumFontFamilies(Ex): call `callback(ENUMLOGFONTEX*, NEWTEXTMETRICEX*,
+/// type, lparam)` for each font family (matching `filter`, a face name, if
+/// given), with Unicode structures when `wide`.
+pub fn enum_font_families<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    filter: Option<Vec<u8>>,
+    callback: u32,
+    lparam: u32,
+    wide: bool,
+) -> u32 {
+    let filter = filter.filter(|face| !face.is_empty()).map(|face| face.to_ascii_lowercase());
+    // (face, pitch-and-family, type) — TRUETYPE_FONTTYPE 4, RASTER 1.
+    let families: [(&[u8], u8, u32); 6] = [
+        (b"Arial", 0x22, 4),
+        (b"Courier New", 0x31, 4),
+        (b"MS Sans Serif", 0x22, 1),
+        (b"Times New Roman", 0x12, 4),
+        (b"System", 0x22, 1),
+        (b"Wingdings", 0x02, 4),
+    ];
+    let buffer = ctx.shared.borrow_mut().heap.alloc(512).unwrap_or(0);
+    if buffer == 0 {
+        return 0;
+    }
+    let widen = |bytes: &[u8]| -> Vec<u8> { bytes.iter().flat_map(|&b| [b, 0]).collect() };
+    let mut result = 1;
+    for (face, pitch, kind) in families {
+        if filter.as_ref().is_some_and(|filter| face.to_ascii_lowercase() != *filter) {
+            continue;
+        }
+        let font = LogFont {
+            height: 16,
+            width: 7,
+            escapement: 0,
+            weight: 400,
+            italic: false,
+            underline: false,
+            strike: false,
+            charset: 0,
+            pitch,
+            face: face.to_vec(),
+        };
+        let logfont = logfont_bytes(&font);
+        let mut full = face.to_vec();
+        full.resize(64, 0);
+        let mut style = b"Regular".to_vec();
+        style.resize(32, 0);
+        let mut tm = textmetric_bytes(&font);
+        let (elf, tm, tm_offset) = if wide {
+            // ENUMLOGFONTEXW: LOGFONTW, then full name, style and script.
+            let mut elf = logfont[..28].to_vec();
+            elf.extend(widen(&logfont[28..60]));
+            elf.extend(widen(&full));
+            elf.extend(widen(&style));
+            elf.resize(348, 0);
+            // TEXTMETRICW has WCHAR first/last/default/break characters.
+            let mut wide_tm = tm[..44].to_vec();
+            wide_tm.extend(widen(&tm[44..48]));
+            wide_tm.extend_from_slice(&tm[48..53]);
+            wide_tm.resize(100, 0);
+            (elf, wide_tm, 352)
+        } else {
+            let mut elf = logfont;
+            elf.extend_from_slice(&full);
+            elf.extend_from_slice(&style);
+            elf.resize(156, 0);
+            tm.extend_from_slice(&[0u8; 24]);
+            tm.truncate(80);
+            (elf, tm, 160)
+        };
+        let _ = memory.write_bytes(buffer, &elf);
+        let _ = memory.write_bytes(buffer + tm_offset, &tm);
+        match memory.call_guest(callback, &[buffer, buffer + tm_offset, kind, lparam]) {
+            Some(value) => {
+                result = value;
+                if value == 0 {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    ctx.shared.borrow_mut().heap.free(buffer);
+    result
+}
+
 pub fn with_dc<M: GuestMemory + ?Sized, R>(
     ctx: &ApiContext,
     memory: &mut M,
@@ -3796,7 +3903,12 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     .unwrap_or_default();
                 shared.gdi.font(attrs.font)
             };
-            let _ = memory.write_bytes(args[1], &textmetric_bytes(&font));
+            let metrics = textmetric_bytes(&font);
+            if std::env::var_os("OTW_TRACE_GDI").is_some() {
+                let height = i32::from_le_bytes([metrics[0], metrics[1], metrics[2], metrics[3]]);
+                eprintln!("[gdi] GetTextMetrics dc={:#x} face={:?} height={height}", args[0], String::from_utf8_lossy(&font.face));
+            }
+            let _ = memory.write_bytes(args[1], &metrics);
             ok(1)
         }
         "GetTextFaceA" => {
@@ -3837,82 +3949,16 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "GetTextCharset" => ok(0),
         "EnumFontFamiliesA" | "EnumFontFamiliesExA" => {
-            let (hdc, callback, lparam) = if name == "EnumFontFamiliesA" {
-                (args[0], args[2], args[3])
-            } else {
-                (args[0], args[2], args[3])
-            };
             let filter = if name == "EnumFontFamiliesA" && args[1] != 0 {
-                Some(read_cstr(memory, args[1]).to_ascii_lowercase())
+                Some(read_cstr(memory, args[1]))
             } else if name == "EnumFontFamiliesExA" && args[1] != 0 {
                 let face = memory.read_bytes(args[1] + 28, 32).unwrap_or_default();
                 let end = face.iter().position(|b| *b == 0).unwrap_or(face.len());
-                let face = face[..end].to_ascii_lowercase();
-                if face.is_empty() {
-                    None
-                } else {
-                    Some(face)
-                }
+                Some(face[..end].to_vec())
             } else {
                 None
             };
-            let _ = hdc;
-            // (face, pitch-and-family, type) — TRUETYPE_FONTTYPE 4, RASTER 1.
-            let families: [(&[u8], u8, u32); 6] = [
-                (b"Arial", 0x22, 4),
-                (b"Courier New", 0x31, 4),
-                (b"MS Sans Serif", 0x22, 1),
-                (b"Times New Roman", 0x12, 4),
-                (b"System", 0x22, 1),
-                (b"Wingdings", 0x02, 4),
-            ];
-            let buffer = ctx.shared.borrow_mut().heap.alloc(256).unwrap_or(0);
-            if buffer == 0 {
-                return ok(0);
-            }
-            let mut result = 1;
-            for (face, pitch, kind) in families {
-                if let Some(filter) = &filter {
-                    if face.to_ascii_lowercase() != *filter {
-                        continue;
-                    }
-                }
-                let font = LogFont {
-                    height: 16,
-                    width: 7,
-                    escapement: 0,
-                    weight: 400,
-                    italic: false,
-                    underline: false,
-                    strike: false,
-                    charset: 0,
-                    pitch,
-                    face: face.to_vec(),
-                };
-                let mut elf = logfont_bytes(&font);
-                let mut full = face.to_vec();
-                full.resize(64, 0);
-                elf.extend_from_slice(&full);
-                let mut style = b"Regular".to_vec();
-                style.resize(32, 0);
-                elf.extend_from_slice(&style);
-                elf.resize(156, 0);
-                let mut tm = textmetric_bytes(&font);
-                tm.extend_from_slice(&[0u8; 24]);
-                let _ = memory.write_bytes(buffer, &elf);
-                let _ = memory.write_bytes(buffer + 160, &tm[..80.min(tm.len())]);
-                match memory.call_guest(callback, &[buffer, buffer + 160, kind, lparam]) {
-                    Some(value) => {
-                        result = value;
-                        if value == 0 {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            ctx.shared.borrow_mut().heap.free(buffer);
-            ok(result)
+            ok(enum_font_families(ctx, memory, filter, args[2], args[3], false))
         }
 
         // ── Printing ──

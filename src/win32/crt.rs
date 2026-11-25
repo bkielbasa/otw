@@ -22,19 +22,66 @@ pub fn drive_root() -> PathBuf {
     home.join(".otw").join("C")
 }
 
+/// The guest path (`C:\\...`) of a host file inside drive C:'s directory.
+/// Make sure drive C: has the folders every Windows installation has.
+pub fn prepare_drive() {
+    let root = drive_root();
+    for folder in ["WINDOWS/SYSTEM", "WINDOWS/TEMP", "WINDOWS/Desktop", "WINDOWS/Start Menu/Programs"] {
+        let _ = std::fs::create_dir_all(root.join(folder));
+    }
+    // Windows programs that programs run: OTW carries them out itself
+    // (see CreateProcess); installers check that the files exist.
+    let rundll32 = root.join("WINDOWS/RUNDLL32.EXE");
+    if !rundll32.exists() {
+        let _ = std::fs::write(rundll32, b"MZ OTW: rundll32 runs built in\r\n");
+    }
+}
+
+pub fn guest_path_of(host: &std::path::Path) -> Option<Vec<u8>> {
+    let host = host.canonicalize().ok()?;
+    let (letter, relative) = [(b'C', Some(drive_root())), (b'D', drive_d_root())]
+        .into_iter()
+        .find_map(|(letter, root)| {
+            let root = root?.canonicalize().ok()?;
+            host.strip_prefix(&root).ok().map(|r| (letter, r.to_path_buf()))
+        })?;
+    let mut path = vec![letter, b':'];
+    for component in relative.components() {
+        path.push(b'\\');
+        path.extend_from_slice(component.as_os_str().to_string_lossy().as_bytes());
+    }
+    if path.len() == 2 {
+        path.push(b'\\');
+    }
+    Some(path)
+}
+
+/// Host directory backing drive D:, if any: the folder of a program
+/// started from outside drive C: (`OTW_DRIVE_D`), as if from a CD.
+pub fn drive_d_root() -> Option<PathBuf> {
+    std::env::var_os("OTW_DRIVE_D").map(PathBuf::from)
+}
+
+/// The host directory behind a drive letter.
+fn root_of(drive: u8) -> Option<PathBuf> {
+    match drive.to_ascii_uppercase() {
+        b'C' => Some(drive_root()),
+        b'D' => drive_d_root(),
+        _ => None,
+    }
+}
+
 /// Translate a guest path to a host path. Existing components are matched
 /// case-insensitively; missing ones are kept as given.
 pub fn host_path(guest: &[u8]) -> Option<PathBuf> {
     let text = String::from_utf8_lossy(guest).replace('/', "\\");
     let mut rest = text.as_str();
+    let mut drive = b'C';
     if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
-        let drive = rest.as_bytes()[0].to_ascii_uppercase();
-        if drive != b'C' {
-            return None;
-        }
+        drive = rest.as_bytes()[0];
         rest = &rest[2..];
     }
-    let root = drive_root();
+    let root = root_of(drive)?;
     let _ = std::fs::create_dir_all(&root);
     let mut path = root.clone();
     let relative = !rest.starts_with('\\');
@@ -67,6 +114,33 @@ pub fn host_path(guest: &[u8]) -> Option<PathBuf> {
     Some(path)
 }
 
+/// A guest path made absolute against the process's current directory
+/// (`C:\` unless SetCurrentDirectory changed it).
+pub fn absolute(ctx: &ApiContext, guest: &[u8]) -> Vec<u8> {
+    let has_drive = guest.len() >= 2 && guest[1] == b':';
+    if has_drive {
+        return guest.to_vec();
+    }
+    if guest.first().is_some_and(|b| *b == b'\\' || *b == b'/') {
+        // The root of the current drive.
+        let current = ctx.shared.borrow().current_dir.clone();
+        let drive = if current.len() >= 2 && current[1] == b':' { current[..2].to_vec() } else { b"C:".to_vec() };
+        return [drive.as_slice(), guest].concat();
+    }
+    let mut path = ctx.shared.borrow().current_dir.clone();
+    if !path.ends_with(b"\\") {
+        path.push(b'\\');
+    }
+    path.extend_from_slice(guest);
+    path
+}
+
+/// [`host_path`] of a guest path, relative ones resolved against the
+/// current directory.
+pub fn host_path_in(ctx: &ApiContext, guest: &[u8]) -> Option<PathBuf> {
+    host_path(&absolute(ctx, guest))
+}
+
 /// Open a host file and register it under a new guest handle.
 pub fn open_file(
     ctx: &ApiContext,
@@ -77,7 +151,7 @@ pub fn open_file(
     truncate: bool,
     must_not_exist: bool,
 ) -> Result<u32, u32> {
-    let Some(host) = host_path(path) else {
+    let Some(host) = host_path_in(ctx, path) else {
         return Err(3); // ERROR_PATH_NOT_FOUND
     };
     if must_not_exist && host.exists() {

@@ -61,8 +61,14 @@ pub fn load_menu_template<M: GuestMemory + ?Sized>(
         .read_bytes(va + 2, 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .unwrap_or(0) as u32;
+    if version == 1 {
+        // MENUEX: { version, offset to the items, help ID }.
+        let mut cursor = va + 4 + header;
+        let root = new_menu(ctx, false);
+        parse_items_ex(ctx, memory, &mut cursor, root, 0);
+        return root;
+    }
     if version != 0 {
-        // MENUEX templates are not used by Win95 applications of this era.
         return new_menu(ctx, false);
     }
     let mut cursor = va + 4 + header;
@@ -85,6 +91,53 @@ fn read_wide<M: GuestMemory + ?Sized>(memory: &mut M, cursor: &mut u32) -> Vec<u
         text.push(if unit <= 0xFF { unit as u8 } else { b'?' });
     }
     text
+}
+
+/// MENUEX items: { type, state, ID (DWORDs), flags (WORD), text (UTF-16,
+/// NUL) } aligned to a DWORD; a popup's help ID and items follow it. Flag
+/// 0x80 marks the last item and 0x01 a popup.
+fn parse_items_ex<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    cursor: &mut u32,
+    menu: u32,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    let dword = |memory: &mut M, at: u32| memory.read_u32(at).unwrap_or(0);
+    for _ in 0..256 {
+        let kind = dword(memory, *cursor);
+        let state = dword(memory, *cursor + 4);
+        let id = dword(memory, *cursor + 8);
+        let flags = memory
+            .read_bytes(*cursor + 12, 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .unwrap_or(0x80);
+        *cursor += 14;
+        let text = read_wide(memory, cursor);
+        *cursor = (*cursor + 3) & !3;
+        let mut item = MenuItem {
+            flags: (kind | state) & 0xFFFF & !(MF_POPUP | 0x80),
+            id,
+            text,
+            submenu: 0,
+        };
+        if flags & 0x01 != 0 {
+            *cursor += 4; // the popup's help ID
+            let sub = new_menu(ctx, true);
+            parse_items_ex(ctx, memory, cursor, sub, depth + 1);
+            item.flags |= MF_POPUP;
+            item.submenu = sub;
+        }
+        if let Some(m) = ctx.shared.borrow_mut().gui.menus.get_mut(&menu) {
+            m.items.push(item);
+        }
+        if flags & 0x80 != 0 {
+            break;
+        }
+    }
 }
 
 fn parse_items<M: GuestMemory + ?Sized>(
@@ -1532,14 +1585,13 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             if args[1] == 0 {
                 return ok(entries.len() as u32);
             }
+            // ACCEL: fVirt (byte, padded), key, cmd: six bytes each.
             let mut bytes = Vec::new();
-            for (index, (flags, key, cmd)) in entries.iter().take(args[2] as usize).enumerate() {
-                let last = index + 1 == entries.len().min(args[2] as usize);
-                bytes.push(*flags as u8 | if last { 0x80 } else { 0 });
+            for (flags, key, cmd) in entries.iter().take(args[2] as usize) {
+                bytes.push(*flags as u8);
                 bytes.push(0);
                 bytes.extend_from_slice(&(*key as u16).to_le_bytes());
                 bytes.extend_from_slice(&(*cmd as u16).to_le_bytes());
-                bytes.extend_from_slice(&[0, 0]);
             }
             let _ = memory.write_bytes(args[1], &bytes);
             ok(entries.len().min(args[2] as usize) as u32)

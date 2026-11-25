@@ -57,8 +57,16 @@ pub fn trace() -> bool {
     std::env::var_os("OTW_TRACE_EH").is_some()
 }
 
-fn on_stack(address: u32) -> bool {
-    (STACK_BASE..STACK_TOP + 0x100).contains(&address) && address & 3 == 0
+/// Whether an exception registration record lies on the running thread's
+/// stack (bounds from its TIB).
+fn on_stack<M: GuestMemory + ?Sized>(memory: &mut M, address: u32) -> bool {
+    let tib = memory.current_tib();
+    let (top, bottom) = if tib == TIB_BASE {
+        (STACK_TOP, STACK_BASE)
+    } else {
+        (rd(memory, tib + 4), rd(memory, tib + 8))
+    };
+    (bottom..top.saturating_add(0x100)).contains(&address) && address & 3 == 0
 }
 
 /// Outcome of dispatching one exception.
@@ -201,12 +209,13 @@ pub fn dispatcher<M: GuestMemory + ?Sized>(
 }
 
 fn dispatch<M: GuestMemory + ?Sized>(memory: &mut M, record: u32, context: u32) -> Dispatch {
-    let mut frame = rd(memory, TIB_BASE);
+    let tib = memory.current_tib();
+    let mut frame = rd(memory, tib);
     for _ in 0..4096 {
         if memory.resume_pending() || memory.stopping() {
             return Dispatch::Handled;
         }
-        if frame == u32::MAX || !on_stack(frame) {
+        if frame == u32::MAX || !on_stack(memory, frame) {
             return Dispatch::Unhandled;
         }
         let handler = rd(memory, frame + 4);
@@ -237,9 +246,10 @@ pub fn global_unwind<M: GuestMemory + ?Sized>(
 ) {
     let flags = rd(memory, record + 4);
     wr(memory, record + 4, flags | EH_UNWINDING);
-    let mut frame = rd(memory, TIB_BASE);
+    let tib = memory.current_tib();
+    let mut frame = rd(memory, tib);
     for _ in 0..4096 {
-        if frame == target || frame == u32::MAX || !on_stack(frame) {
+        if frame == target || frame == u32::MAX || !on_stack(memory, frame) {
             break;
         }
         let next = rd(memory, frame);
@@ -248,7 +258,7 @@ pub fn global_unwind<M: GuestMemory + ?Sized>(
         if memory.resume_pending() || memory.stopping() {
             return;
         }
-        wr(memory, TIB_BASE, next);
+        wr(memory, tib, next);
         frame = next;
     }
     wr(memory, record + 4, flags);

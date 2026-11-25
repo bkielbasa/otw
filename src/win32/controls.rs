@@ -2046,6 +2046,9 @@ fn combo_paint<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: 
             }
         }
         let inner = Rect::new(3, 3, cw - 20, height - 3);
+        // The text stays out of the button.
+        let narrowed = p.clip.intersect_rect(&Rect::new(0, 0, inner.right, height).offset(p.ox, p.oy));
+        p.clip = narrowed;
         if kind == 3 && focused {
             p.fill(inner, sys_color(13));
             p.text(4, (height - face.height) / 2, &text, sys_color(14), false);
@@ -2445,6 +2448,144 @@ fn scrollbar_proc<M: GuestMemory + ?Sized>(
     }
 }
 
+/// The rich edit control (RICHED32's `RICHEDIT` class) as a plain edit
+/// control: text streamed in (plain or RTF) shows as plain text, and
+/// formatting requests are accepted without effect.
+fn rich_edit_proc<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    hwnd: u32,
+    msg: u32,
+    wparam: u32,
+    lparam: u32,
+) -> u32 {
+    const EM_EXGETSEL: u32 = 0x434;
+    const EM_STREAMIN: u32 = 0x449;
+    const SF_RTF: u32 = 2;
+    match msg {
+        EM_STREAMIN => {
+            // EDITSTREAM { cookie, error, callback(cookie, buffer, size, &read) }
+            let cookie = memory.read_u32(lparam).unwrap_or(0);
+            let callback = memory.read_u32(lparam + 8).unwrap_or(0);
+            let buffer = ctx.shared.borrow_mut().heap.alloc(4096 + 4).unwrap_or(0);
+            let read_va = buffer + 4096;
+            let mut data = Vec::new();
+            for _ in 0..4096 {
+                let _ = memory.write_u32(read_va, 0);
+                let status = memory.call_guest(callback, &[cookie, buffer, 4096, read_va]).unwrap_or(1);
+                let read = memory.read_u32(read_va).unwrap_or(0).min(4096);
+                if status != 0 || read == 0 {
+                    break;
+                }
+                data.extend(memory.read_bytes(buffer, read as usize).unwrap_or_default());
+            }
+            ctx.shared.borrow_mut().heap.free(buffer);
+            let text = if wparam & SF_RTF != 0 || data.starts_with(b"{\\rtf") { rtf_text(&data) } else { data };
+            let copy = ctx.shared.borrow_mut().heap.alloc(text.len() as u32 + 1).unwrap_or(0);
+            let _ = memory.write_bytes(copy, &[text.as_slice(), &[0]].concat());
+            edit_proc(ctx, memory, hwnd, WM_SETTEXT, 0, copy);
+            ctx.shared.borrow_mut().heap.free(copy);
+            text.len() as u32
+        }
+        EM_EXGETSEL => {
+            let _ = memory.write_bytes(lparam, &[0; 8]);
+            0
+        }
+        // Rich edit messages (formatting, events, options, targets).
+        0x435..=0x45F => match msg {
+            0x444 | 0x448 => 1, // EM_SETCHARFORMAT, EM_SETTARGETDEVICE
+            _ => 0,
+        },
+        _ => edit_proc(ctx, memory, hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The text of an RTF document: control words dropped (`\par` and
+/// `\line` as line breaks, `\tab`, `\'hh` characters), and the font,
+/// colour and style tables and `{\* ...}` destinations skipped.
+pub fn rtf_text(rtf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut skip_depth: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < rtf.len() {
+        let byte = rtf[i];
+        match byte {
+            b'{' => {
+                depth += 1;
+                i += 1;
+                if skip_depth.is_none() {
+                    let rest = &rtf[i..];
+                    let skipped = [b"\\*".as_slice(), b"\\fonttbl", b"\\colortbl", b"\\stylesheet", b"\\info", b"\\pict"];
+                    if skipped.iter().any(|word| rest.starts_with(word)) {
+                        skip_depth = Some(depth);
+                    }
+                }
+            }
+            b'}' => {
+                if skip_depth == Some(depth) {
+                    skip_depth = None;
+                }
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'\\' => {
+                i += 1;
+                let Some(&next) = rtf.get(i) else { break };
+                if !next.is_ascii_alphabetic() {
+                    i += 1;
+                    if skip_depth.is_some() {
+                        continue;
+                    }
+                    match next {
+                        b'\'' => {
+                            let hex = rtf.get(i..i + 2).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok());
+                            if let Some(value) = hex {
+                                out.push(value);
+                            }
+                            i += 2;
+                        }
+                        b'\\' | b'{' | b'}' => out.push(next),
+                        b'~' => out.push(b' '),
+                        _ => {}
+                    }
+                    continue;
+                }
+                let start = i;
+                while rtf.get(i).is_some_and(u8::is_ascii_alphabetic) {
+                    i += 1;
+                }
+                let word = &rtf[start..i];
+                if rtf.get(i) == Some(&b'-') {
+                    i += 1;
+                }
+                while rtf.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                if rtf.get(i) == Some(&b' ') {
+                    i += 1;
+                }
+                if skip_depth.is_some() {
+                    continue;
+                }
+                match word {
+                    b"par" | b"line" => out.extend_from_slice(b"\r\n"),
+                    b"tab" => out.push(b'\t'),
+                    _ => {}
+                }
+            }
+            b'\r' | b'\n' => i += 1,
+            _ => {
+                if skip_depth.is_none() {
+                    out.push(byte);
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Entry point for the Rust-backed control window procedures.
 pub fn control_proc<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
@@ -2459,6 +2600,7 @@ pub fn control_proc<M: GuestMemory + ?Sized>(
         "OTW_ButtonProc" => button_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_StaticProc" => static_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_EditProc" => edit_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_RichEditProc" => rich_edit_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ListBoxProc" => listbox_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ComboBoxProc" => combo_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ScrollBarProc" => scrollbar_proc(ctx, memory, hwnd, msg, wparam, lparam),
@@ -2473,7 +2615,7 @@ pub fn control_proc<M: GuestMemory + ?Sized>(
 
 const DWL_MSGRESULT: usize = 0;
 
-fn set_msg_result(ctx: &ApiContext, hwnd: u32, value: u32) {
+pub fn set_msg_result(ctx: &ApiContext, hwnd: u32, value: u32) {
     if let Some(w) = ctx.shared.borrow_mut().gui.window_mut(hwnd) {
         if w.extra.len() >= 4 {
             w.extra[DWL_MSGRESULT..DWL_MSGRESULT + 4].copy_from_slice(&value.to_le_bytes());
@@ -2481,7 +2623,7 @@ fn set_msg_result(ctx: &ApiContext, hwnd: u32, value: u32) {
     }
 }
 
-fn msg_result(ctx: &ApiContext, hwnd: u32) -> u32 {
+pub fn msg_result(ctx: &ApiContext, hwnd: u32) -> u32 {
     ctx.shared
         .borrow()
         .gui
@@ -2523,9 +2665,9 @@ pub fn def_dlg_proc<M: GuestMemory + ?Sized>(
         .unwrap_or(0);
     if dlg_proc != 0 {
         set_msg_result(ctx, hwnd, 0);
-        let handled = memory
-            .call_guest(dlg_proc, &[hwnd, msg, wparam, lparam])
-            .unwrap_or(0);
+        let handled =
+            crate::win32::unicode::call_proc(ctx, memory, dlg_proc, hwnd, msg, wparam, lparam)
+                .unwrap_or(0);
         if !is_window(ctx, hwnd) {
             return 0;
         }
@@ -2613,6 +2755,27 @@ pub fn def_dlg_proc<M: GuestMemory + ?Sized>(
     }
 }
 
+/// A dialog's control with the given id (0 if none).
+pub fn dialog_item_of(ctx: &ApiContext, dialog: u32, id: u32) -> u32 {
+    dialog_item(ctx, dialog, id)
+}
+
+/// A dialog's first control that takes the focus.
+pub fn first_tab_stop(ctx: &ApiContext, dialog: u32) -> Option<u32> {
+    tab_controls(ctx, dialog).first().copied()
+}
+
+/// Run a dialog's modal loop until EndDialog; returns its result.
+pub fn run_modal_for<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, dialog: u32, owner: u32) -> u32 {
+    run_modal(ctx, memory, dialog, owner)
+}
+
+/// IsDialogMessage for the MSG at `message_va`.
+pub fn is_dialog_message_for<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, dialog: u32, message_va: u32) -> u32 {
+    let message = user::read_message(memory, message_va);
+    u32::from(is_dialog_message(ctx, memory, dialog, message))
+}
+
 fn dialog_item(ctx: &ApiContext, dialog: u32, id: u32) -> u32 {
     let shared = ctx.shared.borrow();
     shared
@@ -2674,7 +2837,111 @@ fn read_sz_or_ord<M: GuestMemory + ?Sized>(
     (None, text)
 }
 
-/// Create a dialog from a DLGTEMPLATE in guest memory.
+/// One control of a dialog template.
+#[derive(Clone, Debug)]
+pub struct TemplateItem {
+    pub style: u32,
+    pub ex_style: u32,
+    pub x: i32,
+    pub y: i32,
+    pub cx: i32,
+    pub cy: i32,
+    pub id: u32,
+    pub class: String,
+    pub title: Vec<u8>,
+    /// Creation data (the item's extra bytes), or 0.
+    pub extra_va: u32,
+}
+
+/// A dialog template (`DLGTEMPLATE` or `DLGTEMPLATEEX`), in dialog units.
+#[derive(Clone, Debug)]
+pub struct DialogTemplate {
+    pub style: u32,
+    pub ex_style: u32,
+    pub x: i32,
+    pub y: i32,
+    pub cx: i32,
+    pub cy: i32,
+    pub class: Option<String>,
+    pub title: Vec<u8>,
+    pub items: Vec<TemplateItem>,
+}
+
+/// Parse a dialog template in guest memory, either format.
+pub fn parse_template<M: GuestMemory + ?Sized>(memory: &mut M, template: u32) -> Option<DialogTemplate> {
+    let read16 = |memory: &mut M, va: u32| memory.read_bytes(va, 2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
+    let extended = read16(memory, template) == 1 && read16(memory, template + 2) == 0xFFFF;
+    let (style, ex_style, header) = if extended {
+        (memory.read_u32(template + 12)?, memory.read_u32(template + 8)?, template + 16)
+    } else {
+        (memory.read_u32(template)?, memory.read_u32(template + 4)?, template + 8)
+    };
+    let item_count = read16(memory, header) as u32;
+    let x = read16(memory, header + 2) as i16 as i32;
+    let y = read16(memory, header + 4) as i16 as i32;
+    let cx = read16(memory, header + 6) as i16 as i32;
+    let cy = read16(memory, header + 8) as i16 as i32;
+    let mut cursor = header + 10;
+    let _menu = read_sz_or_ord(memory, &mut cursor);
+    let (class_ord, class_name) = read_sz_or_ord(memory, &mut cursor);
+    let (_, title) = read_sz_or_ord(memory, &mut cursor);
+    if style & 0x40 != 0 {
+        // DS_SETFONT: point size (and weight, italic, charset), typeface.
+        cursor += if extended { 6 } else { 2 };
+        let _ = read_sz_or_ord(memory, &mut cursor);
+    }
+    let class = match (class_ord, class_name.is_empty()) {
+        (Some(_), _) | (None, true) => None,
+        (None, false) => Some(String::from_utf8_lossy(&class_name).into_owned()),
+    };
+    let mut items = Vec::new();
+    for _ in 0..item_count.min(256) {
+        // Items are DWORD aligned.
+        cursor = (cursor + 3) & !3;
+        let (item_style, item_ex, geometry, id, next) = if extended {
+            // helpID, exStyle, style, x, y, cx, cy, DWORD id
+            (memory.read_u32(cursor + 8)?, memory.read_u32(cursor + 4)?, cursor + 12, memory.read_u32(cursor + 20)?, cursor + 24)
+        } else {
+            (memory.read_u32(cursor)?, memory.read_u32(cursor + 4)?, cursor + 8, read16(memory, cursor + 16) as u32, cursor + 18)
+        };
+        let ix = read16(memory, geometry) as i16 as i32;
+        let iy = read16(memory, geometry + 2) as i16 as i32;
+        let icx = read16(memory, geometry + 4) as i16 as i32;
+        let icy = read16(memory, geometry + 6) as i16 as i32;
+        cursor = next;
+        let (class_ord, class_text) = read_sz_or_ord(memory, &mut cursor);
+        let (title_ord, title_text) = read_sz_or_ord(memory, &mut cursor);
+        let extra = read16(memory, cursor) as u32;
+        let extra_va = if extra > 0 { cursor + 2 } else { 0 };
+        cursor += 2 + extra;
+        let class = match class_ord {
+            Some(0x80) => "Button".to_string(),
+            Some(0x81) => "Edit".to_string(),
+            Some(0x82) => "Static".to_string(),
+            Some(0x83) => "ListBox".to_string(),
+            Some(0x84) => "ScrollBar".to_string(),
+            Some(0x85) => "ComboBox".to_string(),
+            Some(other) => format!("#{other}"),
+            None => String::from_utf8_lossy(&class_text).into_owned(),
+        };
+        // A resource ordinal title (an icon or bitmap of a static) is kept
+        // as "#id" text, as Windows passes it to the control.
+        let title = match title_ord {
+            Some(ordinal) => format!("#{ordinal}").into_bytes(),
+            None => title_text,
+        };
+        items.push(TemplateItem { style: item_style, ex_style: item_ex, x: ix, y: iy, cx: icx, cy: icy, id, class, title, extra_va });
+    }
+    Some(DialogTemplate { style, ex_style, x, y, cx, cy, class, title, items })
+}
+
+/// Size in pixels of dialog units.
+pub fn dialog_units_to_pixels(x: i32, y: i32) -> (i32, i32) {
+    let (bx, by) = base_units();
+    ((x * bx + 2) / 4, (y * by + 4) / 8)
+}
+
+/// Create a dialog from a DLGTEMPLATE or DLGTEMPLATEEX in guest memory.
 pub fn create_dialog<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
     memory: &mut M,
@@ -2684,31 +2951,25 @@ pub fn create_dialog<M: GuestMemory + ?Sized>(
     dlg_proc: u32,
     param: u32,
 ) -> u32 {
-    let style = memory.read_u32(template).unwrap_or(0);
-    if style >> 16 == 0xFFFF {
-        eprintln!("[user] DLGTEMPLATEEX dialogs are not supported");
-        return 0;
+    match parse_template(memory, template) {
+        Some(template) => create_dialog_from(ctx, memory, instance, &template, owner, dlg_proc, param),
+        None => 0,
     }
-    let ex_style = memory.read_u32(template + 4).unwrap_or(0);
-    let read16 = |memory: &mut M, va: u32| {
-        memory
-            .read_bytes(va, 2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .unwrap_or(0)
-    };
-    let item_count = read16(memory, template + 8) as u32;
-    let x = read16(memory, template + 10) as i16 as i32;
-    let y = read16(memory, template + 12) as i16 as i32;
-    let cx = read16(memory, template + 14) as i16 as i32;
-    let cy = read16(memory, template + 16) as i16 as i32;
-    let mut cursor = template + 18;
-    let (menu_ord, menu_name) = read_sz_or_ord(memory, &mut cursor);
-    let (class_ord, class_name) = read_sz_or_ord(memory, &mut cursor);
-    let (_, title) = read_sz_or_ord(memory, &mut cursor);
-    if style & 0x40 != 0 {
-        cursor += 2; // point size
-        let _ = read_sz_or_ord(memory, &mut cursor);
-    }
+}
+
+/// Create a dialog from a parsed template.
+#[allow(clippy::too_many_arguments)]
+pub fn create_dialog_from<M: GuestMemory + ?Sized>(
+    ctx: &ApiContext,
+    memory: &mut M,
+    instance: u32,
+    template: &DialogTemplate,
+    owner: u32,
+    dlg_proc: u32,
+    param: u32,
+) -> u32 {
+    let DialogTemplate { style, ex_style, x, y, cx, cy, .. } = *template;
+    let title = template.title.clone();
     let (bx, by) = base_units();
     let to_px = |value: i32, base: i32, div: i32| (value * base + div / 2) / div;
     let (width, height) = (to_px(cx, bx, 4), to_px(cy, by, 8));
@@ -2748,11 +3009,7 @@ pub fn create_dialog<M: GuestMemory + ?Sized>(
     }
     px = px.clamp(0, (sw - full_w).max(0));
     py = py.clamp(0, (sh - full_h).max(0));
-    let class = match (class_ord, class_name.is_empty()) {
-        (Some(_), _) | (None, true) => "#32770".to_string(),
-        (None, false) => String::from_utf8_lossy(&class_name).into_owned(),
-    };
-    let _ = (menu_ord, menu_name);
+    let class = template.class.clone().unwrap_or_else(|| "#32770".to_string());
     let font = ctx.shared.borrow_mut().gdi.insert(GdiObject::Font(LogFont {
         height: -11,
         width: 0,
@@ -2798,50 +3055,23 @@ pub fn create_dialog<M: GuestMemory + ?Sized>(
             w.font = font;
         }
     }
-    // Items are DWORD aligned.
-    cursor = (cursor + 3) & !3;
-    for _ in 0..item_count.min(256) {
-        cursor = (cursor + 3) & !3;
-        let item_style = memory.read_u32(cursor).unwrap_or(0);
-        let item_ex = memory.read_u32(cursor + 4).unwrap_or(0);
-        let ix = read16(memory, cursor + 8) as i16 as i32;
-        let iy = read16(memory, cursor + 10) as i16 as i32;
-        let icx = read16(memory, cursor + 12) as i16 as i32;
-        let icy = read16(memory, cursor + 14) as i16 as i32;
-        let id = read16(memory, cursor + 16) as u32;
-        cursor += 18;
-        let (class_ord, class_text) = read_sz_or_ord(memory, &mut cursor);
-        let (title_ord, title_text) = read_sz_or_ord(memory, &mut cursor);
-        let extra = read16(memory, cursor) as u32;
-        let extra_va = if extra > 0 { cursor + 2 } else { 0 };
-        cursor += 2 + extra;
-        let class = match class_ord {
-            Some(0x80) => "Button".to_string(),
-            Some(0x81) => "Edit".to_string(),
-            Some(0x82) => "Static".to_string(),
-            Some(0x83) => "ListBox".to_string(),
-            Some(0x84) => "ScrollBar".to_string(),
-            Some(0x85) => "ComboBox".to_string(),
-            Some(other) => format!("#{other}"),
-            None => String::from_utf8_lossy(&class_text).into_owned(),
-        };
-        let _ = title_ord;
+    for item in &template.items {
         let child = user::create_window(
             ctx,
             memory,
             CreateParams {
-                ex_style: item_ex,
-                class,
-                title: title_text,
-                style: item_style | WS_CHILD,
-                x: to_px(ix, bx, 4),
-                y: to_px(iy, by, 8),
-                width: to_px(icx, bx, 4),
-                height: to_px(icy, by, 8),
+                ex_style: item.ex_style,
+                class: item.class.clone(),
+                title: item.title.clone(),
+                style: item.style | WS_CHILD,
+                x: to_px(item.x, bx, 4),
+                y: to_px(item.y, by, 8),
+                width: to_px(item.cx, bx, 4),
+                height: to_px(item.cy, by, 8),
                 parent: hwnd,
-                menu: id,
+                menu: item.id,
                 instance,
-                param: extra_va,
+                param: item.extra_va,
                 ..CreateParams::default()
             },
         );
@@ -3125,6 +3355,31 @@ fn is_dialog_message<M: GuestMemory + ?Sized>(
     true
 }
 
+/// Break lines longer than `max_width` at spaces (or anywhere, for one
+/// overlong word).
+fn wrap_text(face: &gfx::FontFace, text: &[u8], max_width: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for (index, line) in text.split(|b| *b == b'\n').enumerate() {
+        if index > 0 {
+            out.push(b'\n');
+        }
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let mut current: Vec<u8> = Vec::new();
+        for word in line.split(|b| *b == b' ') {
+            let candidate = if current.is_empty() { word.to_vec() } else { [current.as_slice(), b" ", word].concat() };
+            if face.text_width(&candidate) <= max_width || current.is_empty() {
+                current = candidate;
+            } else {
+                out.extend_from_slice(&current);
+                out.push(b'\n');
+                current = word.to_vec();
+            }
+        }
+        out.extend_from_slice(&current);
+    }
+    out
+}
+
 /// Show a modal message box built from standard controls.
 pub fn message_box<M: GuestMemory + ?Sized>(
     ctx: &ApiContext,
@@ -3151,6 +3406,11 @@ pub fn message_box<M: GuestMemory + ?Sized>(
         return buttons[0].0;
     }
     let face = gfx::pick_face(13, false);
+    // Long lines wrap at word boundaries, as Windows wraps message text
+    // to about five eighths of the screen.
+    let max_width = (ctx.shared.borrow().gui.screen.0 * 5 / 8).max(200);
+    let wrapped = wrap_text(&face, text, max_width);
+    let text = wrapped.as_slice();
     let lines: Vec<&[u8]> = text.split(|b| *b == b'\n').collect();
     let text_w = lines.iter().map(|l| face.text_width(l)).max().unwrap_or(0);
     let text_h = face.height * lines.len() as i32;
@@ -3711,9 +3971,13 @@ pub fn format_printf<M: GuestMemory + ?Sized>(
             precision = Some(p);
         }
         let mut long_double = false;
+        // `l` and `w` make %s and %c wide; %S and %C are always wide.
+        let mut wide = false;
         while i < format.len() && b"hlLIwq".contains(&format[i]) {
-            if format[i] == b'L' {
-                long_double = true;
+            match format[i] {
+                b'L' => long_double = true,
+                b'l' | b'w' => wide = true,
+                _ => {}
             }
             i += 1;
         }
@@ -3768,11 +4032,16 @@ pub fn format_printf<M: GuestMemory + ?Sized>(
                 }
                 s
             }
-            b'c' => vec![next(memory) as u8],
-            b's' => {
+            b'c' | b'C' => {
+                let value = next(memory);
+                vec![if (wide || spec == b'C') && value > 0xFF { b'?' } else { value as u8 }]
+            }
+            b's' | b'S' => {
                 let ptr = next(memory);
                 let mut s = if ptr == 0 {
                     b"(null)".to_vec()
+                } else if wide || spec == b'S' {
+                    crate::win32::unicode::wide_to_ansi(&crate::win32::unicode::read_wstr(memory, ptr))
                 } else {
                     read_cstr(memory, ptr)
                 };

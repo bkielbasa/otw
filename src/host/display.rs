@@ -619,6 +619,12 @@ impl GuiRuntime {
         Ok(runtime)
     }
 
+    /// The desktop session (programs other than the one driving the
+    /// display).
+    pub fn session(&self) -> Rc<Session> {
+        self.session.clone()
+    }
+
     /// Pump host events for at most `timeout`. Guest messages produced by the
     /// events are appended to `GuiState::queue` for `GetMessageA` to consume.
     pub fn pump(&mut self, timeout: Duration) {

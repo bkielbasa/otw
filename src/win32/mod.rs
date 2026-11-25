@@ -6,7 +6,14 @@
 //! handles and window records live in [`SharedState`] so a host GUI backend can
 //! observe what the guest asked for and render it.
 
+pub mod advpack;
+pub mod bindctx;
+pub mod catmgr;
+pub mod cab;
 pub mod clipboard;
+pub mod com;
+pub mod comctl32;
+pub mod commctrl;
 pub mod commdlg;
 pub mod controls;
 pub mod crt;
@@ -14,12 +21,28 @@ pub mod cxx;
 pub mod gdi;
 pub mod gfx;
 pub mod icon;
+pub mod inf;
 pub mod kernel32;
 pub mod menu;
+pub mod misc;
+pub mod module;
 pub mod ole;
 pub mod storage;
+pub mod sync;
+pub mod treeview;
+pub mod unicode;
+pub mod version;
 pub mod user;
 pub mod winsock;
+pub mod lnk;
+pub mod profile;
+pub mod registry;
+pub mod rpcrt4;
+pub mod shell;
+pub mod shellfolder;
+pub mod shelllink;
+pub mod xp;
+pub mod xp_user;
 
 use std::{
     cell::RefCell,
@@ -37,8 +60,29 @@ use crate::{
 };
 
 pub use crate::kernel::memory::{
-    read_cstr, write_cstr, ApiOutcome, GuestMemory, Registers, Resume, HEAP_BASE, HEAP_SIZE,
+    read_cstr, write_cstr, ApiOutcome, GuestMemory, Registers, Resume, ThreadRun, HEAP_BASE,
+    HEAP_SIZE,
 };
+
+/// Starts the programs a program creates (`CreateProcess`). The layer that
+/// runs programs provides it.
+pub trait Launcher {
+    /// Start `path` (on drive C:) with `command_line` in `directory`.
+    /// Returns its process ID.
+    fn start(&self, parent: &ApiContext, path: &[u8], command_line: &[u8], directory: &[u8]) -> Result<u32, String>;
+    /// The exit code of a started program, once it has ended.
+    fn exit_code(&self, pid: u32) -> Option<u32>;
+}
+
+/// A program's [`Launcher`], if it may start others.
+#[derive(Clone, Default)]
+pub struct LauncherSlot(pub Option<Rc<dyn Launcher>>);
+
+impl std::fmt::Debug for LauncherSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Launcher" } else { "None" })
+    }
+}
 
 /// First-fit guest heap with coalescing free blocks. Block bookkeeping lives
 /// on the host, so guest overruns cannot corrupt the allocator itself.
@@ -93,6 +137,26 @@ impl GuestHeap {
         true
     }
 
+    /// Take `[start, end)` out of the free space (a program image mapped
+    /// inside the heap's range).
+    pub fn reserve(&mut self, start: u32, end: u32) {
+        let overlapping: Vec<(u32, u32)> = self
+            .free
+            .iter()
+            .filter(|(&block, &length)| block < end && block + length > start)
+            .map(|(&block, &length)| (block, length))
+            .collect();
+        for (block, length) in overlapping {
+            self.free.remove(&block);
+            if block < start {
+                self.free.insert(block, start - block);
+            }
+            if block + length > end {
+                self.free.insert(end, block + length - end);
+            }
+        }
+    }
+
     pub fn size_of(&self, address: u32) -> Option<u32> {
         self.used.get(&address).copied()
     }
@@ -128,6 +192,9 @@ impl GuestMemory for NoGuestMemory {
 #[derive(Clone, Debug, Default)]
 pub struct GuestWindow {
     pub hwnd: u32,
+    /// The thread that created it, whose message loop gets its messages
+    /// (0: any thread).
+    pub thread: u32,
     pub class: String,
     pub title: String,
     pub parent: u32,
@@ -283,6 +350,8 @@ pub struct GuestHook {
 #[derive(Clone, Copy, Debug)]
 pub struct GuestTimer {
     pub hwnd: u32,
+    /// The thread that set it (0: any).
+    pub thread: u32,
     pub id: u32,
     pub interval: u32,
     pub proc_va: u32,
@@ -327,6 +396,8 @@ pub struct GuiState {
     pub next_hwnd: u32,
     pub quit: bool,
     pub quit_code: u32,
+    /// The thread that posted the quit (0: any).
+    pub quit_thread: u32,
     /// Set whenever something changed that the host renderer should redraw.
     pub dirty: bool,
     pub main_hwnd: u32,
@@ -374,6 +445,19 @@ pub struct GuiState {
     /// This program's icons in the taskbar notification area
     /// (`Shell_NotifyIconA`), in the order they were added.
     pub tray: Vec<TrayIcon>,
+    /// Window and dialog procedures that expect UTF-16 messages.
+    pub unicode_procs: std::collections::HashSet<u32>,
+    /// Open property sheets by frame window (0 while one is being created).
+    pub property_sheets: HashMap<u32, comctl32::Sheet>,
+    /// HPROPSHEETPAGEs made by CreatePropertySheetPageW.
+    pub unicode_pages: std::collections::HashSet<u32>,
+    /// State of SysListView32 controls.
+    pub list_views: HashMap<u32, comctl32::ListView>,
+    pub tree_views: HashMap<u32, treeview::TreeView>,
+    /// Toolbars, status bars and subclassed windows.
+    pub toolbars: HashMap<u32, commctrl::Toolbar>,
+    pub status_bars: HashMap<u32, commctrl::StatusBar>,
+    pub subclasses: HashMap<u32, commctrl::Subclasses>,
     /// BeginDeferWindowPos batches.
     pub deferred: std::collections::HashMap<u32, Vec<[u32; 7]>>,
     /// Accelerator tables: (fVirt flags, key, command).
@@ -382,6 +466,9 @@ pub struct GuiState {
     /// Scripted headless input (OTW_INPUT), parsed on first use.
     pub script: Option<VecDeque<String>>,
     pub script_wait: u32,
+    /// The end of a scripted wait in seconds (`t n`): the script goes on
+    /// then even while the program is busy.
+    pub script_until: Option<std::time::Instant>,
     /// Alt (or F10) was pressed with no other key since: its release
     /// activates the menu bar.
     pub alt_alone: bool,
@@ -395,6 +482,7 @@ impl Default for GuiState {
             queue: VecDeque::new(),
             next_hwnd: 0x1000,
             quit: false,
+            quit_thread: 0,
             quit_code: 0,
             dirty: true,
             main_hwnd: 0,
@@ -424,11 +512,20 @@ impl Default for GuiState {
             pending_deactivate: false,
             icons: HashMap::new(),
             tray: Vec::new(),
+            unicode_procs: std::collections::HashSet::new(),
+            property_sheets: HashMap::new(),
+            unicode_pages: std::collections::HashSet::new(),
+            list_views: HashMap::new(),
+            tree_views: HashMap::new(),
+            toolbars: HashMap::new(),
+            status_bars: HashMap::new(),
+            subclasses: HashMap::new(),
             deferred: std::collections::HashMap::new(),
             accelerators: std::collections::HashMap::new(),
             idle_exits: 0,
             script: None,
             script_wait: 0,
+            script_until: None,
             alt_alone: false,
         }
     }
@@ -603,8 +700,6 @@ pub struct SharedState {
     pub fpu_result: Option<f64>,
     /// Global atoms (GlobalAddAtomA).
     pub global_atoms: Vec<String>,
-    /// Registry values written by the guest during this session.
-    pub registry: HashMap<String, Vec<u8>>,
     /// Paths of open file handles, for GetFileTime and friends.
     pub file_paths: HashMap<u32, Vec<u8>>,
     /// Sizes of resources located by FindResourceA.
@@ -629,6 +724,46 @@ pub struct SharedState {
     /// Functions handed out by GetProcAddress for Rust-backed DLLs, indexed
     /// by dynamic thunk slot: (dll, name).
     pub dynamic_imports: Vec<(String, String)>,
+    /// `dynamic_imports` by (lower-case DLL, name).
+    pub dynamic_index: HashMap<(String, String), usize>,
+    /// UTF-16 strings handed out once per process (GetCommandLineW).
+    pub wide_strings: HashMap<String, u32>,
+    /// The program's SetUnhandledExceptionFilter function.
+    pub unhandled_filter: u32,
+    /// The program's own guest path (GetModuleFileName), when known.
+    pub program_path: Vec<u8>,
+    /// VirtualAlloc regions: page-aligned address to (heap block, size).
+    pub virtual_allocs: HashMap<u32, (u32, u32)>,
+    /// File mapping objects: handle to (file handle or 0, size).
+    pub file_mappings: HashMap<u32, (u32, u32)>,
+    /// Mapped views: address to (mapping handle, offset, size).
+    pub mapped_views: HashMap<u32, (u32, u32, u32)>,
+    /// ShowCursor's display count.
+    pub cursor_count: i32,
+    /// The large and small system image lists (SHGetFileInfo).
+    pub system_image_lists: [u32; 2],
+    /// Class objects registered with CoRegisterClassObject.
+    pub class_objects: Vec<crate::win32::com::ClassObject>,
+    /// The objects CoSetState keeps, by thread.
+    pub com_state: HashMap<u32, u32>,
+    /// Image lists (COMCTL32), by handle.
+    pub image_lists: HashMap<u32, commctrl::ImageList>,
+    /// Shell link objects (CLSID_ShellLink) being edited, by address.
+    pub shell_links: HashMap<u32, shelllink::LinkObject>,
+    /// Shell folder and item enumeration objects, by guest address.
+    pub shell_folders: HashMap<u32, shellfolder::Folder>,
+    pub shell_enumerations: HashMap<u32, shellfolder::Enumeration>,
+    pub desktop_folder: u32,
+    pub bind_contexts: HashMap<u32, bindctx::BindCtx>,
+    pub categories: catmgr::CatState,
+    /// Threads and synchronisation objects.
+    pub sync: sync::SyncState,
+    /// Starts programs for CreateProcess.
+    pub launcher: LauncherSlot,
+    /// The program asked Windows to restart (ExitWindowsEx).
+    pub restart_requested: bool,
+    /// The current directory (a guest path such as `C:\\WINDOWS`).
+    pub current_dir: Vec<u8>,
 }
 
 impl Default for SharedState {
@@ -649,7 +784,6 @@ impl Default for SharedState {
             crt_tables: crate::win32::crt::CrtTables::default(),
             fpu_result: None,
             global_atoms: Vec::new(),
-            registry: HashMap::new(),
             file_paths: HashMap::new(),
             resource_sizes: HashMap::new(),
             finds: HashMap::new(),
@@ -661,6 +795,28 @@ impl Default for SharedState {
             eh_current: Vec::new(),
             storage: crate::win32::storage::StorageState::default(),
             dynamic_imports: Vec::new(),
+            dynamic_index: HashMap::new(),
+            wide_strings: HashMap::new(),
+            unhandled_filter: 0,
+            current_dir: b"C:\\".to_vec(),
+            shell_links: HashMap::new(),
+            shell_folders: HashMap::new(),
+            shell_enumerations: HashMap::new(),
+            desktop_folder: 0,
+            bind_contexts: HashMap::new(),
+            categories: catmgr::CatState::default(),
+            sync: sync::SyncState::default(),
+            launcher: LauncherSlot::default(),
+            restart_requested: false,
+            image_lists: HashMap::new(),
+            cursor_count: 0,
+            system_image_lists: [0; 2],
+            class_objects: Vec::new(),
+            com_state: HashMap::new(),
+            program_path: Vec::new(),
+            virtual_allocs: HashMap::new(),
+            file_mappings: HashMap::new(),
+            mapped_views: HashMap::new(),
         }
     }
 }
@@ -696,6 +852,8 @@ impl SharedState {
         self.eh_current.clear();
         self.storage = crate::win32::storage::StorageState::default();
         self.dynamic_imports.clear();
+        self.dynamic_index.clear();
+        self.sync = sync::SyncState::default();
     }
 
     /// Milliseconds since the process started.
@@ -719,48 +877,75 @@ impl SharedState {
 }
 
 /// Export facts for a genuine PE module mapped into guest memory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LoadedModule {
     pub name: String,
     pub image_base: u32,
     pub size: u32,
     pub exports_by_name: HashMap<String, u32>,
     pub exports_by_ordinal: HashMap<u16, u32>,
+    /// Exports that forward to another DLL (`DLL.Name` or `DLL.#ordinal`).
+    pub forwards_by_name: HashMap<String, String>,
+    pub forwards_by_ordinal: HashMap<u16, String>,
+    /// Where it was loaded from (`C:\\...`), for modules loaded at run time.
+    pub path: Vec<u8>,
+    /// Its entry point (DllMain), if any.
+    pub entry: u32,
 }
 
 impl LoadedModule {
     pub fn from_image(name: String, image: &PeImage) -> Self {
-        let mut exports_by_name = HashMap::new();
-        let mut exports_by_ordinal = HashMap::new();
-        if let Some(exports) = &image.export_directory {
-            for (index, rva) in exports.addresses.iter().enumerate() {
-                if *rva == 0 || exports.forwarders.contains_key(&index) {
-                    continue;
-                }
-                let va = image.image_base.wrapping_add(*rva);
-                if let Some(ordinal) = exports
-                    .ordinal_base
-                    .checked_add(index as u32)
-                    .and_then(|value| u16::try_from(value).ok())
-                {
-                    exports_by_ordinal.insert(ordinal, va);
-                }
-            }
-            for (name, index) in &exports.names {
-                if let Some(rva) = exports.addresses.get(*index) {
-                    if *rva != 0 && !exports.forwarders.contains_key(index) {
-                        exports_by_name.insert(name.clone(), image.image_base.wrapping_add(*rva));
-                    }
-                }
-            }
-        }
-        Self {
+        Self::at(name, image, image.image_base)
+    }
+
+    /// A module mapped at `base` (its preferred base unless relocated).
+    pub fn at(name: String, image: &PeImage, base: u32) -> Self {
+        let mut module = Self {
             name,
-            image_base: image.image_base,
+            image_base: base,
             size: image.size_of_image,
-            exports_by_name,
-            exports_by_ordinal,
+            entry: if image.entry_rva == 0 { 0 } else { base.wrapping_add(image.entry_rva) },
+            ..Self::default()
+        };
+        let Some(exports) = &image.export_directory else {
+            return module;
+        };
+        let ordinal_of = |index: usize| {
+            exports
+                .ordinal_base
+                .checked_add(index as u32)
+                .and_then(|value| u16::try_from(value).ok())
+        };
+        for (index, rva) in exports.addresses.iter().enumerate() {
+            if *rva == 0 {
+                continue;
+            }
+            let Some(ordinal) = ordinal_of(index) else {
+                continue;
+            };
+            match exports.forwarders.get(&index) {
+                Some(target) => {
+                    module.forwards_by_ordinal.insert(ordinal, target.clone());
+                }
+                None => {
+                    module.exports_by_ordinal.insert(ordinal, base.wrapping_add(*rva));
+                }
+            }
         }
+        for (name, index) in &exports.names {
+            let Some(rva) = exports.addresses.get(*index).filter(|rva| **rva != 0) else {
+                continue;
+            };
+            match exports.forwarders.get(index) {
+                Some(target) => {
+                    module.forwards_by_name.insert(name.clone(), target.clone());
+                }
+                None => {
+                    module.exports_by_name.insert(name.clone(), base.wrapping_add(*rva));
+                }
+            }
+        }
+        module
     }
 }
 
@@ -769,8 +954,9 @@ impl LoadedModule {
 pub struct ApiContext {
     pub image_base: u32,
     pub command_line_va: u32,
-    /// Genuine modules available to `LoadLibraryA`/`GetProcAddress`.
-    pub modules: Vec<LoadedModule>,
+    /// Genuine modules available to `LoadLibraryA`/`GetProcAddress`: those
+    /// mapped at start, then those loaded at run time.
+    pub modules: Rc<RefCell<Vec<LoadedModule>>>,
     pub shared: Rc<RefCell<SharedState>>,
     /// Guest-callable addresses of Rust-backed USER32 window procedures,
     /// keyed by address (for direct dispatch) and by name.
@@ -783,7 +969,7 @@ impl Default for ApiContext {
         Self {
             image_base: 0,
             command_line_va: 0,
-            modules: Vec::new(),
+            modules: Rc::new(RefCell::new(Vec::new())),
             shared: Rc::new(RefCell::new(SharedState::default())),
             procs: Rc::new(HashMap::new()),
             builtin: Rc::new(HashMap::new()),
@@ -817,6 +1003,11 @@ impl ApiContext {
                 builtin.insert(name.clone(), image.entry_point(&dll, &name).unwrap_or(0));
             }
         }
+        for module in &image.modules {
+            let start = module.image.image_base & !0xFFF;
+            let end = (module.image.image_base + module.memory.len() as u32 + 0xFFF) & !0xFFF;
+            shared.borrow_mut().heap.reserve(start, end);
+        }
         builtin.insert(
             "__dynamic_base".to_owned(),
             image.entry_point(DYNAMIC_DLL, "slot0").unwrap_or(0),
@@ -824,11 +1015,13 @@ impl ApiContext {
         Self {
             image_base: image.main().image_base,
             command_line_va: image.command_line_va,
-            modules: image
-                .modules
-                .iter()
-                .map(|module| LoadedModule::from_image(module.name.clone(), &module.image))
-                .collect(),
+            modules: Rc::new(RefCell::new(
+                image
+                    .modules
+                    .iter()
+                    .map(|module| LoadedModule::from_image(module.name.clone(), &module.image))
+                    .collect(),
+            )),
             shared,
             procs: Rc::new(procs),
             builtin: Rc::new(builtin),
@@ -848,7 +1041,11 @@ impl ApiContext {
         }
         let slot = name.as_str()?.strip_prefix("slot")?.parse::<usize>().ok()?;
         let (dll, name) = self.shared.borrow().dynamic_imports.get(slot).cloned()?;
-        Some((Cow::Owned(dll), Cow::Owned(ImportName::ByName(name))))
+        let import = match name.strip_prefix('#').and_then(|n| n.parse::<u16>().ok()) {
+            Some(ordinal) => ImportName::Ordinal(ordinal),
+            None => ImportName::ByName(name),
+        };
+        Some((Cow::Owned(dll), Cow::Owned(import)))
     }
 }
 
@@ -866,8 +1063,13 @@ pub fn entry_points() -> Vec<(String, String)> {
         BUILTIN_COM
             .iter()
             .chain(storage::STORAGE_METHODS)
+            .chain(shelllink::SHELL_LINK_METHODS)
+            .chain(shellfolder::METHODS)
+            .chain(bindctx::METHODS)
+            .chain(catmgr::methods())
             .map(|name| ("OLE32.dll".to_owned(), (*name).to_owned())),
     );
+    entries.push(("KERNEL32.dll".to_owned(), "OTW_ThreadStart".to_owned()));
     entries.extend(
         (0..kernel32::DYNAMIC_SLOTS).map(|slot| (DYNAMIC_DLL.to_owned(), format!("slot{slot}"))),
     );
@@ -892,6 +1094,13 @@ impl SystemCalls for ApiContext {
         let (dll, name) = self.resolve(dll, name)?;
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
     }
+
+    fn describe(&self, dll: &str, name: &ImportName) -> String {
+        match self.resolve(dll, name) {
+            Some((dll, name)) => format!("{dll}!{}", name.display()),
+            None => format!("{dll}!{}", name.display()),
+        }
+    }
 }
 
 /// Imports Win32 implements itself even when a genuine DLL is mapped.
@@ -909,6 +1118,7 @@ pub const BUILTIN_PROCS: &[&str] = &[
     "DefDlgProcA",
     "OTW_ButtonProc",
     "OTW_EditProc",
+    "OTW_RichEditProc",
     "OTW_StaticProc",
     "OTW_ListBoxProc",
     "OTW_ComboBoxProc",
@@ -916,6 +1126,13 @@ pub const BUILTIN_PROCS: &[&str] = &[
     "OTW_MDIClientProc",
     "OTW_MenuProc",
     "OTW_ColorPanelProc",
+    "OTW_PropSheetProc",
+    "OTW_TabProc",
+    "OTW_ListViewProc",
+    "OTW_TreeViewProc",
+    "OTW_SubclassProc",
+    "OTW_ToolbarProc",
+    "OTW_StatusProc",
 ];
 
 /// Rust-backed COM methods (stdcall, `this` first) exposed through vtables.
@@ -991,10 +1208,23 @@ pub const BUILTIN_COM: &[&str] = &[
 /// upper bound; the handler pops zero words because it is cdecl.
 pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
     if let ImportName::Ordinal(ordinal) = name {
+        if let Some(named) = crate::win32::winsock::ordinal_name(dll, *ordinal) {
+            return crate::win32::winsock::arg_count(named);
+        }
+        if let Some(named) = commctrl::ordinal_name(dll, *ordinal) {
+            return commctrl::arg_count(named);
+        }
+        if let Some(named) = shell::ordinal_name(dll, *ordinal) {
+            return shell::arg_count(named);
+        }
         // Windows 95 KERNEL32 ordinal 18 is the private, ordinal-only
         // GetProcessDword(process, index) export.
         if dll.eq_ignore_ascii_case("kernel32.dll") && *ordinal == 18 {
             return Some(2);
+        }
+        // Ordinals 1-9: VxDCall0..VxDCall8 (service and 0-8 arguments).
+        if dll.eq_ignore_ascii_case("kernel32.dll") && (1..=9).contains(ordinal) {
+            return Some(*ordinal as usize);
         }
         if let Some(count) = crate::win32::ole::arg_count(dll, name) {
             return Some(count);
@@ -1008,14 +1238,46 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
         ImportName::ByName(name) => name.as_str(),
         ImportName::Ordinal(_) => unreachable!(),
     };
+    if let Some(count) = sync::arg_count(name) {
+        return Some(count);
+    }
+    if dll.eq_ignore_ascii_case("advapi32.dll") {
+        if let Some(count) = registry::arg_count(name) {
+            return Some(count);
+        }
+    }
+    if dll.eq_ignore_ascii_case("rpcrt4.dll") {
+        return rpcrt4::arg_count(name);
+    }
+    if dll.eq_ignore_ascii_case("advpack.dll") {
+        return advpack::arg_count(name);
+    }
+    if dll.eq_ignore_ascii_case("version.dll") {
+        if let Some(count) = version::arg_count(name) {
+            return Some(count);
+        }
+    }
+    if dll.eq_ignore_ascii_case("shell32.dll") {
+        if let Some(count) = shell::arg_count(name) {
+            return Some(count);
+        }
+    }
+    if let Some(count) = comctl32::arg_count(name)
+        .or_else(|| commctrl::arg_count(name))
+        .or_else(|| xp_user::arg_count(name))
+        .or_else(|| profile::arg_count(name))
+        .or_else(|| unicode::arg_count(dll, name))
+        .or_else(|| xp::arg_count(name))
+        .or_else(|| misc::arg_count(name))
+    {
+        return Some(count);
+    }
     if dll.eq_ignore_ascii_case("wsock32.dll") || dll.eq_ignore_ascii_case("winsock.dll") {
         crate::win32::winsock::arg_count(name)
     } else if dll.eq_ignore_ascii_case("msvcrt20.dll") {
         msvcrt20::arg_count(name)
     } else if dll.eq_ignore_ascii_case("kernel32.dll") {
         kernel32_base::arg_count(name)
-    } else if dll.eq_ignore_ascii_case("advapi32.dll") {
-        advapi32::arg_count(name)
     } else if dll.eq_ignore_ascii_case("user32.dll") {
         crate::win32::user::arg_count(name)
     } else if dll.eq_ignore_ascii_case("gdi32.dll") {
@@ -1171,10 +1433,23 @@ pub fn dispatch_with_memory<M: GuestMemory + ?Sized>(
         }
     }
     if let ImportName::Ordinal(ordinal) = name {
+        if let Some(named) = crate::win32::winsock::ordinal_name(dll, *ordinal) {
+            return crate::win32::winsock::dispatch(ctx, memory, &ImportName::ByName(named.into()), args);
+        }
+        if let Some(named) = commctrl::ordinal_name(dll, *ordinal) {
+            return commctrl::dispatch(ctx, memory, named, args);
+        }
+        if let Some(named) = shell::ordinal_name(dll, *ordinal) {
+            return shell::dispatch(ctx, memory, named, args);
+        }
         if dll.eq_ignore_ascii_case("kernel32.dll") && *ordinal == 18 {
             return args
                 .get(1)
                 .map(|index| ApiOutcome::new(kernel32_base::get_process_dword(*index), 2));
+        }
+        if dll.eq_ignore_ascii_case("kernel32.dll") && (1..=9).contains(ordinal) {
+            let value = misc::vxd_call(ctx, memory, args);
+            return Some(ApiOutcome::new(value, *ordinal as usize));
         }
         if crate::win32::ole::arg_count(dll, name).is_some() {
             return crate::win32::ole::dispatch(ctx, memory, dll, name, args);
@@ -1184,14 +1459,53 @@ pub fn dispatch_with_memory<M: GuestMemory + ?Sized>(
     if crate::win32::ole::arg_count(dll, name).is_some() {
         return crate::win32::ole::dispatch(ctx, memory, dll, name, args);
     }
+    if let ImportName::ByName(text) = name {
+        if sync::arg_count(text).is_some() {
+            return sync::dispatch(ctx, memory, text, args);
+        }
+        if dll.eq_ignore_ascii_case("rpcrt4.dll") {
+            return rpcrt4::dispatch(ctx, memory, text, args);
+        }
+        if dll.eq_ignore_ascii_case("advpack.dll") {
+            return advpack::dispatch(ctx, memory, text, args);
+        }
+        if dll.eq_ignore_ascii_case("version.dll") {
+            return version::dispatch(ctx, memory, text, args);
+        }
+        if dll.eq_ignore_ascii_case("shell32.dll") && shell::arg_count(text).is_some() {
+            return shell::dispatch(ctx, memory, text, args);
+        }
+        if dll.eq_ignore_ascii_case("advapi32.dll") && registry::arg_count(text).is_some() {
+            return registry::dispatch(ctx, memory, text, args);
+        }
+        if comctl32::arg_count(text).is_some() {
+            return comctl32::dispatch(ctx, memory, text, args);
+        }
+        if commctrl::arg_count(text).is_some() {
+            return commctrl::dispatch(ctx, memory, text, args);
+        }
+        if xp_user::arg_count(text).is_some() {
+            return xp_user::dispatch(ctx, memory, text, args);
+        }
+        if profile::arg_count(text).is_some() {
+            return profile::dispatch(ctx, memory, text, args);
+        }
+        if unicode::arg_count(dll, text).is_some() {
+            return unicode::dispatch(ctx, memory, dll, text, args, caller);
+        }
+        if xp::arg_count(text).is_some() {
+            return xp::dispatch(ctx, memory, text, args);
+        }
+        if misc::arg_count(text).is_some() {
+            return misc::dispatch(ctx, memory, text, args);
+        }
+    }
     if dll.eq_ignore_ascii_case("wsock32.dll") || dll.eq_ignore_ascii_case("winsock.dll") {
         crate::win32::winsock::dispatch(ctx, memory, name, args)
     } else if dll.eq_ignore_ascii_case("msvcrt20.dll") {
         msvcrt20::dispatch(ctx, memory, name, args)
     } else if dll.eq_ignore_ascii_case("kernel32.dll") {
         kernel32_base::dispatch(ctx, memory, name, args)
-    } else if dll.eq_ignore_ascii_case("advapi32.dll") {
-        advapi32::dispatch(ctx, memory, name, args)
     } else if dll.eq_ignore_ascii_case("user32.dll") {
         crate::win32::user::dispatch(ctx, memory, name, args, caller)
     } else if dll.eq_ignore_ascii_case("gdi32.dll") {
@@ -1705,13 +2019,6 @@ mod kernel32_base {
             | "InitializeCriticalSection"
             | "DeleteCriticalSection" => 1,
             "GetWindowsDirectoryA" | "GetSystemDirectoryA" | "LocalAlloc" | "GlobalAlloc" => 2,
-            "GetProfileIntA" => 3,
-            "GetPrivateProfileIntA" => 4,
-            "GetProfileStringA" => 5,
-            "GetPrivateProfileStringA"
-            | "GetPrivateProfileStructA"
-            | "WritePrivateProfileStructA" => 5,
-            "WriteProfileStringA" | "WritePrivateProfileStringA" => 3,
             "lstrlenA" | "lstrlenW" => 1,
             "lstrcmpA" | "lstrcmpiA" | "lstrcatA" | "lstrcpyA" | "_lcreat" | "_lopen" => 2,
             "lstrcpynA" | "LocalReAlloc" | "_lwrite" | "_llseek" | "_lread" | "GetLocaleInfoA" => {
@@ -1768,7 +2075,8 @@ mod kernel32_base {
             }
             "GetCommandLineA" => ApiOutcome::new(ctx.command_line_va, count),
             // Windows 95 RTM: major 4, minor 0, build 950.
-            "GetVersion" => ApiOutcome::new(0x03B6_0004, count),
+            // Windows 95 4.00.950: the high bit marks Windows 95, not NT.
+            "GetVersion" => ApiOutcome::new(0xC3B6_0004, count),
             "GetWindowsDirectoryA" => {
                 ApiOutcome::new(copy_path(memory, args[0], args[1], b"C:\\WINDOWS"), count)
             }
@@ -1780,10 +2088,17 @@ mod kernel32_base {
             // protected-mode IFSMgr VxD service that the VM does not provide.
             "GetDriveTypeA" => {
                 let path = read_cstr(memory, args[0]);
-                let removable = path.first().is_some_and(|byte| {
-                    byte.is_ascii_alphabetic() && matches!(byte.to_ascii_uppercase(), b'A' | b'B')
-                });
-                ApiOutcome::new(if removable { 2 } else { 3 }, count)
+                // C: (and D:, when a program came from elsewhere) are fixed
+                // disks; A: and B: floppies; others do not exist.
+                let letter = path.first().map(u8::to_ascii_uppercase).unwrap_or(b'C');
+                let kind = match letter {
+                    b'A' | b'B' => 2,
+                    b'C' => 3,
+                    b'D' if crate::win32::crt::drive_d_root().is_some() => 3,
+                    _ if !letter.is_ascii_alphabetic() => 3,
+                    _ => 1, // DRIVE_NO_ROOT_DIR
+                };
+                ApiOutcome::new(kind, count)
             }
             // Genuine GetVolumeInformationA enters the same IFSMgr VxD path.
             // SHELL32 only uses the returned flags to classify the drive, so
@@ -1885,28 +2200,30 @@ mod kernel32_base {
             }
             // Single-threaded guest: no per-DLL thread notification is needed.
             "DisableThreadLibraryCalls" => ApiOutcome::new(1, count),
-            "ExitProcess" | "ExitThread" => ApiOutcome {
-                value: 0,
-                arg_count: count,
-                exit_code: Some(args[0]),
-            },
+            "ExitProcess" | "ExitThread" => {
+                registry::flush();
+                ApiOutcome {
+                    value: 0,
+                    arg_count: count,
+                    exit_code: Some(args[0]),
+                }
+            }
             "GetProcAddress" => {
                 let requested = if args[1] < 0x10000 {
                     None
                 } else {
                     Some(String::from_utf8_lossy(&read_cstr(memory, args[1])).into_owned())
                 };
-                let address = ctx
-                    .modules
-                    .iter()
-                    .find(|module| module.image_base == args[0])
-                    .and_then(|module| match &requested {
-                        Some(name) => module.exports_by_name.get(name).copied(),
-                        None => module.exports_by_ordinal.get(&(args[1] as u16)).copied(),
-                    });
+                let import = match &requested {
+                    Some(name) => ImportName::ByName(name.clone()),
+                    None => ImportName::Ordinal(args[1] as u16),
+                };
+                let address =
+                    crate::win32::module::proc_address(ctx, memory, args[0], &import, 0);
                 let address = address.or_else(|| {
                     let dll = crate::win32::kernel32::system_module_name(args[0])?;
-                    let name = requested.clone()?;
+                    // Functions of Rust-backed DLLs by name, or "#ordinal".
+                    let name = requested.clone().unwrap_or_else(|| format!("#{}", args[1]));
                     crate::win32::kernel32::dynamic_thunk(ctx, dll, &name)
                 });
                 match address {
@@ -1921,7 +2238,7 @@ mod kernel32_base {
                 let name = String::from_utf8_lossy(&read_cstr(memory, args[0])).into_owned();
                 if let Some(module) = ctx
                     .modules
-                    .iter()
+                    .borrow().iter()
                     .find(|module| module.name.eq_ignore_ascii_case(&name))
                 {
                     ApiOutcome::new(module.image_base, count)
@@ -1952,26 +2269,28 @@ mod kernel32_base {
             "lstrlenA" => ApiOutcome::new(read_cstr(memory, args[0]).len() as u32, count),
             "lstrlenW" => ApiOutcome::new(wide_len(memory, args[0]), count),
             "MultiByteToWideChar" => {
-                let source = read_cstr(memory, args[2]);
-                let needed = source.len() as u32 + 1;
+                // An explicit length converts exactly that many bytes (any
+                // terminator among them included); -1 converts through the
+                // terminator.
+                let mut source = if (args[3] as i32) < 0 {
+                    read_cstr(memory, args[2])
+                } else {
+                    memory.read_bytes(args[2], args[3] as usize).unwrap_or_default()
+                };
+                if (args[3] as i32) < 0 {
+                    source.push(0);
+                }
+                let needed = source.len() as u32;
                 let capacity = args[5];
                 let destination = args[4];
-                if capacity > 0 && destination != 0 {
-                    let limit = capacity.min(needed);
-                    for (index, byte) in source
-                        .iter()
-                        .take(limit.saturating_sub(1) as usize)
-                        .enumerate()
-                    {
-                        let _ = memory
-                            .write_bytes(destination.wrapping_add(index as u32 * 2), &[*byte, 0]);
-                    }
-                    if limit == needed {
-                        let _ =
-                            memory.write_bytes(destination.wrapping_add((needed - 1) * 2), &[0, 0]);
-                    }
-                    ApiOutcome::new(limit, count)
+                if capacity == 0 {
+                    ApiOutcome::new(needed, count)
+                } else if capacity < needed || destination == 0 {
+                    ctx.shared.borrow_mut().last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                    ApiOutcome::new(0, count)
                 } else {
+                    let wide: Vec<u8> = source.iter().flat_map(|&b| [b, 0]).collect();
+                    let _ = memory.write_bytes(destination, &wide);
                     ApiOutcome::new(needed, count)
                 }
             }
@@ -2022,15 +2341,6 @@ mod kernel32_base {
                 } else {
                     ApiOutcome::new(0, count)
                 }
-            }
-            "GetProfileStringA" | "GetPrivateProfileStringA" => {
-                let default = read_cstr(memory, args[2]);
-                ApiOutcome::new(copy_path(memory, args[3], args[4], &default), count)
-            }
-            "GetProfileIntA" | "GetPrivateProfileIntA" => ApiOutcome::new(args[2], count),
-            "GetPrivateProfileStructA" => ApiOutcome::new(0, count),
-            "WriteProfileStringA" | "WritePrivateProfileStringA" | "WritePrivateProfileStructA" => {
-                ApiOutcome::new(1, count)
             }
             "GetTimeFormatA" | "GetDateFormatA" => {
                 if args[5] > 0 && args[4] != 0 {
@@ -2321,283 +2631,6 @@ mod comdlg32 {
             _ => return None,
         };
         Some(outcome)
-    }
-}
-
-// ── ADVAPI32 (registry) ────────────────────────────────────────────────────
-
-mod advapi32 {
-    use super::*;
-
-    pub(super) fn arg_count(name: &str) -> Option<usize> {
-        Some(match name {
-            "RegCloseKey" | "RegFlushKey" => 1,
-            "RegDeleteKeyA" | "RegDeleteKeyW" | "RegDeleteValueA" | "RegDeleteValueW" => 2,
-            "RegOpenKeyA" | "RegOpenKeyW" | "RegCreateKeyA" | "RegCreateKeyW" => 3,
-            "RegQueryValueA" | "RegQueryValueW" | "RegEnumKeyA" | "RegEnumKeyW" => 4,
-            "RegOpenKeyExA" | "RegOpenKeyExW" | "RegSetValueA" | "RegSetValueW" => 5,
-            "RegQueryValueExA" | "RegQueryValueExW" | "RegSetValueExA" | "RegSetValueExW" => 6,
-            "RegEnumKeyExA" | "RegEnumKeyExW" | "RegEnumValueA" | "RegEnumValueW" => 8,
-            "RegCreateKeyExA" | "RegCreateKeyExW" => 9,
-            "RegQueryInfoKeyA" | "RegQueryInfoKeyW" => 12,
-            _ => return None,
-        })
-    }
-
-    fn root_name(key: u32) -> Option<&'static str> {
-        Some(match key {
-            0x8000_0000 => "HKCR",
-            0x8000_0001 => "HKCU",
-            0x8000_0002 => "HKLM",
-            0x8000_0003 => "HKU",
-            0x8000_0005 => "HKCC",
-            _ => return None,
-        })
-    }
-
-    /// Full path of an open key handle.
-    fn key_path(shared: &SharedState, key: u32) -> Option<String> {
-        if let Some(root) = root_name(key) {
-            return Some(root.to_string());
-        }
-        shared
-            .registry
-            .keys()
-            .find(|k| k.starts_with(&format!("#handle:{key}:")))
-            .map(|k| k[format!("#handle:{key}:").len()..].to_string())
-    }
-
-    fn join(base: &str, sub: &[u8]) -> String {
-        let sub = String::from_utf8_lossy(sub).replace('/', "\\");
-        let sub = sub.trim_matches('\\');
-        if sub.is_empty() {
-            base.to_string()
-        } else {
-            format!("{base}\\{sub}").to_ascii_lowercase()
-        }
-    }
-
-    fn key_exists(shared: &SharedState, path: &str) -> bool {
-        let path = path.to_ascii_lowercase();
-        root_name_of(&path) || shared.registry.contains_key(&format!("#key:{path}"))
-    }
-
-    fn root_name_of(path: &str) -> bool {
-        matches!(path, "hkcr" | "hkcu" | "hklm" | "hku" | "hkcc")
-    }
-
-    fn create_key(shared: &mut SharedState, path: &str) {
-        let mut current = String::new();
-        for part in path.to_ascii_lowercase().split('\\') {
-            if current.is_empty() {
-                current = part.to_string();
-            } else {
-                current = format!("{current}\\{part}");
-            }
-            shared
-                .registry
-                .entry(format!("#key:{current}"))
-                .or_default();
-        }
-    }
-
-    fn open_handle(shared: &mut SharedState, path: &str) -> u32 {
-        let handle = shared.alloc_handle() | 0x0080_0000;
-        shared.registry.insert(
-            format!("#handle:{handle}:{}", path.to_ascii_lowercase()),
-            Vec::new(),
-        );
-        handle
-    }
-
-    fn value_key(path: &str, name: &[u8]) -> String {
-        format!(
-            "#value:{}|{}",
-            path.to_ascii_lowercase(),
-            String::from_utf8_lossy(name).to_ascii_lowercase()
-        )
-    }
-
-    pub(super) fn dispatch<M: GuestMemory + ?Sized>(
-        ctx: &ApiContext,
-        memory: &mut M,
-        name: &ImportName,
-        args: &[u32],
-    ) -> Option<ApiOutcome> {
-        let name = name_of(name)?;
-        let count = arg_count(name)?;
-        if args.len() < count {
-            return None;
-        }
-        let ok = |value: u32| Some(ApiOutcome::new(value, count));
-        const NOT_FOUND: u32 = 2;
-        const BAD_HANDLE: u32 = 6;
-        if name.ends_with('W') {
-            // Wide registry calls are only probed by optional components.
-            return ok(NOT_FOUND);
-        }
-        let mut shared = ctx.shared.borrow_mut();
-        let Some(base) = key_path(&shared, args[0]) else {
-            return ok(BAD_HANDLE);
-        };
-        match name {
-            "RegCloseKey" => {
-                let prefix = format!("#handle:{}:", args[0]);
-                shared.registry.retain(|k, _| !k.starts_with(&prefix));
-                ok(0)
-            }
-            "RegFlushKey" => ok(0),
-            "RegOpenKeyA" | "RegOpenKeyExA" | "RegCreateKeyA" | "RegCreateKeyExA" => {
-                let sub = if args[1] == 0 {
-                    Vec::new()
-                } else {
-                    read_cstr(memory, args[1])
-                };
-                let path = join(&base, &sub);
-                let out = match name {
-                    "RegOpenKeyA" | "RegCreateKeyA" => args[2],
-                    "RegOpenKeyExA" => args[4],
-                    _ => args[7],
-                };
-                let create = name.contains("Create");
-                if !create && !key_exists(&shared, &path) {
-                    let _ = memory.write_u32(out, 0);
-                    return ok(NOT_FOUND);
-                }
-                let existed = key_exists(&shared, &path);
-                create_key(&mut shared, &path);
-                let handle = open_handle(&mut shared, &path);
-                let _ = memory.write_u32(out, handle);
-                if name == "RegCreateKeyExA" && args[8] != 0 {
-                    let _ = memory.write_u32(args[8], if existed { 2 } else { 1 });
-                }
-                ok(0)
-            }
-            "RegDeleteKeyA" => {
-                let path = join(&base, &read_cstr(memory, args[1]));
-                let prefix_key = format!("#key:{path}");
-                let prefix_value = format!("#value:{path}");
-                shared
-                    .registry
-                    .retain(|k, _| !k.starts_with(&prefix_key) && !k.starts_with(&prefix_value));
-                ok(0)
-            }
-            "RegDeleteValueA" => {
-                let key = value_key(&base, &read_cstr(memory, args[1]));
-                ok(if shared.registry.remove(&key).is_some() {
-                    0
-                } else {
-                    NOT_FOUND
-                })
-            }
-            "RegSetValueA" => {
-                let path = join(
-                    &base,
-                    &if args[1] == 0 {
-                        Vec::new()
-                    } else {
-                        read_cstr(memory, args[1])
-                    },
-                );
-                create_key(&mut shared, &path);
-                let data = read_cstr(memory, args[3]);
-                let mut stored = vec![1u8];
-                stored.extend_from_slice(&data);
-                stored.push(0);
-                shared.registry.insert(value_key(&path, b""), stored);
-                ok(0)
-            }
-            "RegSetValueExA" => {
-                let value_name = if args[1] == 0 {
-                    Vec::new()
-                } else {
-                    read_cstr(memory, args[1])
-                };
-                let data = memory
-                    .read_bytes(args[4], args[5] as usize)
-                    .unwrap_or_default();
-                let mut stored = vec![args[3] as u8];
-                stored.extend_from_slice(&data);
-                shared
-                    .registry
-                    .insert(value_key(&base, &value_name), stored);
-                ok(0)
-            }
-            "RegQueryValueA" | "RegQueryValueExA" => {
-                let (path, value_name, type_out, data_out, size_va) = if name == "RegQueryValueA" {
-                    let sub = if args[1] == 0 {
-                        Vec::new()
-                    } else {
-                        read_cstr(memory, args[1])
-                    };
-                    (join(&base, &sub), Vec::new(), 0, args[2], args[3])
-                } else {
-                    let value_name = if args[1] == 0 {
-                        Vec::new()
-                    } else {
-                        read_cstr(memory, args[1])
-                    };
-                    (base.clone(), value_name, args[3], args[4], args[5])
-                };
-                let Some(stored) = shared.registry.get(&value_key(&path, &value_name)).cloned()
-                else {
-                    return ok(NOT_FOUND);
-                };
-                drop(shared);
-                let kind = stored[0] as u32;
-                let data = &stored[1..];
-                if type_out != 0 {
-                    let _ = memory.write_u32(type_out, kind);
-                }
-                let capacity = if size_va != 0 {
-                    memory.read_u32(size_va).unwrap_or(0)
-                } else {
-                    0
-                };
-                if size_va != 0 {
-                    let _ = memory.write_u32(size_va, data.len() as u32);
-                }
-                if data_out != 0 {
-                    if (capacity as usize) < data.len() {
-                        return ok(234); // ERROR_MORE_DATA
-                    }
-                    let _ = memory.write_bytes(data_out, data);
-                }
-                ok(0)
-            }
-            "RegEnumKeyA" | "RegEnumKeyExA" => {
-                let prefix = format!("#key:{}\\", base.to_ascii_lowercase());
-                let mut children: Vec<String> = shared
-                    .registry
-                    .keys()
-                    .filter_map(|k| k.strip_prefix(&prefix))
-                    .filter(|rest| !rest.contains('\\'))
-                    .map(str::to_string)
-                    .collect();
-                children.sort();
-                drop(shared);
-                match children.get(args[1] as usize) {
-                    Some(child) => {
-                        let _ = write_cstr(memory, args[2], child.as_bytes());
-                        if name == "RegEnumKeyExA" && args[3] != 0 {
-                            let _ = memory.write_u32(args[3], child.len() as u32);
-                        }
-                        ok(0)
-                    }
-                    None => ok(259), // ERROR_NO_MORE_ITEMS
-                }
-            }
-            "RegEnumValueA" => ok(259),
-            "RegQueryInfoKeyA" => {
-                for index in [4usize, 5, 6, 7, 8, 9, 10] {
-                    if args[index] != 0 {
-                        let _ = memory.write_u32(args[index], 0);
-                    }
-                }
-                ok(0)
-            }
-            _ => ok(NOT_FOUND),
-        }
     }
 }
 
