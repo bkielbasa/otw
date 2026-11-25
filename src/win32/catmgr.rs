@@ -122,27 +122,31 @@ fn vtable<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, names: &[&s
 /// A new manager, returned as the interface `iid` asks for.
 pub fn create<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, iid: &[u8], out: u32) -> u32 {
     let _ = memory.write_u32(out, 0);
+    let ps = crate::win32::ptr_size(ctx);
     let interface = if iid == IID_IUNKNOWN || iid == IID_ICATREGISTER {
         0
     } else if iid == IID_ICATINFORMATION {
-        4
+        ps
     } else {
         return E_NOINTERFACE;
     };
-    let object = ctx.shared.borrow_mut().heap.alloc(8).unwrap_or(0);
+    let object = ctx.shared.borrow_mut().heap.alloc(16).unwrap_or(0);
     let register = vtable(ctx, memory, REGISTER_METHODS);
     let information = vtable(ctx, memory, INFORMATION_METHODS);
     let _ = memory.write_u32(object, register);
     let _ = memory.write_u32(object + 4, information);
+    crate::win32::wide_vtable(ctx, memory, object, REGISTER_METHODS);
+    crate::win32::wide_vtable(ctx, memory, object + 8, INFORMATION_METHODS);
     ctx.shared.borrow_mut().categories.managers.insert(object, CatManager { refs: 1 });
     let _ = memory.write_u32(out, object + interface);
     S_OK
 }
 
 fn new_enum<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, iid: [u8; 16], items: Vec<Vec<u8>>) -> u32 {
-    let object = ctx.shared.borrow_mut().heap.alloc(4).unwrap_or(0);
+    let object = ctx.shared.borrow_mut().heap.alloc(8).unwrap_or(0);
     let table = vtable(ctx, memory, ENUM_METHODS);
     let _ = memory.write_u32(object, table);
+    crate::win32::wide_vtable(ctx, memory, object, ENUM_METHODS);
     ctx.shared.borrow_mut().categories.enums.insert(object, CatEnum { refs: 1, iid, items, position: 0 });
     object
 }
@@ -193,7 +197,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
     let this = args[0];
     let value = match group {
         "CatReg" | "CatInfo" => {
-            let object = if group == "CatReg" { this } else { this.wrapping_sub(4) };
+            let object = if group == "CatReg" { this } else { this.wrapping_sub(crate::win32::ptr_size(ctx)) };
             if !ctx.shared.borrow().categories.managers.contains_key(&object) {
                 return Some(ApiOutcome::new(E_FAIL, count));
             }
@@ -216,7 +220,7 @@ fn manager<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, object: u3
             let pointer = if iid == IID_IUNKNOWN || iid == IID_ICATREGISTER {
                 object
             } else if iid == IID_ICATINFORMATION {
-                object + 4
+                object + crate::win32::ptr_size(ctx)
             } else {
                 let _ = memory.write_u32(args[2], 0);
                 return E_NOINTERFACE;

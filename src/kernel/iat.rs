@@ -39,7 +39,7 @@ impl Iat {
             for (index, name) in dll.names.iter().enumerate() {
                 let slot_rva = dll
                     .first_thunk_rva
-                    .wrapping_add(index as u32 * THUNK_STRIDE);
+                    .wrapping_add(index as u32 * if image.is64 { 8 } else { 4 });
                 let slot_va = image.image_base.wrapping_add(slot_rva);
                 let entry = IatEntry {
                     dll: dll.dll.clone(),

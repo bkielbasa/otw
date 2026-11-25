@@ -8,6 +8,7 @@
 
 pub mod advpack;
 pub mod bindctx;
+pub mod x64;
 pub mod catmgr;
 pub mod cab;
 pub mod clipboard;
@@ -679,6 +680,8 @@ impl GuiState {
 #[derive(Debug)]
 pub struct SharedState {
     pub gui: GuiState,
+    /// A 64-bit process (see [`x64`]).
+    pub x64: bool,
     pub heap_next: u32,
     pub next_handle: u32,
     pub registered_messages: u32,
@@ -770,6 +773,7 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             gui: GuiState::default(),
+            x64: false,
             heap_next: HEAP_BASE,
             next_handle: 0x200,
             registered_messages: 0xC000,
@@ -1008,6 +1012,7 @@ impl ApiContext {
             let end = (module.image.image_base + module.memory.len() as u32 + 0xFFF) & !0xFFF;
             shared.borrow_mut().heap.reserve(start, end);
         }
+        shared.borrow_mut().x64 = image.main().is64;
         builtin.insert(
             "__dynamic_base".to_owned(),
             image.entry_point(DYNAMIC_DLL, "slot0").unwrap_or(0),
@@ -1095,12 +1100,48 @@ impl SystemCalls for ApiContext {
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
     }
 
+    fn arg_count64(&self, dll: &str, name: &ImportName) -> Option<usize> {
+        let (dll, name) = self.resolve(dll, name)?;
+        x64::arg_count(self, &dll, &name)
+    }
+
+    fn call64(
+        &self,
+        memory: &mut dyn GuestMemory,
+        dll: &str,
+        name: &ImportName,
+        args: &[u64],
+        caller: u32,
+    ) -> Option<(u64, Option<u32>)> {
+        let (dll, name) = self.resolve(dll, name)?;
+        x64::call(self, memory, &dll, &name, args, caller)
+    }
+
     fn describe(&self, dll: &str, name: &ImportName) -> String {
         match self.resolve(dll, name) {
             Some((dll, name)) => format!("{dll}!{}", name.display()),
             None => format!("{dll}!{}", name.display()),
         }
     }
+}
+
+/// The size of a pointer in the process: 8 in a 64-bit one.
+pub fn ptr_size(ctx: &ApiContext) -> u32 {
+    if ctx.shared.borrow().x64 { 8 } else { 4 }
+}
+
+/// In a 64-bit process, point the COM interface pointer at `slot` (8
+/// bytes) at a vtable of 8-byte entries for `names`; a 32-bit process keeps
+/// the vtable it has.
+pub fn wide_vtable<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, slot: u32, names: &[&str]) {
+    if !ctx.shared.borrow().x64 {
+        return;
+    }
+    let table = ctx.shared.borrow_mut().heap.alloc(8 * names.len() as u32).unwrap_or(0);
+    for (index, name) in names.iter().enumerate() {
+        let _ = memory.write_bytes(table + 8 * index as u32, &(ctx.builtin_proc(name) as u64).to_le_bytes());
+    }
+    let _ = memory.write_bytes(slot, &(table as u64).to_le_bytes());
 }
 
 /// Imports Win32 implements itself even when a genuine DLL is mapped.
@@ -2076,7 +2117,12 @@ mod kernel32_base {
             "GetCommandLineA" => ApiOutcome::new(ctx.command_line_va, count),
             // Windows 95 RTM: major 4, minor 0, build 950.
             // Windows 95 4.00.950: the high bit marks Windows 95, not NT.
-            "GetVersion" => ApiOutcome::new(0xC3B6_0004, count),
+            "GetVersion" => {
+                let v = crate::win32::unicode::os_version(ctx);
+                // Windows 95 sets the top bit (not NT) and leaves the build high word.
+                let value = if v.platform == 2 { v.build << 16 | v.minor << 8 | v.major } else { 0xC3B6_0004 };
+                ApiOutcome::new(value, count)
+            }
             "GetWindowsDirectoryA" => {
                 ApiOutcome::new(copy_path(memory, args[0], args[1], b"C:\\WINDOWS"), count)
             }

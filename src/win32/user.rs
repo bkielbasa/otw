@@ -1203,6 +1203,9 @@ fn call_hooks<M: GuestMemory + ?Sized>(
         hooks.get(start).copied()
     };
     let hook = hook?;
+    if ctx.shared.borrow().x64 {
+        return crate::win32::x64::call_hook(ctx, memory, hook.proc_va, kind, code, wparam, lparam);
+    }
     memory.call_guest(hook.proc_va, &[code, wparam, lparam])
 }
 
@@ -4193,14 +4196,17 @@ pub fn resource_directory<M: GuestMemory + ?Sized>(memory: &mut M, module: u32) 
         return None;
     }
     let optional = pe.wrapping_add(24);
-    if mem_u16(memory, optional)? != 0x10b {
-        return None;
-    }
-    let directories = memory.read_u32(optional.wrapping_add(92))?;
+    // PE32 or PE32+ (whose data directories start 16 bytes later).
+    let table = match mem_u16(memory, optional)? {
+        0x10b => optional.wrapping_add(96),
+        0x20b => optional.wrapping_add(112),
+        _ => return None,
+    };
+    let directories = memory.read_u32(table.wrapping_sub(4))?;
     if directories <= 2 {
         return None;
     }
-    let rva = memory.read_u32(optional.wrapping_add(96 + 2 * 8))?;
+    let rva = memory.read_u32(table.wrapping_add(2 * 8))?;
     if rva == 0 {
         return None;
     }

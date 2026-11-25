@@ -193,8 +193,11 @@ pub fn companion_modules(program: &Path, image: &PeImage) -> Vec<(String, PathBu
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
-        if let Ok(parsed) = PeImage::parse(bytes.clone()) {
-            pending.extend(parsed.imports.iter().map(|import| import.dll.clone()));
+        match PeImage::parse(bytes.clone()) {
+            // A 64-bit program cannot use 32-bit DLLs, nor the reverse.
+            Ok(parsed) if parsed.is64 != image.is64 => continue,
+            Ok(parsed) => pending.extend(parsed.imports.iter().map(|import| import.dll.clone())),
+            Err(_) => {}
         }
         let name = path
             .file_name()

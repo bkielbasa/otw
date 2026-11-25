@@ -39,6 +39,12 @@ const fn guid(data1: u32) -> [u8; 16] {
 const INTERFACES: [(&str, u32); 3] = [("ShellLinkW_", 0), ("PersistFile_", 4), ("ShellLinkA_", 8)];
 const OBJECT_SIZE: u32 = 12;
 
+/// An interface's offset in the object: interface pointers are 8 bytes in
+/// a 64-bit process.
+fn scaled(ctx: &ApiContext, offset: u32) -> u32 {
+    offset * crate::win32::ptr_size(ctx) / 4
+}
+
 /// The methods, in vtable order per interface.
 pub const SHELL_LINK_METHODS: &[&str] = &[
     "ShellLinkW_QueryInterface",
@@ -122,16 +128,20 @@ pub fn arg_count(name: &str) -> Option<usize> {
 /// Create a shell link object and return the interface `iid` asks for.
 pub fn create<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, iid: &[u8], out: u32) -> u32 {
     let vtables: u32 = SHELL_LINK_METHODS.len() as u32 * 4;
-    let Some(object) = ctx.shared.borrow_mut().heap.alloc(OBJECT_SIZE + vtables) else {
+    let Some(object) = ctx.shared.borrow_mut().heap.alloc(2 * OBJECT_SIZE + vtables) else {
         return E_OUTOFMEMORY;
     };
-    let mut slot = object + OBJECT_SIZE;
+    let mut slot = object + 2 * OBJECT_SIZE;
     for (prefix, offset) in INTERFACES {
-        let _ = memory.write_u32(object + offset, slot);
+        let _ = memory.write_u32(object + scaled(ctx, offset), slot);
         for name in SHELL_LINK_METHODS.iter().filter(|name| name.starts_with(prefix)) {
             let _ = memory.write_u32(slot, ctx.builtin_proc(name));
             slot += 4;
         }
+    }
+    for (prefix, offset) in INTERFACES {
+        let names: Vec<&str> = SHELL_LINK_METHODS.iter().copied().filter(|name| name.starts_with(prefix)).collect();
+        crate::win32::wide_vtable(ctx, memory, object + scaled(ctx, offset), &names);
     }
     ctx.shared.borrow_mut().shell_links.insert(object, LinkObject::default());
     let result = query_interface(ctx, memory, object, iid, out);
@@ -155,7 +165,7 @@ fn query_interface<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, ob
     if let Some(link) = ctx.shared.borrow_mut().shell_links.get_mut(&object) {
         link.refs += 1;
     }
-    let _ = memory.write_u32(out, object + offset);
+    let _ = memory.write_u32(out, object + scaled(ctx, offset));
     S_OK
 }
 
@@ -190,7 +200,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
     let ok = |value: u32| Some(ApiOutcome::new(value, count));
     let (prefix, method) = name.split_once('_')?;
     let offset = INTERFACES.iter().find(|(p, _)| p.trim_end_matches('_') == prefix)?.1;
-    let object = args[0].wrapping_sub(offset);
+    let object = args[0].wrapping_sub(scaled(ctx, offset));
     if !ctx.shared.borrow().shell_links.contains_key(&object) {
         return ok(E_FAIL);
     }

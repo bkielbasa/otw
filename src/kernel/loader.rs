@@ -114,11 +114,12 @@ pub fn load(
         for dll in imports {
             let target = by_name.get(&dll.dll.to_ascii_lowercase()).copied();
             for (index, name) in dll.names.iter().enumerate() {
+                let slot_size = if modules[importer].image.is64 { 8 } else { 4 };
                 let slot_va = modules[importer]
                     .image
                     .image_base
                     .wrapping_add(dll.first_thunk_rva)
-                    .wrapping_add(index as u32 * THUNK_STRIDE);
+                    .wrapping_add(index as u32 * slot_size);
 
                 let resolved = if policy.prefers_subsystem(&dll.dll, name) {
                     None
@@ -182,7 +183,57 @@ pub fn map_image(name: &str, image: &PeImage) -> Result<Vec<u8>, LoadError> {
         let raw = section.raw_offset as usize;
         memory[start..end].copy_from_slice(&image.bytes[raw..raw + available]);
     }
+    if image.is64 && image.preferred_base != image.image_base as u64 {
+        let delta = (image.image_base as u64).wrapping_sub(image.preferred_base);
+        relocate64(&mut memory, image.relocations, delta);
+        // The header records the base the image now has.
+        let pe = u32::from_le_bytes([memory[0x3C], memory[0x3D], memory[0x3E], memory[0x3F]]) as usize;
+        if let Some(field) = memory.get_mut(pe + 24 + 24..pe + 24 + 32) {
+            field.copy_from_slice(&(image.image_base as u64).to_le_bytes());
+        }
+    }
     Ok(memory)
+}
+
+/// Apply a 64-bit image's base relocations (DIR64 and HIGHLOW fixups) for
+/// a move by `delta`.
+pub fn relocate64(memory: &mut [u8], relocations: Option<(u32, u32)>, delta: u64) {
+    let Some((rva, size)) = relocations else {
+        return;
+    };
+    let read = |memory: &[u8], at: usize| memory.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let mut block = rva as usize;
+    let end = (rva as usize + size as usize).min(memory.len());
+    while block + 8 <= end {
+        let (Some(page), Some(length)) = (read(memory, block), read(memory, block + 4)) else {
+            break;
+        };
+        if length < 8 {
+            break;
+        }
+        for entry in (block + 8..block + length as usize).step_by(2) {
+            let Some(bytes) = memory.get(entry..entry + 2) else {
+                break;
+            };
+            let value = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let at = page as usize + (value & 0xFFF) as usize;
+            match value >> 12 {
+                10 => {
+                    if let Some(slot) = memory.get_mut(at..at + 8) {
+                        let old = u64::from_le_bytes(slot.try_into().expect("8 bytes"));
+                        slot.copy_from_slice(&old.wrapping_add(delta).to_le_bytes());
+                    }
+                }
+                3 => {
+                    if let Some(old) = read(memory, at) {
+                        memory[at..at + 4].copy_from_slice(&old.wrapping_add(delta as u32).to_le_bytes());
+                    }
+                }
+                _ => {}
+            }
+        }
+        block += length as usize;
+    }
 }
 
 fn write_slot(
@@ -195,11 +246,13 @@ fn write_slot(
     let offset = slot_va
         .checked_sub(modules[importer].image.image_base)
         .ok_or_else(|| LoadError::MissingSection(name.clone(), slot_va))? as usize;
+    // A 64-bit image's slots are 8 bytes; addresses stay below 4 GiB.
+    let width = if modules[importer].image.is64 { 8 } else { 4 };
     let slot = modules[importer]
         .memory
-        .get_mut(offset..offset + 4)
+        .get_mut(offset..offset + width)
         .ok_or_else(|| LoadError::MissingSection(name, slot_va))?;
-    slot.copy_from_slice(&value.to_le_bytes());
+    slot.copy_from_slice(&(value as u64).to_le_bytes()[..width]);
     Ok(())
 }
 

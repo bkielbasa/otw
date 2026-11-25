@@ -71,6 +71,7 @@ pub fn create<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) -> u32 
     for (index, name) in METHODS.iter().enumerate() {
         let _ = memory.write_u32(object + 4 + index as u32 * 4, ctx.builtin_proc(name));
     }
+    crate::win32::wide_vtable(ctx, memory, object, METHODS);
     // BIND_OPTS2: cbStruct, grfFlags, grfMode (STGM_READWRITE), deadline, ...
     let mut options = vec![0u8; 32];
     options[0..4].copy_from_slice(&32u32.to_le_bytes());

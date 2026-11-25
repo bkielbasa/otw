@@ -98,7 +98,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         "PropertySheetA" | "PropertySheet" => property_sheet(ctx, memory, args[0], false),
         "CreatePropertySheetPageW" | "CreatePropertySheetPageA" | "CreatePropertySheetPage" => {
             // An HPROPSHEETPAGE is a copy of the PROPSHEETPAGE.
-            let size = memory.read_u32(args[0]).unwrap_or(0).clamp(40, 128);
+            let size = memory.read_u32(args[0]).unwrap_or(0).clamp(40, 160);
             let bytes = memory.read_bytes(args[0], size as usize).unwrap_or_default();
             let copy = ctx.shared.borrow_mut().heap.alloc(size).unwrap_or(0);
             let _ = memory.write_bytes(copy, &bytes);
@@ -123,6 +123,28 @@ fn rd<M: GuestMemory + ?Sized>(memory: &mut M, va: u32) -> u32 {
     memory.read_u32(va).unwrap_or(0)
 }
 
+/// Offset of field `index` of a PROPSHEETHEADER or PROPSHEETPAGE: two
+/// 32-bit fields (size, flags), then pointer-sized ones, except the
+/// header's page count (field 6), a 32-bit value.
+fn sheet_field(ctx: &ApiContext, index: u32, header: bool) -> u32 {
+    if !ctx.shared.borrow().x64 {
+        return index * 4;
+    }
+    match index {
+        0 | 1 => index * 4,
+        6 if header => 40,
+        _ => 8 * (index - 1),
+    }
+}
+
+fn psp_field(ctx: &ApiContext, index: u32) -> u32 {
+    sheet_field(ctx, index, false)
+}
+
+fn psh_field(ctx: &ApiContext, index: u32) -> u32 {
+    sheet_field(ctx, index, true)
+}
+
 fn text<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, wide: bool) -> Vec<u8> {
     if va < 0x10000 {
         return Vec::new();
@@ -136,13 +158,13 @@ fn text<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, wide: bool) -> Vec<u8>
 
 /// Build a page from a PROPSHEETPAGE in guest memory.
 fn load_page<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, psp: u32, wide: bool) -> Option<Page> {
-    let size = rd(memory, psp).clamp(40, 128);
+    let size = rd(memory, psp).clamp(40, 160);
     let bytes = memory.read_bytes(psp, size as usize)?;
     let copy = ctx.shared.borrow_mut().heap.alloc(size)?;
     let _ = memory.write_bytes(copy, &bytes);
-    let flags = rd(memory, copy + 4);
-    let instance = rd(memory, copy + 8);
-    let name = rd(memory, copy + 12);
+    let flags = rd(memory, copy + psp_field(ctx, 1));
+    let instance = rd(memory, copy + psp_field(ctx, 2));
+    let name = rd(memory, copy + psp_field(ctx, 3));
     let (template, resource_id) = if flags & PSP_DLGINDIRECT != 0 {
         (name, 0)
     } else {
@@ -154,7 +176,7 @@ fn load_page<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, psp: u32
         let (va, _) = user::find_resource_any(ctx, memory, instance, &ResName::Id(5), &resource)?;
         (va, if name < 0x10000 { name } else { 0 })
     };
-    let dlg_proc = rd(memory, copy + 24);
+    let dlg_proc = rd(memory, copy + psp_field(ctx, 6));
     if wide {
         unicode::mark_unicode(ctx, dlg_proc);
     }
@@ -211,18 +233,18 @@ fn frame_template<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, fra
 /// it was finished (or OK'd) and 0 when cancelled; a modeless sheet returns
 /// its window.
 fn property_sheet<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, header: u32, wide: bool) -> u32 {
-    let flags = rd(memory, header + 4);
-    let parent = rd(memory, header + 8);
-    let instance = rd(memory, header + 12);
-    let caption_va = rd(memory, header + 20);
+    let flags = rd(memory, header + psh_field(ctx, 1));
+    let parent = rd(memory, header + psh_field(ctx, 2));
+    let instance = rd(memory, header + psh_field(ctx, 3));
+    let caption_va = rd(memory, header + psh_field(ctx, 5));
     let mut caption = text(memory, caption_va, wide);
     if flags & PSH_PROPTITLE != 0 {
         caption = [b"Properties for ".as_slice(), &caption].concat();
     }
-    let count = rd(memory, header + 24).min(64);
-    let start = rd(memory, header + 28);
-    let pages_va = rd(memory, header + 32);
-    let callback = if flags & PSH_USECALLBACK != 0 { rd(memory, header + 36) } else { 0 };
+    let count = rd(memory, header + psh_field(ctx, 6)).min(64);
+    let start = rd(memory, header + psh_field(ctx, 7));
+    let pages_va = rd(memory, header + psh_field(ctx, 8));
+    let callback = if flags & PSH_USECALLBACK != 0 { rd(memory, header + psh_field(ctx, 9)) } else { 0 };
     let wizard = flags & (PSH_WIZARD | PSH_WIZARD97 | PSH_WIZARD_LITE | PSH_AEROWIZARD) != 0;
 
     let mut pages = Vec::new();
@@ -234,7 +256,7 @@ fn property_sheet<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hea
             psp
         } else {
             let handle = rd(memory, cursor);
-            cursor += 4;
+            cursor += if ctx.shared.borrow().x64 { 8 } else { 4 };
             handle
         };
         let page_wide = wide || ctx.shared.borrow().gui.unicode_pages.contains(&psp);
@@ -452,10 +474,10 @@ fn activate<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, sheet_hwn
 
 fn create_page<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, sheet_hwnd: u32, sheet: &Sheet, index: usize) -> u32 {
     let page = &sheet.pages[index];
-    let flags = rd(memory, page.psp + 4);
+    let flags = rd(memory, page.psp + psp_field(ctx, 1));
     if flags & PSP_USECALLBACK != 0 {
         // PSPCB_CREATE: MFC hooks the page's window creation here.
-        let callback = rd(memory, page.psp + 32);
+        let callback = rd(memory, page.psp + psp_field(ctx, 8));
         if callback != 0 && memory.call_guest(callback, &[0, 2, page.psp]) == Some(0) {
             return 0;
         }
@@ -473,7 +495,7 @@ fn create_page<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, sheet_
     template.ex_style |= 0x0001_0000; // WS_EX_CONTROLPARENT
     template.x = sheet.page_x;
     template.y = sheet.page_y;
-    let instance = rd(memory, page.psp + 8);
+    let instance = rd(memory, page.psp + psp_field(ctx, 2));
     let instance = if instance != 0 { instance } else { sheet.instance };
     let hwnd = controls::create_dialog_from(ctx, memory, instance, &template, sheet_hwnd, page.dlg_proc, page.psp);
     with_sheet(ctx, sheet_hwnd, |sheet| sheet.pages[index].hwnd = hwnd);

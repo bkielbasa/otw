@@ -148,6 +148,8 @@ struct RunState<'a> {
     thread_signal: Option<ThreadSignal>,
     /// The thunk start routines return to.
     thread_return: u32,
+    /// A 64-bit process: the x64 calling convention, GS-based TEBs.
+    x64: bool,
 }
 
 /// A thread off the CPU.
@@ -222,6 +224,26 @@ impl Fault {
 }
 
 /// Raise the pending fault in the guest, as Windows does: push an
+/// A 64-bit thread environment block at `teb`, made current through the GS
+/// base: stack bounds, the self pointer, the client id and an (empty) PEB.
+fn init_teb64(uc: &mut Unicorn<'_, ()>, teb: u32, top: u32, bottom: u32, thread: u32) -> Result<(), RunError> {
+    let peb = teb + 0x800;
+    for (offset, value) in [
+        (0x00u32, u64::MAX),       // ExceptionList (unused on x64)
+        (0x08, top as u64),        // StackBase
+        (0x10, bottom as u64),     // StackLimit
+        (0x30, teb as u64),        // Self
+        (0x40, 1),                 // ClientId.UniqueProcess
+        (0x48, thread as u64),     // ClientId.UniqueThread
+        (0x60, peb as u64),        // ProcessEnvironmentBlock
+    ] {
+        uc.mem_write((teb + offset) as u64, &value.to_le_bytes())
+            .map_err(|error| RunError::Unicorn("initialising the TEB", error))?;
+    }
+    uc.reg_write(Reg::GS_BASE, teb as u64)
+        .map_err(|error| RunError::Unicorn("setting the GS base", error))
+}
+
 /// The running thread's TIB.
 fn current_tib(state: &RunState<'_>) -> u32 {
     let id = state.running.last().copied().unwrap_or(1);
@@ -244,6 +266,12 @@ fn deliver_fault(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>) ->
         }
     };
     eprintln!("[eh] {}", fault.describe());
+    if state.borrow().x64 {
+        // 64-bit exception dispatch (table-based unwinding) is not there yet.
+        let rip = uc.reg_read(Reg::RIP).unwrap_or(0);
+        state.borrow_mut().error = Some(format!("{} (rip={rip:#x}; exceptions in 64-bit programs are not supported yet)", fault.describe()));
+        return false;
+    }
     let read = |uc: &Unicorn<'_, ()>, register| uc.reg_read(register).unwrap_or(0) as u32;
     let esp = read(uc, Reg::ESP);
     if std::env::var_os("OTW_TRACE_FAULTS").is_some() {
@@ -389,8 +417,66 @@ const SAVED_REGISTERS: [Reg; 10] = [
     Reg::EFLAGS,
 ];
 
+/// Registers preserved around a synchronous guest callback in a 64-bit
+/// process.
+const SAVED_REGISTERS_64: [Reg; 18] = [
+    Reg::RAX,
+    Reg::RBX,
+    Reg::RCX,
+    Reg::RDX,
+    Reg::RSI,
+    Reg::RDI,
+    Reg::RBP,
+    Reg::RSP,
+    Reg::RIP,
+    Reg::EFLAGS,
+    Reg::R8,
+    Reg::R9,
+    Reg::R10,
+    Reg::R11,
+    Reg::R12,
+    Reg::R13,
+    Reg::R14,
+    Reg::R15,
+];
+
 /// Deepest Rust-to-guest callback nesting. Unicorn itself allows 64 levels.
 const MAX_CALLBACK_DEPTH: usize = 48;
+
+impl UnicornGuestMemory<'_, '_, '_, '_> {
+    /// A thread of a 64-bit process: its TEB through the GS base, the
+    /// parameter in RCX, returning to the thread-end thunk.
+    fn create_thread64(&mut self, entry: u32, param: u32, stack: u32, top: u32, teb: u32) -> Option<u32> {
+        let run = self.run?;
+        let id = run.borrow().next_thread;
+        let thread_return = run.borrow().thread_return;
+        let mut current = self.uc.context_alloc().ok()?;
+        self.uc.context_save(&mut current).ok()?;
+        init_teb64(self.uc, teb, top, stack, id).ok()?;
+        let rsp = ((top - 0x40) & !0xF) - 8;
+        self.uc.mem_write(rsp as u64, &(thread_return as u64).to_le_bytes()).ok()?;
+        for register in SAVED_REGISTERS_64 {
+            self.uc.reg_write(register, 0).ok()?;
+        }
+        for (register, value) in [(Reg::RSP, rsp as u64), (Reg::RIP, entry as u64), (Reg::RCX, param as u64), (Reg::EFLAGS, 0x202)] {
+            self.uc.reg_write(register, value).ok()?;
+        }
+        let mut context = self.uc.context_alloc().ok()?;
+        self.uc.context_save(&mut context).ok()?;
+        self.uc.context_restore(&current).ok()?;
+        let mut state = run.borrow_mut();
+        state.next_thread += 1;
+        state.tibs.push((id, teb));
+        state.threads.push(ThreadSlot {
+            id,
+            context,
+            levels: Vec::new(),
+            callback_depth: 0,
+            retry_eip: None,
+        });
+        Some(id)
+    }
+}
 
 impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
     fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
@@ -430,20 +516,39 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
                 return None;
             }
         }
-        let mut saved = [0u64; SAVED_REGISTERS.len()];
-        for (slot, register) in SAVED_REGISTERS.iter().enumerate() {
+        let x64 = run.borrow().x64;
+        let registers: &[Reg] = if x64 { &SAVED_REGISTERS_64 } else { &SAVED_REGISTERS };
+        let mut saved = vec![0u64; registers.len()];
+        for (slot, register) in registers.iter().enumerate() {
             saved[slot] = self.uc.reg_read(*register).ok()?;
         }
         let esp = saved[7] as u32;
-        // Leave a gap so the interrupted frame's locals are never touched.
-        let frame = (esp.wrapping_sub(0x80 + 4 * (args.len() as u32 + 1))) & !0xF;
-        let mut bytes = Vec::with_capacity(4 * (args.len() + 1));
-        bytes.extend_from_slice(&SENTINEL_BASE.to_le_bytes());
-        for arg in args {
-            bytes.extend_from_slice(&arg.to_le_bytes());
+        if x64 {
+            // The x64 convention: RCX, RDX, R8, R9, then the stack above a
+            // 32-byte home area; RSP is 8 off 16-byte alignment at entry.
+            let slots = args.len().max(4) as u32;
+            let frame = ((esp.wrapping_sub(0x80 + 8 * (slots + 1))) & !0xF).wrapping_sub(8);
+            let mut bytes = vec![0u8; 8 * (slots as usize + 1)];
+            bytes[..8].copy_from_slice(&(SENTINEL_BASE as u64).to_le_bytes());
+            for (index, arg) in args.iter().enumerate().skip(4) {
+                bytes[8 + index * 8..16 + index * 8].copy_from_slice(&(*arg as u64).to_le_bytes());
+            }
+            self.uc.mem_write(frame as u64, &bytes).ok()?;
+            self.uc.reg_write(Reg::RSP, frame as u64).ok()?;
+            for (register, arg) in [Reg::RCX, Reg::RDX, Reg::R8, Reg::R9].iter().zip(args) {
+                self.uc.reg_write(*register, *arg as u64).ok()?;
+            }
+        } else {
+            // Leave a gap so the interrupted frame's locals are never touched.
+            let frame = (esp.wrapping_sub(0x80 + 4 * (args.len() as u32 + 1))) & !0xF;
+            let mut bytes = Vec::with_capacity(4 * (args.len() + 1));
+            bytes.extend_from_slice(&SENTINEL_BASE.to_le_bytes());
+            for arg in args {
+                bytes.extend_from_slice(&arg.to_le_bytes());
+            }
+            self.uc.mem_write(frame as u64, &bytes).ok()?;
+            self.uc.reg_write(Reg::ESP, frame as u64).ok()?;
         }
-        self.uc.mem_write(frame as u64, &bytes).ok()?;
-        self.uc.reg_write(Reg::ESP, frame as u64).ok()?;
         if let Some(ebp) = ebp {
             self.uc.reg_write(Reg::EBP, ebp as u64).ok()?;
         }
@@ -462,7 +567,7 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             state.levels.pop();
         }
         let eax = self.uc.reg_read(Reg::EAX).unwrap_or(0) as u32;
-        for (slot, register) in SAVED_REGISTERS.iter().enumerate() {
+        for (slot, register) in registers.iter().enumerate() {
             let _ = self.uc.reg_write(*register, saved[slot]);
         }
         if let Err(error) = result {
@@ -514,9 +619,12 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         let stack_size = align_up(stack_size.clamp(0x1_0000, 0x100_0000), PAGE_SIZE);
         let stack = self.map_region(0x1000_0000, stack_size)?;
         let tib = self.map_region(0x1000_0000, PAGE_SIZE)?;
+        let top = stack + stack_size;
+        if run.borrow().x64 {
+            return self.create_thread64(entry, param, stack, top, tib);
+        }
         // A copy of the first thread's TIB with its own exception chain,
         // stack bounds and self pointer.
-        let top = stack + stack_size;
         let mut page = self.uc.mem_read_as_vec(TIB_BASE as u64, TIB_SIZE as usize).ok()?;
         for (offset, value) in [(0usize, u32::MAX), (4, top), (8, stack), (0x18, tib)] {
             page[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -1103,7 +1211,8 @@ fn build<'a>(
     let image = process.main();
     let iat = &process.iat;
 
-    let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32)
+    let x64 = image.is64;
+    let mut uc = Unicorn::new(Arch::X86, if x64 { Mode::MODE_64 } else { Mode::MODE_32 })
         .map_err(|error| RunError::Unicorn("creating the CPU", error))?;
 
     for module in &process.modules {
@@ -1159,70 +1268,74 @@ fn build<'a>(
 
     uc.mem_map(TIB_BASE as u64, TIB_SIZE as u64, Prot::ALL)
         .map_err(|error| RunError::Unicorn("mapping guest TIB", error))?;
-    // Win95 TIB: a terminated SEH chain, stack bounds and a pointer to the TIB
-    // itself. MFC's CRT and SEH prologues consult all four during startup.
-    // KERNEL32's private state helpers compare FS:[0] with -1 and skip the
-    // registration-record walk only when the chain head is the real terminator.
-    let tib_init = [
-        (0u32, u32::MAX),
-        (4, STACK_TOP),
-        (8, STACK_BASE),
-        // Win95 KERNEL32's private 16-bit thunk allocator pops blocks from
-        // FS:[0x10]. It expects a linked list of mapped free blocks, not zero.
-        (0x10, LOCAL_HANDLE_LIST_BASE),
-        (0x18, TIB_BASE),
-        // FS:[0x30] (NT's PEB): a zeroed block. MSHTML's allocator reads
-        // flags from it; KERNEL32's own code must not find the PDB there.
-        (0x30, WIN95_STATE_BASE + 0x3000),
-        // Win95 heap helpers load GS from FS:[0x0c] and test flag bits at
-        // GS:[0x16]. Point GS at the synthetic state page, whose flags stay
-        // zero so the simple (non-thunking) allocation path is used.
-        (0x0c, GS_SELECTOR),
-    ];
-    for (offset, value) in tib_init {
-        uc.mem_write((TIB_BASE + offset) as u64, &value.to_le_bytes())
-            .map_err(|error| RunError::Unicorn("initialising guest TIB", error))?;
-    }
+    if x64 {
+        init_teb64(&mut uc, TIB_BASE, STACK_TOP, STACK_BASE, 1)?;
+    } else {
+        // Win95 TIB: a terminated SEH chain, stack bounds and a pointer to the TIB
+        // itself. MFC's CRT and SEH prologues consult all four during startup.
+        // KERNEL32's private state helpers compare FS:[0] with -1 and skip the
+        // registration-record walk only when the chain head is the real terminator.
+        let tib_init = [
+            (0u32, u32::MAX),
+            (4, STACK_TOP),
+            (8, STACK_BASE),
+            // Win95 KERNEL32's private 16-bit thunk allocator pops blocks from
+            // FS:[0x10]. It expects a linked list of mapped free blocks, not zero.
+            (0x10, LOCAL_HANDLE_LIST_BASE),
+            (0x18, TIB_BASE),
+            // FS:[0x30] (NT's PEB): a zeroed block. MSHTML's allocator reads
+            // flags from it; KERNEL32's own code must not find the PDB there.
+            (0x30, WIN95_STATE_BASE + 0x3000),
+            // Win95 heap helpers load GS from FS:[0x0c] and test flag bits at
+            // GS:[0x16]. Point GS at the synthetic state page, whose flags stay
+            // zero so the simple (non-thunking) allocation path is used.
+            (0x0c, GS_SELECTOR),
+        ];
+        for (offset, value) in tib_init {
+            uc.mem_write((TIB_BASE + offset) as u64, &value.to_le_bytes())
+                .map_err(|error| RunError::Unicorn("initialising guest TIB", error))?;
+        }
 
-    // Unicorn 2.1.5 ignores FS_BASE writes in 32-bit mode, so install a small
-    // GDT and load FS with a selector whose descriptor bases it at TIB_BASE.
-    uc.mem_map(GDT_BASE as u64, GDT_SIZE as u64, Prot::ALL)
-        .map_err(|error| RunError::Unicorn("mapping guest GDT", error))?;
-    let mut gdt = vec![0u8; 40];
-    // Flat 32-bit code and data selectors, the TIB selector, and a selector
-    // based at the synthetic Win95 state page for GS.
-    gdt[8..16].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x9A, 0xCF, 0]);
-    gdt[16..24].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x92, 0xCF, 0]);
-    gdt[24..32].copy_from_slice(&fs_descriptor(TIB_BASE));
-    let gs_base = WIN95_STATE_BASE;
-    let gs_limit = WIN95_STATE_SIZE - 1;
-    gdt[32..40].copy_from_slice(&[
-        gs_limit as u8,
-        (gs_limit >> 8) as u8,
-        gs_base as u8,
-        (gs_base >> 8) as u8,
-        (gs_base >> 16) as u8,
-        0x92,
-        0xC0, // 32-bit segment, 4 KiB granularity
-        (gs_base >> 24) as u8,
-    ]);
-    uc.mem_write(GDT_BASE as u64, &gdt)
-        .map_err(|error| RunError::Unicorn("writing guest GDT", error))?;
-    let mut gdtr = [0u8; 24];
-    gdtr[8..16].copy_from_slice(&(GDT_BASE as u64).to_le_bytes());
-    gdtr[16..20].copy_from_slice(&39u32.to_le_bytes());
-    uc.reg_write_long(Reg::GDTR, &gdtr)
-        .map_err(|error| RunError::Unicorn("initialising GDTR", error))?;
-    for (register, selector) in [
-        (Reg::CS, CODE_SELECTOR),
-        (Reg::DS, DATA_SELECTOR),
-        (Reg::ES, DATA_SELECTOR),
-        (Reg::SS, DATA_SELECTOR),
-        (Reg::FS, FS_SELECTOR),
-        (Reg::GS, DATA_SELECTOR),
-    ] {
-        uc.reg_write(register, selector as u64)
-            .map_err(|error| RunError::Unicorn("initialising guest segment selectors", error))?;
+        // Unicorn 2.1.5 ignores FS_BASE writes in 32-bit mode, so install a small
+        // GDT and load FS with a selector whose descriptor bases it at TIB_BASE.
+        uc.mem_map(GDT_BASE as u64, GDT_SIZE as u64, Prot::ALL)
+            .map_err(|error| RunError::Unicorn("mapping guest GDT", error))?;
+        let mut gdt = vec![0u8; 40];
+        // Flat 32-bit code and data selectors, the TIB selector, and a selector
+        // based at the synthetic Win95 state page for GS.
+        gdt[8..16].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x9A, 0xCF, 0]);
+        gdt[16..24].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x92, 0xCF, 0]);
+        gdt[24..32].copy_from_slice(&fs_descriptor(TIB_BASE));
+        let gs_base = WIN95_STATE_BASE;
+        let gs_limit = WIN95_STATE_SIZE - 1;
+        gdt[32..40].copy_from_slice(&[
+            gs_limit as u8,
+            (gs_limit >> 8) as u8,
+            gs_base as u8,
+            (gs_base >> 8) as u8,
+            (gs_base >> 16) as u8,
+            0x92,
+            0xC0, // 32-bit segment, 4 KiB granularity
+            (gs_base >> 24) as u8,
+        ]);
+        uc.mem_write(GDT_BASE as u64, &gdt)
+            .map_err(|error| RunError::Unicorn("writing guest GDT", error))?;
+        let mut gdtr = [0u8; 24];
+        gdtr[8..16].copy_from_slice(&(GDT_BASE as u64).to_le_bytes());
+        gdtr[16..20].copy_from_slice(&39u32.to_le_bytes());
+        uc.reg_write_long(Reg::GDTR, &gdtr)
+            .map_err(|error| RunError::Unicorn("initialising GDTR", error))?;
+        for (register, selector) in [
+            (Reg::CS, CODE_SELECTOR),
+            (Reg::DS, DATA_SELECTOR),
+            (Reg::ES, DATA_SELECTOR),
+            (Reg::SS, DATA_SELECTOR),
+            (Reg::FS, FS_SELECTOR),
+            (Reg::GS, DATA_SELECTOR),
+        ] {
+            uc.reg_write(register, selector as u64)
+                .map_err(|error| RunError::Unicorn("initialising guest segment selectors", error))?;
+        }
     }
 
     let thunk_end = align_up(
@@ -1235,9 +1348,22 @@ fn build<'a>(
     uc.mem_write(THUNK_BASE as u64, &vec![0xC3; thunk_size as usize])
         .map_err(|error| RunError::Unicorn("writing IAT thunks", error))?;
 
-    init_win95_state(process, &mut uc)?;
+    if !x64 {
+        init_win95_state(process, &mut uc)?;
+    }
 
-    uc.reg_write(Reg::ESP, STACK_TOP as u64)
+    let thread_return = process.entry_point(KERNEL_DLL, THREAD_RETURN).unwrap_or(0);
+    let initial_sp = if x64 {
+        // As if called: the entry point returns to the thread-end thunk,
+        // with the stack 16-byte aligned before the call.
+        let sp = (STACK_TOP & !0xF) - 8;
+        uc.mem_write(sp as u64, &(thread_return as u64).to_le_bytes())
+            .map_err(|error| RunError::Unicorn("initialising the stack", error))?;
+        sp
+    } else {
+        STACK_TOP
+    };
+    uc.reg_write(Reg::ESP, initial_sp as u64)
         .map_err(|error| RunError::Unicorn("initialising ESP", error))?;
     uc.reg_write(Reg::EBP, 0)
         .map_err(|error| RunError::Unicorn("initialising EBP", error))?;
@@ -1252,7 +1378,8 @@ fn build<'a>(
     initial_state.dispatcher = process
         .entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER)
         .unwrap_or(0);
-    initial_state.thread_return = process.entry_point(KERNEL_DLL, THREAD_RETURN).unwrap_or(0);
+    initial_state.thread_return = thread_return;
+    initial_state.x64 = x64;
     initial_state.running = vec![1];
     initial_state.tibs = vec![(1, TIB_BASE)];
     initial_state.next_thread = 2;
@@ -1369,8 +1496,11 @@ fn build<'a>(
                 }
                 return;
             }
+            let x64 = thunk_state.borrow().x64;
             let arg_count = if kernel_entry {
                 Some(2)
+            } else if x64 {
+                thunk_calls.arg_count64(&entry.dll, &entry.name)
             } else {
                 thunk_calls.arg_count(&entry.dll, &entry.name)
             };
@@ -1386,12 +1516,25 @@ fn build<'a>(
                 return;
             };
 
-            let mut args = Vec::with_capacity(arg_count + 1);
+            // x64: the first four arguments in RCX, RDX, R8 and R9, the rest
+            // on the stack above the return address and the 32-byte home
+            // area. 32-bit: all on the stack.
+            let mut wide_args: Vec<u64> = Vec::with_capacity(arg_count);
             for index in 0..arg_count {
-                let arg_va = esp.wrapping_add(4 + index as u32 * 4);
-                match read_guest_u32(uc, arg_va) {
-                    Ok(value) => args.push(value),
-                    Err(error) => {
+                let value = if x64 && index < 4 {
+                    let register = [Reg::RCX, Reg::RDX, Reg::R8, Reg::R9][index];
+                    uc.reg_read(register).map_err(|error| (esp, error))
+                } else if x64 {
+                    let arg_va = esp.wrapping_add(8 + index as u32 * 8);
+                    let mut bytes = [0u8; 8];
+                    uc.mem_read(arg_va as u64, &mut bytes).map(|()| u64::from_le_bytes(bytes)).map_err(|error| (arg_va, error))
+                } else {
+                    let arg_va = esp.wrapping_add(4 + index as u32 * 4);
+                    read_guest_u32(uc, arg_va).map(u64::from).map_err(|error| (arg_va, error))
+                };
+                match value {
+                    Ok(value) => wide_args.push(value),
+                    Err((arg_va, error)) => {
                         abort(
                             &thunk_state,
                             uc,
@@ -1401,6 +1544,7 @@ fn build<'a>(
                     }
                 }
             }
+            let args: Vec<u32> = wide_args.iter().map(|&value| value as u32).collect();
 
             if trace_api {
                 eprintln!(
@@ -1410,6 +1554,7 @@ fn build<'a>(
                 );
             }
 
+            let mut wide_result = 0u64;
             let outcome = {
                 let mut memory = UnicornGuestMemory {
                     uc,
@@ -1418,6 +1563,13 @@ fn build<'a>(
                 if kernel_entry {
                     // The exception dispatcher: (record, context) on the stack.
                     Some(super::eh::dispatcher(&mut memory, args[0], args[1]))
+                } else if x64 {
+                    thunk_calls
+                        .call64(&mut memory, &entry.dll, &entry.name, &wide_args, return_address)
+                        .map(|(value, exit_code)| {
+                            wide_result = value;
+                            super::memory::ApiOutcome { value: value as u32, arg_count, exit_code }
+                        })
                 } else {
                     thunk_calls.call(&mut memory, &entry.dll, &entry.name, &args, return_address)
                 }
@@ -1523,7 +1675,7 @@ fn build<'a>(
             }
 
             if let Some(exit_code) = outcome.exit_code {
-                if let Err(error) = uc.reg_write(Reg::EAX, outcome.value as u64) {
+                if let Err(error) = uc.reg_write(if x64 { Reg::RAX } else { Reg::EAX }, outcome.value as u64) {
                     abort(&thunk_state, uc, format!("could not write EAX: {error:?}"));
                     return;
                 }
@@ -1536,11 +1688,23 @@ fn build<'a>(
                 return;
             }
 
-            let restored_esp = esp.wrapping_add(4 + outcome.arg_count as u32 * 4);
-            let register_writes = uc
-                .reg_write(Reg::EAX, outcome.value as u64)
-                .and_then(|()| uc.reg_write(Reg::ESP, restored_esp as u64))
-                .and_then(|()| uc.reg_write(Reg::EIP, return_address as u64));
+            // stdcall pops the arguments; in x64 the caller does.
+            let register_writes = if x64 {
+                let value = if kernel_entry { outcome.value as u64 } else { wide_result };
+                let return_address = {
+                    let mut bytes = [0u8; 8];
+                    let _ = uc.mem_read(esp as u64, &mut bytes);
+                    u64::from_le_bytes(bytes)
+                };
+                uc.reg_write(Reg::RAX, value)
+                    .and_then(|()| uc.reg_write(Reg::RSP, esp as u64 + 8))
+                    .and_then(|()| uc.reg_write(Reg::RIP, return_address))
+            } else {
+                let restored_esp = esp.wrapping_add(4 + outcome.arg_count as u32 * 4);
+                uc.reg_write(Reg::EAX, outcome.value as u64)
+                    .and_then(|()| uc.reg_write(Reg::ESP, restored_esp as u64))
+                    .and_then(|()| uc.reg_write(Reg::EIP, return_address as u64))
+            };
             if let Err(error) = register_writes {
                 abort(
                     &thunk_state,

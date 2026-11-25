@@ -148,6 +148,7 @@ fn object<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, prefix: &st
     for (index, name) in methods.iter().enumerate() {
         let _ = memory.write_u32(block + 8 + index as u32 * 4, ctx.builtin_proc(name));
     }
+    crate::win32::wide_vtable(ctx, memory, block, &methods);
     block
 }
 

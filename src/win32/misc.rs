@@ -53,6 +53,15 @@ pub fn arg_count(name: &str) -> Option<usize> {
         | "GetWindowWord" | "DdeAccessData" | "ExitWindowsEx" | "WNetConnectionDialog" | "WNetCancelConnectionA"
         | "LZCopy" => 2,
         "MakeCriticalSectionGlobal" => 1,
+        "VerifyVersionInfoW" | "VerifyVersionInfoA" => 4,
+        "GetFileSizeEx" | "MonitorFromRect" => 2,
+        "MonitorFromPoint" => 3,
+        "FindFirstFileExW" | "FindFirstFileExA" => 6,
+        "EnumDisplayMonitors" | "SHGetKnownFolderPath" | "SHCreateItemFromParsingName" => 4,
+        "CreateActCtxW" | "CreateActCtxA" | "ReleaseActCtx" | "GetCurrentActCtx" | "AddRefActCtx" => 1,
+        "ActivateActCtx" | "DeactivateActCtx" => 2,
+        "FindActCtxSectionStringW" | "FindActCtxSectionStringA" => 5,
+        "QueryActCtxW" => 7,
         "ImmGetContext" | "ImmIsIME" | "ImmGetOpenStatus" | "ImmGetVirtualKey" => 1,
         "ImmReleaseContext" | "ImmAssociateContext" | "ImmSetOpenStatus" | "ImmSetCompositionWindow"
         | "ImmSetCandidateWindow" | "ImmSetCompositionFontA" | "ImmGetProperty" => 2,
@@ -186,6 +195,111 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             0
         }
         "EqualSid" | "FreeSid" => 0,
+        "GetFileSizeEx" => match crate::win32::crt::file_size(ctx, args[0]) {
+            Some(size) => {
+                let _ = memory.write_bytes(args[1], &size.to_le_bytes());
+                1
+            }
+            None => 0,
+        },
+        // FindFirstFileEx(name, info level, data, search op, filter, flags):
+        // the standard information, every match.
+        "FindFirstFileExW" | "FindFirstFileExA" => {
+            let simple = if name.ends_with('W') { "FindFirstFileW" } else { "FindFirstFileA" };
+            call(ctx, memory, "KERNEL32.dll", simple, &[args[0], args[2]])
+        }
+        // One monitor: the screen.
+        "MonitorFromPoint" | "MonitorFromRect" => 0x0001_0001,
+        // EnumDisplayMonitors(hdc, clip, proc, data): the one monitor.
+        "EnumDisplayMonitors" => {
+            let (width, height) = ctx.shared.borrow().gui.screen;
+            let rect = ctx.shared.borrow_mut().heap.alloc(16).unwrap_or(0);
+            let bytes: Vec<u8> = [0, 0, width, height].iter().flat_map(|v| (*v as u32).to_le_bytes()).collect();
+            let _ = memory.write_bytes(rect, &bytes);
+            if args[2] != 0 {
+                memory.call_guest(args[2], &[0x0001_0001, args[0], rect, args[3]]);
+            }
+            ctx.shared.borrow_mut().heap.free(rect);
+            1
+        }
+        // SHGetKnownFolderPath(folder id, flags, token, &path): the folders
+        // that have a CSIDL, as a CoTaskMemAlloc'd string.
+        "SHGetKnownFolderPath" => {
+            let id = memory.read_bytes(args[0], 16).unwrap_or_default();
+            let known = [
+                ("B4BFCC3A-DB2C-424C-B029-7FE99A87C641", 0x10), // Desktop
+                ("FDD39AD0-238F-46AF-ADB4-6C85480369C7", 0x05), // Documents
+                ("33E28130-4E1E-4676-835A-98395C3BC3BB", 0x05), // Pictures
+                ("3EB685DB-65F9-4CF6-A03A-E3EF65729F3D", 0x1A), // RoamingAppData
+                ("F1B32785-6FBA-4FCF-9D55-7B8E7F157091", 0x1C), // LocalAppData
+                ("62AB5D82-FDC1-4DC3-A9DD-070D1D495D97", 0x23), // ProgramData
+                ("905E63B6-C1BF-494E-B29C-65B732D3D21A", 0x26), // ProgramFiles
+                ("6D809377-6AF0-444B-8957-A3773F02200E", 0x26), // ProgramFilesX64
+                ("F38BF404-1D43-42F2-9305-67DE0B28FC23", 0x24), // Windows
+                ("1AC14E77-02E7-4E5D-B744-2EB1AE5198B7", 0x25), // System
+                ("A77F5D77-2E2B-44C3-A6A2-ABA601054A51", 0x02), // Programs
+                ("625B53C3-AB48-4EC1-BA1F-A1EF4146FC19", 0x0B), // StartMenu
+                ("B97D20BB-F46A-4C97-BA10-5E3608430854", 0x07), // Startup
+                ("FD228CB7-AE11-4AE3-864C-16F3910AB8FE", 0x14), // Fonts
+            ];
+            let csidl = known.iter().find(|(text, _)| crate::win32::shell::parse_guid(text).is_some_and(|g| g.as_slice() == id.as_slice())).map(|(_, c)| *c);
+            match csidl.and_then(crate::win32::unicode::special_folder) {
+                Some(path) => {
+                    let units: Vec<u16> = path.encode_utf16().chain([0]).collect();
+                    let block = ctx.shared.borrow_mut().heap.alloc(units.len() as u32 * 2).unwrap_or(0);
+                    crate::win32::unicode::write_wide(memory, block, &units, false);
+                    if let Some(host) = crate::win32::crt::host_path(path.as_bytes()) {
+                        let _ = std::fs::create_dir_all(host);
+                    }
+                    let _ = memory.write_u32(args[3], block);
+                    0
+                }
+                None => {
+                    let _ = memory.write_u32(args[3], 0);
+                    0x8000_4005 // E_FAIL
+                }
+            }
+        }
+        // Shell items (IShellItem) are not there: callers fall back.
+        "SHCreateItemFromParsingName" => {
+            let _ = memory.write_u32(args[3], 0);
+            0x8000_4001 // E_NOTIMPL
+        }
+        "VerifyVersionInfoW" | "VerifyVersionInfoA" => {
+            crate::win32::unicode::verify_version(ctx, memory, args, name.ends_with('W'))
+        }
+        // Activation contexts (side-by-side manifests): none, as on
+        // Windows before XP; programs then use the system's DLLs.
+        "CreateActCtxW" | "CreateActCtxA" => {
+            ctx.shared.borrow_mut().last_error = 2; // ERROR_FILE_NOT_FOUND
+            u32::MAX
+        }
+        "ActivateActCtx" | "GetCurrentActCtx" => {
+            let out = if name == "ActivateActCtx" { args[1] } else { args[0] };
+            let width = if ctx.shared.borrow().x64 { 8 } else { 4 };
+            if out != 0 {
+                let _ = memory.write_bytes(out, &vec![0u8; width]);
+            }
+            1
+        }
+        "DeactivateActCtx" | "AddRefActCtx" => 1,
+        "ReleaseActCtx" => 0,
+        // QueryActCtxW(flags, context, subinstance, class, buffer, size,
+        // &needed): a module has no activation context of its own.
+        "QueryActCtxW" => {
+            let size = args[5].min(64);
+            if args[4] != 0 && size > 0 {
+                let _ = memory.write_bytes(args[4], &vec![0u8; size as usize]);
+            }
+            if args[6] != 0 {
+                let _ = memory.write_u32(args[6], size);
+            }
+            1
+        }
+        "FindActCtxSectionStringW" | "FindActCtxSectionStringA" => {
+            ctx.shared.borrow_mut().last_error = 0x36B7; // ERROR_SXS_KEY_NOT_FOUND
+            0
+        }
         // IMM32: no input method editors (Western Windows 95).
         "ImmGetContext" | "ImmIsIME" | "ImmGetOpenStatus" | "ImmAssociateContext" | "ImmGetProperty"
         | "ImmGetConversionStatus" | "ImmGetCandidateWindow" | "ImmNotifyIME" | "ImmEscapeA" | "ImmEscapeW" => 0,

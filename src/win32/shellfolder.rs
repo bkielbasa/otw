@@ -242,6 +242,8 @@ fn make_object<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, prefix
     for (index, name) in methods.iter().enumerate() {
         let _ = memory.write_u32(object + 4 + index as u32 * 4, ctx.builtin_proc(name));
     }
+    let names: Vec<&str> = methods.iter().map(|m| **m).collect();
+    crate::win32::wide_vtable(ctx, memory, object, &names);
     object
 }
 

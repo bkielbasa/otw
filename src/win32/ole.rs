@@ -199,6 +199,7 @@ fn malloc_object<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) -> u
     for (index, name) in crate::win32::BUILTIN_COM.iter().enumerate() {
         let _ = memory.write_u32(block + 4 + index as u32 * 4, ctx.builtin_proc(name));
     }
+    crate::win32::wide_vtable(ctx, memory, block, crate::win32::BUILTIN_COM);
     ctx.shared.borrow_mut().imalloc = block;
     block
 }

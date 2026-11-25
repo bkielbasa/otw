@@ -1,4 +1,4 @@
-//! Minimal PE32 reader for the static loader skeleton.
+//! Minimal PE32 and PE32+ reader for the static loader skeleton.
 //!
 //! Only the pieces needed to map `NOTEPAD.EXE` and build its import table are
 //! implemented: DOS/PE headers, section table, and the import directory. The
@@ -132,6 +132,11 @@ pub struct PeImage {
     pub export_directory: Option<ExportDirectory>,
     /// The base relocation directory (RVA, size), if the image has one.
     pub relocations: Option<(u32, u32)>,
+    /// A 64-bit (PE32+) image.
+    pub is64: bool,
+    /// The base the image was linked for. A 64-bit image linked above 4 GiB
+    /// is moved below it (`image_base`) and relocated when mapped.
+    pub preferred_base: u64,
 }
 
 impl PeImage {
@@ -157,39 +162,57 @@ impl PeImage {
         if optional + optional_size > bytes.len() || optional_size < 96 {
             return Err(PeError::TruncatedHeader("optional"));
         }
-        if read_u16(&bytes, optional)? != 0x10b {
-            return Err(PeError::UnsupportedOptionalHeader(read_u16(
-                &bytes, optional,
-            )?));
-        }
+        let magic = read_u16(&bytes, optional)?;
+        let is64 = match magic {
+            0x10b => false,
+            0x20b => true,
+            other => return Err(PeError::UnsupportedOptionalHeader(other)),
+        };
+        // PE32+ widens the image base (and the stack/heap sizes), which moves
+        // the data directories 16 bytes on.
+        let directories = if is64 { optional + 112 } else { optional + 96 };
 
         let entry_rva = read_u32(&bytes, optional + 16)?;
-        let image_base = read_u32(&bytes, optional + 28)?;
+        let preferred_base = if is64 {
+            read_u32(&bytes, optional + 24)? as u64 | (read_u32(&bytes, optional + 28)? as u64) << 32
+        } else {
+            read_u32(&bytes, optional + 28)? as u64
+        };
         let size_of_image = read_u32(&bytes, optional + 56)?;
         let size_of_headers = read_u32(&bytes, optional + 60)?;
-        let directory_count = read_u32(&bytes, optional + 92)? as usize;
+        let directory_count = read_u32(&bytes, directories - 4)? as usize;
         let export_rva = if directory_count >= 1 {
-            read_u32(&bytes, optional + 96)?
+            read_u32(&bytes, directories)?
         } else {
             0
         };
         let export_size = if directory_count >= 1 {
-            read_u32(&bytes, optional + 100)?
+            read_u32(&bytes, directories + 4)?
         } else {
             0
         };
         let import_rva = if directory_count >= 2 {
-            read_u32(&bytes, optional + 96 + 8)?
+            read_u32(&bytes, directories + 8)?
         } else {
             0
         };
 
         let relocations = if directory_count >= 6 {
-            let rva = read_u32(&bytes, optional + 96 + 5 * 8)?;
-            let size = read_u32(&bytes, optional + 96 + 5 * 8 + 4)?;
+            let rva = read_u32(&bytes, directories + 5 * 8)?;
+            let size = read_u32(&bytes, directories + 5 * 8 + 4)?;
             (rva != 0 && size != 0).then_some((rva, size))
         } else {
             None
+        };
+        // The emulated address space is 32 bits wide: a 64-bit image linked
+        // above it is loaded low, where 32-bit programs go.
+        let image_base = match u32::try_from(preferred_base) {
+            Ok(base) => base,
+            Err(_) if relocations.is_some() => {
+                let is_dll = read_u16(&bytes, coff + 18)? & 0x2000 != 0;
+                if is_dll { 0x1000_0000 } else { 0x0040_0000 }
+            }
+            Err(_) => return Err(PeError::UnsupportedOptionalHeader(magic)),
         };
 
         let section_table = optional + optional_size;
@@ -225,6 +248,8 @@ impl PeImage {
             imports: Vec::new(),
             export_directory: None,
             relocations,
+            is64,
+            preferred_base,
         };
         if export_rva != 0 {
             image.export_directory = Some(image.parse_exports(export_rva, export_size)?);
@@ -363,11 +388,22 @@ impl PeImage {
             let mut names = Vec::new();
 
             for _ in 0..MAX_NAMES_PER_DLL {
-                let value = read_u32(&self.bytes, thunk_offset)?;
-                if value == 0 {
+                // PE32+ lookup entries are 64 bits, the ordinal flag in bit 63.
+                let (value, ordinal) = if self.is64 {
+                    let high = read_u32(&self.bytes, thunk_offset + 4)?;
+                    let low = read_u32(&self.bytes, thunk_offset)?;
+                    if low == 0 && high == 0 {
+                        break;
+                    }
+                    (low & 0x7FFF_FFFF, high & 0x8000_0000 != 0)
+                } else {
+                    let value = read_u32(&self.bytes, thunk_offset)?;
+                    (value, value & 0x8000_0000 != 0)
+                };
+                if value == 0 && !ordinal {
                     break;
                 }
-                let import = if value & 0x8000_0000 != 0 {
+                let import = if ordinal {
                     ImportName::Ordinal((value & 0xffff) as u16)
                 } else {
                     let hint_name_offset = self
@@ -376,7 +412,7 @@ impl PeImage {
                     ImportName::ByName(read_c_string(&self.bytes, hint_name_offset + 2)?)
                 };
                 names.push(import);
-                thunk_offset += 4;
+                thunk_offset += if self.is64 { 8 } else { 4 };
             }
             result.push(DllImport {
                 dll,
@@ -441,7 +477,7 @@ impl fmt::Display for PeError {
             PeError::UnsupportedOptionalHeader(magic) => {
                 write!(
                     f,
-                    "unsupported optional-header magic 0x{magic:04x} (need PE32)"
+                    "unsupported optional-header magic 0x{magic:04x} (need PE32 or a relocatable PE32+)"
                 )
             }
             PeError::TruncatedHeader(part) => write!(f, "truncated {part} header"),

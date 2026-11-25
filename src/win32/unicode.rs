@@ -515,12 +515,20 @@ pub fn call_proc<M: GuestMemory + ?Sized>(
     wparam: u32,
     lparam: u32,
 ) -> Option<u32> {
+    let x64 = ctx.shared.borrow().x64;
+    let call = |memory: &mut M, wparam: u32, lparam: u32| {
+        if x64 {
+            crate::win32::x64::call_proc(ctx, memory, proc_va, hwnd, msg, wparam, lparam)
+        } else {
+            memory.call_guest(proc_va, &[hwnd, msg, wparam, lparam])
+        }
+    };
     if !is_unicode_proc(ctx, proc_va) {
-        return memory.call_guest(proc_va, &[hwnd, msg, wparam, lparam]);
+        return call(memory, wparam, lparam);
     }
     let mut result = None;
     convert_message(ctx, memory, true, hwnd, msg, wparam, lparam, |memory, wparam, lparam| {
-        result = memory.call_guest(proc_va, &[hwnd, msg, wparam, lparam]);
+        result = call(memory, wparam, lparam);
         result.unwrap_or(0)
     });
     result
@@ -670,17 +678,19 @@ fn native<M: GuestMemory + ?Sized>(
             0
         }
         "GetVersionExW" | "GetVersionExA" => {
-            // OSVERSIONINFO: Windows 95 (4.0.950).
+            // OSVERSIONINFO: Windows 95 (4.0.950), or for 64-bit programs a
+            // 64-bit Windows (see `os_version`).
             let size = memory.read_u32(args[0]).unwrap_or(0);
-            for (offset, value) in [(4, 4), (8, 0), (12, 950), (16, 1)] {
+            let version = os_version(ctx);
+            for (offset, value) in [(4, version.major), (8, version.minor), (12, version.build), (16, version.platform)] {
                 let _ = memory.write_u32(args[0] + offset, value);
             }
             let csd_size = if name == "GetVersionExW" { 256 } else { 128 };
             let _ = memory.write_bytes(args[0] + 20, &vec![0u8; csd_size]);
             if size >= 20 + csd_size as u32 + 8 {
                 // OSVERSIONINFOEX: service pack, suite, product type.
-                let _ = memory.write_bytes(args[0] + 20 + csd_size as u32, &[0u8; 8]);
-                let _ = memory.write_bytes(args[0] + 20 + csd_size as u32 + 6, &[1]);
+                let at = args[0] + 20 + csd_size as u32;
+                let _ = memory.write_bytes(at, &[version.service_pack as u8, 0, 0, 0, 0, 0, 1, 0]);
             }
             1
         }
@@ -1368,4 +1378,74 @@ mod tests {
             font
         }))[28..30], [b'T', 0]);
     }
+}
+
+/// The Windows version programs are told.
+pub struct OsVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub build: u32,
+    pub platform: u32,
+    pub service_pack: u32,
+}
+
+/// Windows 95 (4.0.950) for 32-bit programs. A 64-bit program cannot run
+/// on Windows 95, so it is told Windows 7 SP1 (6.1.7601), the oldest
+/// 64-bit Windows such programs commonly require.
+pub fn os_version(ctx: &ApiContext) -> OsVersion {
+    if ctx.shared.borrow().x64 {
+        OsVersion { major: 6, minor: 1, build: 7601, platform: 2, service_pack: 1 }
+    } else {
+        OsVersion { major: 4, minor: 0, build: 950, platform: 1, service_pack: 0 }
+    }
+}
+
+/// `VerifyVersionInfo(info, type mask, condition mask low, high)`.
+pub fn verify_version<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, args: &[u32], wide: bool) -> u32 {
+    let (info, types) = (args[0], args[1]);
+    let mask = args[2] as u64 | (args[3] as u64) << 32;
+    let condition = |bit: u32| ((mask >> (bit.trailing_zeros() * 3)) & 7) as u32;
+    let ours = os_version(ctx);
+    let csd = if wide { 256 } else { 128 };
+    let read = |memory: &mut M, offset: u32, size: u32| -> u32 {
+        let bytes = memory.read_bytes(info + offset, size as usize).unwrap_or_default();
+        bytes.iter().rev().fold(0, |value, &b| value << 8 | b as u32)
+    };
+    let compare = |ours: u64, theirs: u64, how: u32| match how {
+        1 => ours == theirs,
+        2 => ours > theirs,
+        3 => ours >= theirs,
+        4 => ours < theirs,
+        5 => ours <= theirs,
+        _ => true,
+    };
+    // Major, minor and service pack compare as one version number, with
+    // the condition of the most significant part asked about.
+    let parts = [
+        (2u32, ours.major, read(memory, 4, 4)),
+        (1, ours.minor, read(memory, 8, 4)),
+        (0x20, ours.service_pack, read(memory, 20 + csd, 2)),
+        (0x10, 0, read(memory, 22 + csd, 2)),
+    ];
+    let asked: Vec<_> = parts.iter().filter(|(bit, _, _)| types & bit != 0).collect();
+    let mut ok = true;
+    if let Some(first) = asked.first() {
+        let pack = |values: &[u32]| values.iter().fold(0u64, |acc, &v| acc << 16 | v as u64 & 0xFFFF);
+        let mine: Vec<u32> = asked.iter().map(|p| p.1).collect();
+        let theirs: Vec<u32> = asked.iter().map(|p| p.2).collect();
+        ok &= compare(pack(&mine), pack(&theirs), condition(first.0));
+    }
+    if types & 4 != 0 {
+        ok &= compare(ours.build as u64, read(memory, 12, 4) as u64, condition(4));
+    }
+    if types & 8 != 0 {
+        ok &= compare(ours.platform as u64, read(memory, 16, 4) as u64, condition(8));
+    }
+    if types & 0x80 != 0 {
+        ok &= compare(1, read(memory, 26 + csd, 1) as u64, condition(0x80));
+    }
+    if !ok {
+        ctx.shared.borrow_mut().last_error = 0x47E; // ERROR_OLD_WIN_VERSION
+    }
+    u32::from(ok)
 }

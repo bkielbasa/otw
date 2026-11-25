@@ -31,6 +31,27 @@ pub trait SystemCalls {
         caller: u32,
     ) -> Option<ApiOutcome>;
 
+    /// Number of arguments of an implemented import called from 64-bit
+    /// code, where each argument is one 64-bit register or stack slot.
+    fn arg_count64(&self, dll: &str, name: &ImportName) -> Option<usize> {
+        self.arg_count(dll, name)
+    }
+
+    /// Perform a call from 64-bit code (the x64 calling convention: the
+    /// caller cleans the stack). The value is returned in RAX.
+    fn call64(
+        &self,
+        memory: &mut dyn GuestMemory,
+        dll: &str,
+        name: &ImportName,
+        args: &[u64],
+        caller: u32,
+    ) -> Option<(u64, Option<u32>)> {
+        let narrow: Vec<u32> = args.iter().map(|&a| a as u32).collect();
+        let outcome = self.call(memory, dll, name, &narrow, caller)?;
+        Some((widen(outcome.value), outcome.exit_code))
+    }
+
     /// How to name an import in diagnostics.
     fn describe(&self, dll: &str, name: &ImportName) -> String {
         format!("{dll}!{}", name.display())
@@ -49,5 +70,16 @@ pub struct GenuineFirst;
 impl ImportPolicy for GenuineFirst {
     fn prefers_subsystem(&self, _dll: &str, _name: &ImportName) -> bool {
         false
+    }
+}
+
+/// A 32-bit result as a 64-bit one: small negative values (error codes such
+/// as -1) are sign-extended, everything else (addresses and handles below
+/// 4 GiB, counts, flags) zero-extended.
+pub fn widen(value: u32) -> u64 {
+    if value >= 0xFFFF_0000 {
+        value as i32 as i64 as u64
+    } else {
+        value as u64
     }
 }
