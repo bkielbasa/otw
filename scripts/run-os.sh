@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boot target/os/otw.img (scripts/build-os-image.sh) in QEMU with UEFI, as a
-# real machine would. Writes go to the image itself.
+# real machine would: the PC's own PS/2 keyboard and mouse, a plain VGA
+# card. The kernel logs to the serial port (VM_SERIAL).
 # Settings: OS_IMAGE, VM_CPUS (8), VM_MEMORY (8G), VM_DISPLAY (gtk; none),
 # VM_MONITOR (unix socket for the QEMU monitor), VM_QMP (unix socket for
 # QMP), VM_SERIAL (serial log file).
@@ -33,7 +34,6 @@ exec qemu-system-x86_64 \
   -drive "if=pflash,format=raw,file=$VARS" \
   -drive "file=$IMAGE,if=virtio,format=raw" \
   -nic user,model=virtio-net-pci \
-  -device virtio-vga \
-  -device qemu-xhci -device usb-tablet -device usb-kbd \
+  -vga std \
   -display "${VM_DISPLAY:-gtk}" \
   "${args[@]}"

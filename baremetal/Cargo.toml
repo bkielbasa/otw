@@ -1,0 +1,25 @@
+[package]
+name = "otw-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "OTW on bare metal: the kernel a UEFI machine boots"
+license = "GPL-2.0-only"
+publish = false
+
+[[bin]]
+name = "otw-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+
+# Not part of the host crate's build.
+[workspace]

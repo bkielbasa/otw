@@ -37,8 +37,8 @@ desktop:
 qemu:
 	QEMU='$(QEMU)' QEMU_DISPLAY='$(QEMU_DISPLAY)' $(ROOT)scripts/run-qemu.sh
 
-# A bootable disk image that starts the OTW desktop (real machines via UEFI,
-# or QEMU with `make os`).
+# OTW on bare metal: a bootable UEFI disk image of the kernel in baremetal/
+# (real machines, or QEMU with `make os`).
 image:
 	$(ROOT)scripts/build-os-image.sh
 
