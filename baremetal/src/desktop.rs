@@ -92,6 +92,8 @@ pub fn run(system: &System) -> ! {
 /// Run a program the shell asked for, to its end; the desktop keeps going
 /// while it waits.
 fn launch(path: &str, name: &str) {
+    // The shell names paths on drive C: from its root.
+    let path = &if path.starts_with('\\') { format!("C:{path}") } else { String::from(path) };
     log!("OTW kernel: asked to run {path}");
     let ended = crate::process::run(path, name);
     let desktop = unsafe { &mut *DESKTOP.load(Ordering::SeqCst) };

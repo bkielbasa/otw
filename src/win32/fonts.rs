@@ -82,6 +82,10 @@ fn font_dirs() -> Vec<PathBuf> {
     if let Some(dirs) = std::env::var_os("OTW_FONT_DIRS") {
         return std::env::split_paths(&dirs).collect();
     }
+    // On bare metal, the fonts are drive C:'s (C:\WINDOWS\FONTS).
+    #[cfg(not(feature = "std"))]
+    return vec![crate::win32::crt::drive_root().join("WINDOWS").join("FONTS")];
+    #[allow(unreachable_code)]
     let mut dirs = vec![PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")];
     if let Some(home) = std::env::var_os("HOME") {
         dirs.push(PathBuf::from(&home).join(".local/share/fonts"));

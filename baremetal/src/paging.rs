@@ -15,6 +15,8 @@ pub const DIRECT_BASE: u64 = 0xFFFF_8000_0000_0000;
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 2;
 pub const USER: u64 = 4;
+/// Ours: a frame owned elsewhere (not freed when unmapped).
+const SHARED: u64 = 1 << 9;
 const WRITE_THROUGH: u64 = 1 << 3;
 const NO_CACHE: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
@@ -223,7 +225,9 @@ impl AddressSpace {
             if let Some(entry) = self.entry(page, false) {
                 unsafe {
                     if *entry & PRESENT != 0 {
-                        alloc::alloc::dealloc(to_virtual(*entry & ADDRESS) as *mut u8, layout);
+                        if *entry & SHARED == 0 {
+                            alloc::alloc::dealloc(to_virtual(*entry & ADDRESS) as *mut u8, layout);
+                        }
                         *entry = 0;
                         asm!("invlpg [{}]", in(reg) page);
                     }
@@ -231,6 +235,23 @@ impl AddressSpace {
             }
             page += 4096;
         }
+    }
+
+    /// Map [address, address + size) onto the physical frames from
+    /// `physical` (memory owned by someone else: a shared section). Pages
+    /// already there are given back.
+    pub fn map_frames(&self, address: u64, physical: u64, size: u64) -> bool {
+        self.unmap(address, size);
+        let mut offset = 0;
+        while offset < size {
+            let Some(entry) = self.entry(address + offset, true) else { return false };
+            unsafe {
+                *entry = (physical + offset) | PRESENT | WRITABLE | USER | SHARED;
+                asm!("invlpg [{}]", in(reg) address + offset);
+            }
+            offset += 4096;
+        }
+        true
     }
 
     /// Where the kernel reaches the byte at `address`, if mapped.
@@ -288,7 +309,7 @@ impl Drop for AddressSpace {
                 }
                 if level > 1 {
                     free_level(entry & ADDRESS, level - 1, layout);
-                } else {
+                } else if entry & SHARED == 0 {
                     alloc::alloc::dealloc(to_virtual(entry & ADDRESS) as *mut u8, layout);
                 }
             }

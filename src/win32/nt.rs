@@ -1217,12 +1217,27 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(1)
         }
         "IsValidSecurityDescriptor" => ok(1),
-        "GetSystemCpuSetInformation" | "GetDisplayConfigBufferSizes" => {
-            if name == "GetDisplayConfigBufferSizes" {
-                return ok(50); // ERROR_NOT_SUPPORTED
+        "GetDisplayConfigBufferSizes" => ok(50), // ERROR_NOT_SUPPORTED
+        "GetSystemCpuSetInformation" => {
+            // (buffer, length, &returned, process, flags): one CPU set, the
+            // one processor OTW reports (SYSTEM_CPU_SET_INFORMATION, 32
+            // bytes). Callers ask for the size first: they get it, with
+            // ERROR_INSUFFICIENT_BUFFER, and allocate that much.
+            const SIZE: u32 = 32;
+            if p(2) != 0 {
+                let _ = memory.write_u32(p(2), SIZE);
             }
-            set_error(ctx, 50);
-            ok(0)
+            if p(0) == 0 || (p(1) as u32) < SIZE {
+                set_error(ctx, 122);
+                return ok(0);
+            }
+            let mut entry = vec![0u8; SIZE as usize];
+            entry[0..4].copy_from_slice(&SIZE.to_le_bytes()); // Size
+            // Type 0 (CpuSetInformation); Id 0x100; group 0; logical
+            // processor, core, cache, NUMA node, efficiency class all 0.
+            entry[8..12].copy_from_slice(&0x100u32.to_le_bytes());
+            let _ = memory.write_bytes(p(0), &entry);
+            ok(1)
         }
         "GetUserPreferredUILanguages" | "GetThreadPreferredUILanguages" | "GetUserDefaultPreferredUILanguages" => {
             // (flags, &count, buffer, &size): "en-US", a double-NUL list.

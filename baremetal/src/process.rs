@@ -104,7 +104,12 @@ struct Runner {
     next_thread: Cell<u32>,
     signal: Cell<Option<Signal>>,
     /// Each module's TLS template, copied for every thread.
-    tls: Vec<Vec<u8>>,
+    tls: RefCell<Vec<Vec<u8>>>,
+    /// Memory shared between mappings (sections, and 64-bit memory above
+    /// 4 GiB with its low alias), by address: size, alias, the memory.
+    shared: RefCell<alloc::collections::BTreeMap<u64, (u64, Option<u64>, alloc::sync::Arc<memory::SharedMemory>)>>,
+    /// The last calls made (for when a program ends badly).
+    recent: RefCell<alloc::collections::VecDeque<String>>,
 }
 
 /// What the subsystem sees of the program (`GuestMemory`), while it runs a
@@ -159,21 +164,34 @@ impl Runner {
         self.read(address, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
     }
 
-    /// A free range of `size` bytes (from `preferred` if it is free).
+    /// A free range of `size` bytes: from `preferred` up (the first free
+    /// 64 KiB-aligned place), else from the start of the separate window.
     fn find_free(&self, preferred: u64, size: u64) -> Option<u64> {
         let size = (size + PAGE - 1) & !(PAGE - 1);
-        let free = |start: u64| !self.reserved.borrow().iter().any(|&(s, e)| start < e && start + size > s);
-        if preferred != 0 && free(preferred & !(PAGE - 1)) {
-            return Some(preferred & !(PAGE - 1));
-        }
-        let mut start = memory::SEPARATE_BASE as u64;
-        while start + size < 0x7000_0000 {
-            if free(start) {
-                return Some(start);
+        // Below the thunks in 32-bit processes; below NTDLL's image in
+        // 64-bit ones (which reach the whole low 4 GiB).
+        let limit = if self.x64 { memory::NTDLL_HANDLE as u64 } else { THUNK_BASE as u64 };
+        let reserved = self.reserved.borrow();
+        let search = |from: u64| -> Option<u64> {
+            let mut start = from;
+            loop {
+                if start + size > limit {
+                    return None;
+                }
+                match reserved.iter().filter(|&&(s, e)| start < e && start + size > s).map(|&(_, e)| e).max() {
+                    None => return Some(start),
+                    Some(end) => start = (end + 0xFFFF) & !0xFFFF,
+                }
             }
-            start += 0x1_0000;
+        };
+        if preferred != 0 {
+            let exact = preferred & !(PAGE - 1);
+            if search(exact) == Some(exact) {
+                return Some(exact);
+            }
         }
-        None
+        let from = if preferred != 0 { (preferred + 0xFFFF) & !0xFFFF } else { memory::SEPARATE_BASE as u64 };
+        search(from).or_else(|| search(memory::SEPARATE_BASE as u64))
     }
 
     fn end(&self, how: Ended) {
@@ -227,6 +245,20 @@ impl Runner {
         // A breakpoint reports the int3 itself.
         let at = if vector == 3 { regs.rip - 1 } else { regs.rip };
         log!("OTW kernel: {} at {at:#x} ({:#x})", exception_name(vector), regs.fault_address);
+        {
+            // What the program was doing: return addresses on its stack,
+            // strings its registers point at (a crash reason), its code.
+            let stack: Vec<u64> = (0..24).filter_map(|i| self.read_u64(regs.rsp + i * 8)).filter(|v| (0x1000_0000..0x8000_0000).contains(v)).collect();
+            log!("[eh] stack {stack:x?}");
+            for (name, v) in [("rax", regs.rax), ("rcx", regs.rcx), ("rsi", regs.rsi), ("r8", regs.r8), ("r9", regs.r9)] {
+                if let Some(bytes) = self.read(v, 96) {
+                    let text: String = bytes.iter().take_while(|&&b| b != 0).map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
+                    log!("[eh] {name} -> {text:?}");
+                }
+            }
+            log!("[eh] code {:02x?} rsp {:#x} rax {:#x} rcx {:#x} rdx {:#x} rbx {:#x} rsi {:#x} rdi {:#x} error {:#x}",
+                self.read(regs.rip, 16).unwrap_or_default(), regs.rsp, regs.rax, regs.rcx, regs.rdx, regs.rbx, regs.rsi, regs.rdi, regs.error);
+        }
         if self.dispatcher == 0 {
             return Some(self.fail(format!("{} at {at:#x}", exception_name(vector))));
         }
@@ -301,6 +333,13 @@ impl Runner {
             return Some(self.fail(format!("a system call from {:#x}, not an import", regs.rip)));
         };
         self.api_calls.set(self.api_calls.get() + 1);
+        {
+            let mut recent = self.recent.borrow_mut();
+            if recent.len() >= 600 {
+                recent.pop_front();
+            }
+            recent.push_back(self.syscalls.describe(&entry.dll, &entry.name));
+        }
         let x64 = self.x64;
         let esp = regs.rsp;
         let return_address = if x64 { self.read_u64(esp) } else { self.read_u32(esp).map(u64::from) };
@@ -324,6 +363,18 @@ impl Runner {
             self.syscalls.arg_count(&entry.dll, &entry.name)
         };
         let Some(arg_count) = arg_count else {
+            // OTW_STUB_MISSING: functions OTW lacks return 0 (64-bit
+            // programs), named in the log, to see what comes next.
+            if x64 && otw_vm::platform::env::var_os("OTW_STUB_MISSING").is_some() {
+                let name = self.syscalls.describe(&entry.dll, &entry.name);
+                if self.recent.borrow().iter().filter(|n| **n == name).count() <= 1 {
+                    log!("[stub] {name} returns 0");
+                }
+                regs.rax = 0;
+                regs.rsp = esp + 8;
+                regs.rip = return_address;
+                return None;
+            }
             return Some(self.fail(format!("{} is not implemented", self.syscalls.describe(&entry.dll, &entry.name))));
         };
         // x64: the first four in RCX, RDX, R8, R9, the rest above the return
@@ -403,6 +454,13 @@ impl Runner {
             self.end(Ended::Exited(code));
             return Some(Stop::Ended);
         }
+        if outcome.value == 0 && outcome.wide.unwrap_or(0) == 0 {
+            if let Some(name) = entry.name.as_str() {
+                if matches!(name, "VirtualAlloc" | "VirtualAllocEx" | "HeapAlloc" | "HeapReAlloc" | "malloc" | "calloc" | "realloc" | "_aligned_malloc" | "VirtualAlloc2" | "MapViewOfFile" | "MapViewOfFileEx" | "CreateFileMappingW") {
+                    log!("[mem] {name} failed: {:x?}", [regs.rcx, regs.rdx, regs.r8, regs.r9]);
+                }
+            }
+        }
         if x64 {
             regs.rax = outcome.wide.unwrap_or_else(|| widen(outcome.value));
             regs.rsp = esp + 8;
@@ -464,22 +522,57 @@ impl Runner {
 
     /// Give a thread its copies of the TLS templates.
     fn install_tls(&self, teb: u64) {
-        if self.tls.is_empty() {
+        let tls = self.tls.borrow();
+        if tls.is_empty() {
             return;
         }
         let width = if self.x64 { 8 } else { 4 };
-        let array = (self.tls.len() as u64 * width + 15) & !15;
-        let total = array + self.tls.iter().map(|t| (t.len() as u64 + 15) & !15).sum::<u64>();
+        let array = (tls.len() as u64 * width + 15) & !15;
+        let total = array + tls.iter().map(|t| (t.len() as u64 + 15) & !15).sum::<u64>();
         let Some(block) = self.find_free(0x1000_0000, total.max(1)) else { return };
         self.reserve(block, total.max(1));
         let mut cursor = block + array;
-        for (index, template) in self.tls.iter().enumerate() {
+        for (index, template) in tls.iter().enumerate() {
             self.write(cursor, template);
             self.write(block + index as u64 * width, &cursor.to_le_bytes()[..width as usize]);
             cursor += (template.len() as u64 + 15) & !15;
         }
         let slot = if self.x64 { teb + 0x58 } else { teb + 0x2C };
         self.write(slot, &block.to_le_bytes()[..width as usize]);
+    }
+
+    /// A module loaded later has TLS: every thread gets a longer array with
+    /// a block for it. Returns its index.
+    fn add_tls(&self, template: &[u8]) -> Option<u32> {
+        let index = {
+            let mut tls = self.tls.borrow_mut();
+            tls.push(template.to_vec());
+            tls.len() as u64 - 1
+        };
+        let width = if self.x64 { 8 } else { 4 };
+        let mut tibs: Vec<u64> = self.running.borrow().iter().map(|&(_, tib)| tib).collect();
+        tibs.extend(self.waiting.borrow().iter().map(|t| t.tib));
+        for tib in tibs {
+            let slot = if self.x64 { tib + 0x58 } else { tib + 0x2C };
+            let old = self.read(slot, width as usize).map(|b| {
+                let mut v = [0u8; 8];
+                v[..width as usize].copy_from_slice(&b);
+                u64::from_le_bytes(v)
+            })?;
+            let size = (index + 1) * width;
+            let total = size + 16 + template.len() as u64;
+            let array = self.find_free(0x1000_0000, total)?;
+            self.reserve(array, total);
+            if old != 0 && index > 0 {
+                let previous = self.read(old, (index * width) as usize)?;
+                self.write(array, &previous);
+            }
+            let block = (array + size + 15) & !15;
+            self.write(block, template);
+            self.write(array + index * width, &block.to_le_bytes()[..width as usize]);
+            self.write(slot, &array.to_le_bytes()[..width as usize]);
+        }
+        Some(index as u32)
     }
 
     fn init_teb64(&self, teb: u64, top: u64, bottom: u64, thread: u32) {
@@ -612,6 +705,29 @@ impl NativeMemory<'_> {
     fn regs(&self) -> &UserRegs {
         unsafe { &*self.regs }
     }
+
+    /// Unmap [va, va + size): no longer the program's.
+    fn unmap_range(&mut self, va: u64, size: u64) -> bool {
+        let (start, end) = (va & !(PAGE - 1), (va + size + PAGE - 1) & !(PAGE - 1));
+        let mut reserved = self.runner.reserved.borrow_mut();
+        let mut kept = Vec::new();
+        for &(s, e) in reserved.iter() {
+            if e <= start || s >= end {
+                kept.push((s, e));
+                continue;
+            }
+            if s < start {
+                kept.push((s, start));
+            }
+            if e > end {
+                kept.push((end, e));
+            }
+        }
+        *reserved = kept;
+        drop(reserved);
+        self.runner.space.unmap(start, end - start);
+        true
+    }
 }
 
 impl GuestMemory for NativeMemory<'_> {
@@ -649,35 +765,76 @@ impl GuestMemory for NativeMemory<'_> {
     }
 
     fn unmap(&mut self, va: u32, size: u32) -> bool {
-        let (start, end) = (va as u64 & !(PAGE - 1), (va as u64 + size as u64 + PAGE - 1) & !(PAGE - 1));
-        let mut reserved = self.runner.reserved.borrow_mut();
-        let mut kept = Vec::new();
-        for &(s, e) in reserved.iter() {
-            if e <= start || s >= end {
-                kept.push((s, e));
-                continue;
-            }
-            if s < start {
-                kept.push((s, start));
-            }
-            if e > end {
-                kept.push((end, e));
-            }
-        }
-        *reserved = kept;
-        drop(reserved);
-        self.runner.space.unmap(start, end - start);
-        true
+        self.unmap_range(va as u64, size as u64)
     }
 
     fn map_region(&mut self, preferred: u32, size: u32) -> Option<u32> {
-        let start = self.runner.find_free(preferred as u64, size as u64)?;
+        let Some(start) = self.runner.find_free(preferred as u64, size as u64) else {
+            log!("[mem] no room for {size:#x} bytes (asked {preferred:#x})");
+            return None;
+        };
         self.runner.reserve(start, size as u64);
         Some(start as u32)
     }
 
+
+    fn map_shared(&mut self, va: u64, size: u64, alias: Option<u32>) -> bool {
+        let size = (size + PAGE - 1) & !(PAGE - 1);
+        let Some(section) = memory::SharedMemory::new(size as usize) else {
+            log!("[mem] no memory for {size:#x} shared bytes at {va:#x}");
+            return false;
+        };
+        let physical = crate::paging::to_physical(section.pointer(0) as u64);
+        let runner = self.runner;
+        if !runner.space.map_frames(va, physical, size) {
+            return false;
+        }
+        runner.reserve(va, size);
+        let alias = alias.map(|low| low as u64).filter(|&low| runner.space.map_frames(low, physical, size));
+        if let Some(low) = alias {
+            runner.reserve(low, size);
+        }
+        runner.shared.borrow_mut().insert(va, (size, alias, section));
+        true
+    }
+
+    fn unmap_shared(&mut self, va: u64) -> bool {
+        let Some((size, alias, _section)) = self.runner.shared.borrow_mut().remove(&va) else { return false };
+        self.unmap_range(va, size);
+        if let Some(low) = alias {
+            self.unmap_range(low, size);
+        }
+        true
+    }
+
+    fn map_section(&mut self, section: alloc::sync::Arc<memory::SharedMemory>, offset: usize, size: u32, preferred: u32) -> Option<u32> {
+        let size = (size as u64 + PAGE - 1) & !(PAGE - 1);
+        if offset as u64 + size > section.len() as u64 {
+            return None;
+        }
+        let runner = self.runner;
+        let va = runner.find_free(if preferred != 0 { preferred as u64 } else { memory::SEPARATE_BASE as u64 }, size)?;
+        let physical = crate::paging::to_physical(section.pointer(offset) as u64);
+        if !runner.space.map_frames(va, physical, size) {
+            return None;
+        }
+        runner.reserve(va, size);
+        runner.shared.borrow_mut().insert(va, (size, None, section));
+        Some(va as u32)
+    }
+
+    fn unmap_section(&mut self, va: u32) -> bool {
+        let Some((size, _, _section)) = self.runner.shared.borrow_mut().remove(&(va as u64)) else { return false };
+        self.unmap_range(va as u64, size);
+        true
+    }
+
     fn mapped(&mut self) -> Vec<(u64, u64)> {
         self.runner.reserved.borrow().iter().map(|&(s, e)| (s, e - s)).collect()
+    }
+
+    fn add_tls(&mut self, template: &[u8]) -> Option<u32> {
+        self.runner.add_tls(template)
     }
 
     fn xmm(&mut self, index: usize) -> u64 {
@@ -860,7 +1017,7 @@ pub fn run(path: &str, command_line: &str) -> Ended {
     let image = vm.process_image();
     let main = image.main();
     let x64 = main.is64;
-    let mut runner = Runner {
+    let runner = Runner {
         space: AddressSpace::new(),
         x64,
         entries: vm.iat().entries.clone(),
@@ -877,7 +1034,9 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         waiting: RefCell::new(Vec::new()),
         next_thread: Cell::new(2),
         signal: Cell::new(None),
-        tls: Vec::new(),
+        tls: RefCell::new(Vec::new()),
+        recent: RefCell::new(alloc::collections::VecDeque::new()),
+        shared: RefCell::new(alloc::collections::BTreeMap::new()),
     };
 
     // The modules, where the loader placed them.
@@ -896,6 +1055,35 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         code.extend_from_slice(&[0xCD, 0x80, 0xC3, 0x90]);
     }
     runner.write(THUNK_BASE as u64, &code);
+    // Small C library functions the subsystem has machine code for (64-bit)
+    // run as that code, after the thunks: called millions of times, they
+    // are far faster without a system call.
+    if x64 {
+        let thunk_end = (THUNK_BASE as u64 + thunks * THUNK_STRIDE as u64 + PAGE - 1) & !(PAGE - 1);
+        let mut leaves: Vec<u8> = Vec::new();
+        let mut placed: Vec<(&'static [u8], u64)> = Vec::new();
+        let mut bound = 0;
+        for entry in runner.entries.iter().filter(|e| e.slot_va != 0) {
+            let Some(native) = runner.syscalls.native_x64(&entry.dll, &entry.name) else { continue };
+            let at = match placed.iter().find(|(code, _)| core::ptr::eq(*code, native)) {
+                Some(&(_, at)) => at,
+                None => {
+                    let at = thunk_end + leaves.len() as u64;
+                    leaves.extend_from_slice(native);
+                    leaves.resize((leaves.len() + 15) & !15, 0xCC);
+                    placed.push((native, at));
+                    at
+                }
+            };
+            runner.write(entry.slot_va as u64, &at.to_le_bytes());
+            bound += 1;
+        }
+        if !leaves.is_empty() {
+            runner.reserve(thunk_end, leaves.len() as u64);
+            runner.write(thunk_end, &leaves);
+            log!("OTW kernel: {bound} imports run as machine code");
+        }
+    }
     // Where callbacks return.
     runner.reserve(CALLBACK_RETURN, PAGE);
     runner.write(CALLBACK_RETURN, &[0xCD, 0x81]);
@@ -920,7 +1108,7 @@ pub fn run(path: &str, command_line: &str) -> Ended {
             runner.write(tib + offset, &value.to_le_bytes());
         }
     }
-    runner.tls = tls_templates(image, &runner);
+    *runner.tls.borrow_mut() = tls_templates(image, &runner);
     runner.install_tls(tib);
 
     // The entry point, returning to the thread's end.
@@ -951,6 +1139,24 @@ pub fn run(path: &str, command_line: &str) -> Ended {
     runner.running.borrow_mut().push((1, tib));
     runner.set_thread_block(tib);
     let ran = apic::now_us();
+    // The program's own DLLs initialise first: DllMain(module,
+    // DLL_PROCESS_ATTACH, 0). Win95's system DLLs' entry points are the
+    // loader's private hooks, not DllMains: skipped.
+    const SYSTEM_DLLS: &[&str] = &["kernel32.dll", "user32.dll", "gdi32.dll", "advapi32.dll", "comctl32.dll", "shell32.dll", "comdlg32.dll"];
+    let caller = UserRegs::new(x64, 0, (STACK_TOP as u64 - 0x100) & !0xF);
+    for module in image.modules.iter().skip(1) {
+        if module.image.entry_rva == 0 || SYSTEM_DLLS.iter().any(|n| module.name.eq_ignore_ascii_case(n)) {
+            continue;
+        }
+        let base = module.image.image_base as u64;
+        let result = runner.call(&caller, module.image.entry_va() as u64, &[base, 1, 0], None, None);
+        if runner.has_ended() {
+            break;
+        }
+        if result.is_some_and(|r| r as u32 == 0) {
+            log!("OTW kernel: {}'s DllMain reported failure", module.name);
+        }
+    }
     let stop = runner.execute(&mut regs);
     if let Stop::Returned(_) | Stop::Suspended | Stop::ThreadExited(_) = stop {
         runner.end(Ended::Exited(0));
@@ -966,6 +1172,9 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         runner.api_calls.get(),
         runner.next_thread.get() - 1
     );
+    if !matches!(ended, Ended::Exited(0)) {
+        log!("OTW kernel: its last calls: {}", runner.recent.borrow().iter().cloned().collect::<Vec<_>>().join(", "));
+    }
     otw_vm::win32::registry::flush();
     ended
 }

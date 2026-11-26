@@ -102,6 +102,9 @@ impl System for Kernel {
             "OTW_DRIVE_C" => Some(DRIVE_C.to_string()),
             "OTW_HOST_CLIPBOARD" => Some("0".to_string()),
             "HOME" => Some("/home".to_string()),
+            // Firefox: no crash reporter, no sandbox broker; functions OTW
+            // lacks return 0 (and are named in the log).
+            "OTW_ENV_MOZ_CRASHREPORTER_DISABLE" | "OTW_ENV_MOZ_DISABLE_CONTENT_SANDBOX" | "OTW_STUB_MISSING" => Some("1".to_string()),
             _ => None,
         }
     }

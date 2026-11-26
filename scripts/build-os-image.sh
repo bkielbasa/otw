@@ -25,6 +25,12 @@ EXTRA="$OUT/extra"
 rm -rf "$EXTRA"
 mkdir -p "$EXTRA/OTW"
 cp "$ROOT"/binaries/guests/*.EXE "$EXTRA/OTW/"
+# TrueType fonts for programs (DejaVu and Liberation, free fonts) from this
+# machine, in C:\WINDOWS\FONTS.
+mkdir -p "$EXTRA/WINDOWS/FONTS"
+for dir in /usr/share/fonts/truetype/dejavu /usr/share/fonts/truetype/liberation /usr/share/fonts/truetype/liberation2; do
+  [[ -d "$dir" ]] && cp "$dir"/*.ttf "$EXTRA/WINDOWS/FONTS/" 2>/dev/null || true
+done
 DRIVE_C="${OTW_DRIVE_C-$HOME/.otw/C}"
 if [[ -n "$DRIVE_C" && -d "$DRIVE_C" ]]; then
   partitions+=("data:OTW-C:auto:$DRIVE_C+$EXTRA")

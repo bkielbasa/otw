@@ -236,7 +236,8 @@ pub fn load_idt() {
                 // A double fault runs on its own stack (IST 1).
                 ist: if vector == 8 { 1 } else { 0 },
                 // Programs may raise the system call vectors themselves.
-                kind: if vector == SYSTEM_CALL_VECTOR || vector == CALLBACK_RETURN_VECTOR { 0xEE } else { 0x8E },
+                // So may int3 and into (breakpoints, overflow checks).
+                kind: if matches!(vector, 3 | 4) || vector == SYSTEM_CALL_VECTOR || vector == CALLBACK_RETURN_VECTOR { 0xEE } else { 0x8E },
                 offset_middle: (address >> 16) as u16,
                 offset_high: (address >> 32) as u32,
                 reserved: 0,
