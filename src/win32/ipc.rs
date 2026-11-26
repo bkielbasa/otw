@@ -149,7 +149,8 @@ fn post(ctx: &ApiContext, port: u32, bytes: u32, key: u64, overlapped: u64) {
     if let Some(queue) = shared.nt.ports.get_mut(&port) {
         queue.push_back((bytes, key, overlapped));
     }
-    sync::set_event(&mut shared.sync, port);
+    drop(shared);
+    sync::signal(ctx, port);
 }
 
 /// Finish an overlapped operation: its status and byte count, its event,
@@ -163,7 +164,7 @@ fn complete(ctx: &ApiContext, memory: &mut dyn GuestMemory, handle: u32, overlap
     let _ = memory.write_ptr(high, bytes as u64);
     let event = memory.read_ptr(event_at).unwrap_or(0) as u32;
     if event & !1 != 0 {
-        sync::set_event(&mut ctx.shared.borrow_mut().sync, event & !1);
+        sync::signal(ctx, event & !1);
     }
     // An event handle with its low bit set asks for no packet.
     if event & 1 != 0 {
@@ -645,7 +646,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             let (shared_memory, size) = section;
             let offset = (arg(2) << 32) | (arg(3) & 0xFFFF_FFFF);
             let length = if arg(4) != 0 { arg(4) } else { size.saturating_sub(offset) };
-            let preferred = if name == "MapViewOfFileEx" && p(5) != 0 { p(5) } else { 0x2000_0000 };
+            let preferred = if name == "MapViewOfFileEx" && p(5) != 0 { p(5) } else { crate::kernel::memory::SEPARATE_BASE };
             let Some(view) = memory.map_section(shared_memory, offset as usize, length as u32, preferred) else {
                 return fail(8, 0);
             };

@@ -259,6 +259,7 @@ pub fn notify() {
     let (count, condvar) = changes();
     *count.lock().unwrap_or_else(|p| p.into_inner()) += 1;
     condvar.notify_all();
+    wake_shared();
 }
 
 /// The change count now.
@@ -274,4 +275,103 @@ pub fn wait_change(since: u64, timeout: std::time::Duration) {
         return;
     }
     let _ = condvar.wait_timeout_while(guard, timeout, |now| *now == since);
+}
+
+// ── Parking: a waiting thread sleeps until something it waits for changes ──
+
+/// Kinds of things a thread waits for, in the high bits of a park key.
+pub const KEY_HANDLE: u64 = 1 << 40;
+pub const KEY_SECTION: u64 = 2 << 40;
+pub const KEY_SRW: u64 = 3 << 40;
+pub const KEY_WAKE: u64 = 4 << 40;
+pub const KEY_MESSAGES: u64 = 5 << 40;
+/// Changes of the objects processes share (pipes, processes).
+pub const KEY_SHARED: u64 = 6 << 40;
+
+#[derive(Default)]
+pub struct Parker {
+    woken: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+impl Parker {
+    fn unpark(&self) {
+        *self.woken.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.wake.notify_one();
+    }
+}
+
+type Registry = HashMap<(u32, u64), Vec<Arc<Parker>>>;
+
+fn registry() -> MutexGuard<'static, Registry> {
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+thread_local! {
+    static PARKER: Arc<Parker> = Arc::new(Parker::default());
+}
+
+/// Registered interest of this host thread in some keys of a process; it
+/// is withdrawn when dropped.
+pub struct Interest {
+    pid: u32,
+    keys: Vec<u64>,
+    parker: Arc<Parker>,
+}
+
+/// Be woken by changes to `keys` of process `pid` (register before
+/// looking at the state, so no change in between is missed).
+pub fn interest(pid: u32, keys: Vec<u64>) -> Interest {
+    let parker = PARKER.with(Arc::clone);
+    let mut registry = registry();
+    for &key in &keys {
+        registry.entry((pid, key)).or_default().push(parker.clone());
+    }
+    Interest { pid, keys, parker }
+}
+
+impl Drop for Interest {
+    fn drop(&mut self) {
+        let mut registry = registry();
+        for &key in &self.keys {
+            if let Some(parkers) = registry.get_mut(&(self.pid, key)) {
+                if let Some(index) = parkers.iter().position(|p| Arc::ptr_eq(p, &self.parker)) {
+                    parkers.swap_remove(index);
+                }
+                if parkers.is_empty() {
+                    registry.remove(&(self.pid, key));
+                }
+            }
+        }
+    }
+}
+
+/// Sleep until woken (or `timeout`); returns whether woken.
+pub fn park(timeout: std::time::Duration) -> bool {
+    PARKER.with(|parker| {
+        let woken = parker.woken.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut woken, _) = parker.wake.wait_timeout_while(woken, timeout, |w| !*w).unwrap_or_else(|p| p.into_inner());
+        std::mem::replace(&mut *woken, false)
+    })
+}
+
+/// Wake the threads waiting for `key` of process `pid`.
+pub fn wake(pid: u32, key: u64) {
+    let parkers: Vec<Arc<Parker>> = registry().get(&(pid, key)).cloned().unwrap_or_default();
+    for parker in parkers {
+        parker.unpark();
+    }
+}
+
+/// Wake the threads of every process waiting on shared objects.
+fn wake_shared() {
+    let parkers: Vec<Arc<Parker>> = registry()
+        .iter()
+        .filter(|((_, key), _)| *key == KEY_SHARED)
+        .flat_map(|(_, parkers)| parkers.iter().cloned())
+        .collect();
+    for parker in parkers {
+        parker.unpark();
+    }
 }

@@ -1274,6 +1274,7 @@ pub fn post(ctx: &ApiContext, hwnd: u32, msg: u32, wparam: u32, lparam: u32) {
         wparam,
         lparam,
     });
+    crate::win32::sync::wake_key(ctx, crate::win32::kobj::KEY_MESSAGES);
 }
 
 /// Call the hook chain of `kind` starting after `after` (0 = from the top).

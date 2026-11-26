@@ -111,7 +111,7 @@ pub fn alloc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address:
         (base, length)
     } else {
         // Large reservations go high, keeping the low space for the rest.
-        let preferred = if length >= 0x1000_0000 { 0x8000_0000 } else { 0x2000_0000 };
+        let preferred = if length >= 0x1000_0000 { 0x8000_0000 } else { crate::kernel::memory::POOL_BASE };
         match memory.map_region(preferred, length) {
             Some(base) if base % GRANULARITY == 0 => (base, length),
             Some(base) => {
@@ -286,7 +286,7 @@ pub fn reserve_high<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, a
         let low = base as u32;
         (base, (low != 0 && memory.map_exact(low, ALIAS_SIZE)).then_some(low))
     } else {
-        let alias = memory.map_region(0x2000_0000, ALIAS_SIZE);
+        let alias = memory.map_region(crate::kernel::memory::SEPARATE_BASE, ALIAS_SIZE);
         let mut shared = ctx.shared.borrow_mut();
         let slot = shared.vmem.next_slot.max(1);
         shared.vmem.next_slot = slot + (size >> 32) + 2;

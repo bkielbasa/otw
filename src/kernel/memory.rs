@@ -16,6 +16,13 @@ pub const NTDLL_HANDLE: u32 = 0xFFF0_0000;
 /// The size of NTDLL's image.
 pub const NTDLL_SIZE: u32 = 0x1_0000;
 
+/// Where a 64-bit process's memory backed by memory of its own (views of
+/// sections) goes: below its pool, so its CPUs keep the pool whole.
+pub const SEPARATE_BASE: u32 = 0x2000_0000;
+/// The start of a 64-bit process's memory pool, which runs up to NTDLL
+/// (the upper half stays free for large reservations: a JIT's 2 GiB).
+pub const POOL_BASE: u32 = 0x4000_0000;
+
 /// More heap for 64-bit processes, whose programs allocate far more.
 pub const HEAP64_EXTRA_BASE: u32 = 0x4000_0000;
 pub const HEAP64_EXTRA_SIZE: u32 = 0x1000_0000;
@@ -35,13 +42,22 @@ unsafe impl Send for SharedMemory {}
 unsafe impl Sync for SharedMemory {}
 
 impl SharedMemory {
-    /// `size` zeroed bytes, rounded up to whole pages.
+    /// `size` zeroed bytes, rounded up to whole pages (reserved from the
+    /// host lazily: untouched pages cost nothing).
     pub fn new(size: usize) -> Option<std::sync::Arc<Self>> {
         let size = (size.max(1) + 0xFFF) & !0xFFF;
-        let layout = std::alloc::Layout::from_size_align(size, 0x1000).ok()?;
-        // SAFETY: the layout has a non-zero size.
-        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
-        (!pointer.is_null()).then(|| std::sync::Arc::new(Self { pointer, size }))
+        // SAFETY: an anonymous private mapping, owned by this value.
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        (pointer != libc::MAP_FAILED).then(|| std::sync::Arc::new(Self { pointer: pointer as *mut u8, size }))
     }
 
     pub fn len(&self) -> usize {
@@ -65,14 +81,31 @@ impl SharedMemory {
         // SAFETY: the range is inside the allocation.
         unsafe { std::slice::from_raw_parts(self.pointer.add(start), end - start).to_vec() }
     }
+
+    /// Zero `len` bytes from `offset` (whole pages are given back to the
+    /// host, which hands out zero pages again).
+    pub fn zero(&self, offset: usize, len: usize) {
+        let end = (offset + len).min(self.size);
+        let start = offset.min(end);
+        let page_start = (start + 0xFFF) & !0xFFF;
+        let page_end = end & !0xFFF;
+        // SAFETY: inside the allocation.
+        unsafe {
+            if page_end > page_start {
+                std::ptr::write_bytes(self.pointer.add(start), 0, page_start - start);
+                libc::madvise(self.pointer.add(page_start) as *mut libc::c_void, page_end - page_start, libc::MADV_DONTNEED);
+                std::ptr::write_bytes(self.pointer.add(page_end), 0, end - page_end);
+            } else {
+                std::ptr::write_bytes(self.pointer.add(start), 0, end - start);
+            }
+        }
+    }
 }
 
 impl Drop for SharedMemory {
     fn drop(&mut self) {
-        if let Ok(layout) = std::alloc::Layout::from_size_align(self.size, 0x1000) {
-            // SAFETY: allocated in `new` with this layout.
-            unsafe { std::alloc::dealloc(self.pointer, layout) };
-        }
+        // SAFETY: mapped in `new` with this size.
+        unsafe { libc::munmap(self.pointer as *mut libc::c_void, self.size) };
     }
 }
 

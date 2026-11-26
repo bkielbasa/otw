@@ -340,7 +340,7 @@ fn file_view(ctx: &ApiContext, memory: &mut dyn GuestMemory, db: &FontDb, file: 
         return va;
     }
     let data = db.file_data(file);
-    let va = memory.map_region(0x2000_0000, (data.len() as u32).max(1)).unwrap_or(0);
+    let va = memory.map_region(crate::kernel::memory::POOL_BASE, (data.len() as u32).max(1)).unwrap_or(0);
     if va != 0 {
         let _ = memory.write_bytes(va, &data);
     }

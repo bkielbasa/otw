@@ -356,7 +356,7 @@ pub fn srw_release(ctx: &ApiContext, lock: u32, exclusive: bool) {
             }
         }
     }
-    crate::win32::kobj::notify();
+    wake_key(ctx, crate::win32::kobj::KEY_SRW | lock as u64);
 }
 
 /// WakeConditionVariable / WakeByAddressSingle (`all` false) and the
@@ -372,7 +372,7 @@ pub fn wake(ctx: &ApiContext, key: u32, all: bool) {
             wakes.single = wakes.single.saturating_add(1).min(64);
         }
     }
-    crate::win32::kobj::notify();
+    wake_key(ctx, crate::win32::kobj::KEY_WAKE | key as u64);
 }
 
 /// Sleep on a condition variable (or address) until woken or the timeout
@@ -500,7 +500,23 @@ pub fn thread_exited(ctx: &ApiContext, thread: u32, code: u32) {
             }
         }
     }
-    crate::win32::kobj::notify();
+    let handles: Vec<u32> = ctx
+        .shared
+        .borrow()
+        .sync
+        .objects
+        .iter()
+        .filter(|(_, o)| match o {
+            Object::Thread { id, .. } => *id == thread,
+            // Mutexes it held are abandoned.
+            Object::Mutex { .. } => true,
+            _ => false,
+        })
+        .map(|(&h, _)| h)
+        .collect();
+    for handle in handles {
+        wake_handle(ctx, handle);
+    }
 }
 
 /// Whether a thread was created suspended and is not yet resumed.
@@ -551,6 +567,23 @@ pub fn preempt(ctx: &ApiContext, memory: &mut dyn GuestMemory) -> bool {
     shared.sync.preempting = false;
     shared.sync.slice_start = Some(std::time::Instant::now());
     false
+}
+
+/// Wake the threads of this process waiting for `key` (kobj::KEY_*).
+pub fn wake_key(ctx: &ApiContext, key: u64) {
+    let pid = ctx.shared.borrow().pid;
+    crate::win32::kobj::wake(pid, key);
+}
+
+/// Wake the threads waiting on a handle.
+pub fn wake_handle(ctx: &ApiContext, handle: u32) {
+    wake_key(ctx, crate::win32::kobj::KEY_HANDLE | handle as u64);
+}
+
+/// Signal an event and wake its waiters.
+pub fn signal(ctx: &ApiContext, handle: u32) {
+    set_event(&mut ctx.shared.borrow_mut().sync, handle);
+    wake_handle(ctx, handle);
 }
 
 /// Signal an event (another part of the subsystem finished something a
@@ -759,7 +792,33 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
     };
     let began = std::time::Instant::now();
     let mut reported = false;
+    // What wakes this wait (registered before each look at the state).
+    let keys = {
+        use crate::win32::kobj::*;
+        let mut keys: Vec<u64> = wait.handles.iter().map(|&h| KEY_HANDLE | h as u64).collect();
+        if wait.section != 0 {
+            keys.push(KEY_SECTION | wait.section as u64);
+        }
+        if wait.srw != 0 {
+            keys.push(KEY_SRW | wait.srw as u64);
+        }
+        if wait.wake_key != 0 {
+            keys.push(KEY_WAKE | wait.wake_key as u64);
+        }
+        if wait.messages {
+            keys.push(KEY_MESSAGES);
+        }
+        // Data from another process (pipes), or another process's end.
+        let shared_objects = crate::win32::ipc::has_pending(ctx)
+            || wait.handles.iter().any(|h| matches!(ctx.shared.borrow().sync.objects.get(h), Some(crate::win32::sync::Object::Process { .. })));
+        if shared_objects {
+            keys.push(KEY_SHARED);
+        }
+        keys
+    };
+    let pid = ctx.shared.borrow().pid;
     loop {
+        let _interest = crate::win32::kobj::interest(pid, keys.clone());
         if !reported && began.elapsed().as_secs() >= 20 && std::env::var_os("OTW_TRACE_WAITS").is_some() {
             reported = true;
             let pid = ctx.shared.borrow().pid;
@@ -776,7 +835,6 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             }
         }
         let generation = crate::win32::kobj::generation();
-        memory.sync_memory();
         refresh_processes(ctx);
         crate::win32::ipc::poll(ctx, memory);
         let me = ctx.shared.borrow().pid;
@@ -854,9 +912,18 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         if wait.messages {
             memory.pump(true);
         } else {
-            let remaining = wait.deadline.map(|d| d.saturating_sub(now)).unwrap_or(10);
+            // With threads on other CPUs, the changes that end waits are
+            // announced (kobj::notify): wait longer between looks.
+            let cap = if memory.others_running() { 50 } else { 10 };
+            let remaining = wait.deadline.map(|d| d.saturating_sub(now)).unwrap_or(cap).min(cap);
             // Until another process changes something, or a while.
-            crate::kernel::lock::unlocked(|| crate::win32::kobj::wait_change(generation, std::time::Duration::from_millis(remaining.clamp(1, 10))));
+            let _ = generation;
+            crate::kernel::lock::unlocked(|| {
+                // Keep up with other threads' memory changes meanwhile.
+                memory.sync_memory();
+                crate::win32::kobj::park(std::time::Duration::from_millis(remaining.max(1)))
+            });
+            memory.sync_memory();
         }
     }
 }
@@ -909,6 +976,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                 Some(Object::Event { signaled, .. }) => {
                     *signaled = name == "SetEvent";
                     drop(shared);
+                    if name != "ResetEvent" {
+                        wake_handle(ctx, args[0]);
+                    }
                     if name == "PulseEvent" {
                         // Releases the threads already waiting: let them run.
                         if let Some(Object::Event { signaled, .. }) = ctx.shared.borrow_mut().sync.objects.get_mut(&args[0]) {
@@ -931,6 +1001,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                     *count = count.saturating_sub(1);
                     if *count == 0 {
                         *owner = 0;
+                        drop(shared);
+                        wake_handle(ctx, args[0]);
                     }
                     ok(1)
                 }
@@ -958,6 +1030,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                     _ => 0,
                 }
             };
+            wake_handle(ctx, args[0]);
             if args[2] != 0 {
                 let _ = memory.write_u32(args[2], previous);
             }
@@ -1222,6 +1295,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                 let _ = memory.write_u32(section + 8, recursion);
                 if recursion == 0 {
                     let _ = memory.write_u32(section + 12, 0);
+                    if memory.others_running() {
+                        wake_key(ctx, crate::win32::kobj::KEY_SECTION | section as u64);
+                    }
                 }
             }
             ok(0)

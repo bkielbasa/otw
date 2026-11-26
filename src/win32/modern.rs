@@ -187,7 +187,6 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             let _ = memory.write_ptr(args[0], 1);
             let result = memory.call_guest(args[1], &[args[0], args[2], args[3]]).unwrap_or(0);
             let _ = memory.write_ptr(args[0], if result != 0 { 2 } else { 0 });
-            crate::win32::kobj::notify();
             ok(result)
         }
         // Thread-pool work runs at once on the submitting thread.

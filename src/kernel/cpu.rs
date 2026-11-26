@@ -32,6 +32,9 @@ use super::{
 pub const STACK_BASE: u32 = 0x0010_0000;
 pub const STACK_SIZE: u32 = 0x0010_0000;
 pub const STACK_TOP: u32 = STACK_BASE + STACK_SIZE - 0x100;
+/// The range of a 64-bit process's memory pool (see `AddressSpace`).
+const POOL_START: u64 = memory::POOL_BASE as u64;
+const POOL_END: u64 = memory::NTDLL_HANDLE as u64;
 /// The bottom of a 64-bit program's first stack.
 const X64_STACK_LOW: u32 = 0x0001_0000;
 
@@ -841,17 +844,32 @@ impl UnicornGuestMemory<'_, '_, '_, '_> {
                 && start + size <= limit
                 && regions.iter().all(|&(begin, end)| start + size <= begin || start > end)
         };
-        let mut start = (preferred as u64) & !(PAGE_SIZE as u64 - 1);
-        if !free(start) {
-            start = ((preferred as u64).max(0x1000_0000) + GRANULE - 1) & !(GRANULE - 1);
-            while start + size <= limit && !free(start) {
+        let start = (preferred as u64) & !(PAGE_SIZE as u64 - 1);
+        if free(start) {
+            return Some(start);
+        }
+        let scan = |from: u64, to: u64| {
+            let mut start = (from + GRANULE - 1) & !(GRANULE - 1);
+            while start + size <= to && !free(start) {
                 start += GRANULE;
             }
-            if !free(start) {
-                return None;
+            (start + size <= to && free(start)).then_some(start)
+        };
+        let pooled = run.borrow().process.space.in_pool(POOL_START, 1);
+        if !pooled {
+            return scan((preferred as u64).max(0x1000_0000), limit);
+        }
+        // A 64-bit process: memory from elsewhere in its window below the
+        // pool, the rest in the pool (then anywhere).
+        let separate = (memory::SEPARATE_BASE as u64..POOL_START).contains(&(preferred as u64));
+        if separate {
+            if let Some(start) = scan(preferred as u64, POOL_START) {
+                return Some(start);
             }
         }
-        Some(start)
+        scan((preferred as u64).max(POOL_START), limit)
+            .or_else(|| scan(POOL_START, limit))
+            .or_else(|| scan(0x1000_0000, limit))
     }
 
     /// Run guest code synchronously: arguments as the process's calling
@@ -1093,8 +1111,9 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         if !space.map_memory(self.uc, &mut cursor, va, size, memory.clone(), 0) {
             return false;
         }
-        // The low alias replaces the reserved low range with the same bytes.
-        let alias = alias.filter(|&low| {
+        // The low alias replaces the reserved low range with the same bytes
+        // (not inside the pool, which every CPU keeps whole).
+        let alias = alias.filter(|&low| !space.in_pool(low as u64, size)).filter(|&low| {
             space.unmap(self.uc, &mut cursor, low as u64, size);
             space.map_memory(self.uc, &mut cursor, low as u64, size, memory.clone(), 0)
         });
@@ -1472,7 +1491,9 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             pump(block);
             run.borrow_mut().pump = Some(pump);
         } else if block {
-            memory::idle_wait(std::time::Duration::from_millis(10));
+            // A thread on a CPU of its own is woken by notified changes.
+            let worker = run.borrow().worker;
+            memory::idle_wait(std::time::Duration::from_millis(if worker { 50 } else { 10 }));
         }
     }
 
@@ -1876,6 +1897,10 @@ impl HookEntry {
     fn new(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>, lock: &Arc<BigLock>) -> Self {
         let flags = state.borrow().flags.clone();
         flags.in_guest.store(false, Ordering::SeqCst);
+        // Applying the changes needs only the address space, not the lock
+        // (an unmap made while this CPU waits for the lock is applied
+        // before it touches memory: unmaps are made under the lock).
+        sync_space(uc, state);
         let hold = super::lock::Hold::new(lock);
         sync_space(uc, state);
         Self { _hold: hold, flags }
@@ -1926,11 +1951,17 @@ fn spawn_worker(run: &Rc<RefCell<RunState<'_>>>, id: u32, entry: u32, param: u32
 
 /// The life of a thread on a CPU of its own.
 fn run_worker(process: Arc<ProcessShared>, recipe: Rc<Recipe>, [id, entry, param, rsp, teb, dispatcher, thread_return]: [u32; 7]) {
+    // The CPU is made without the lock (it needs only the address space).
+    let made = Unicorn::new(Arch::X86, Mode::MODE_64)
+        .map_err(|error| RunError::Unicorn("creating a CPU", error))
+        .and_then(|mut uc| hide_sse42(&mut uc).map(|()| uc).map_err(|error| RunError::Unicorn("hooking CPUID", error)))
+        .map(|mut uc| {
+            let cursor = process.space.attach(&mut uc);
+            (uc, cursor)
+        });
     let hold = super::lock::Hold::new(&process.lock);
     let outcome = (|| -> Result<(), RunError> {
-        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_64).map_err(|error| RunError::Unicorn("creating a CPU", error))?;
-        hide_sse42(&mut uc).map_err(|error| RunError::Unicorn("hooking CPUID", error))?;
-        let cursor = process.space.attach(&mut uc);
+        let (mut uc, cursor) = made?;
         let state = Rc::new(RefCell::new(RunState::new(process.clone())));
         process.space.register(cursor, uc.get_handle() as usize, state.borrow().flags.clone());
         {
@@ -2584,6 +2615,11 @@ fn build<'a>(
         process_shared.space.register(cursor, uc.get_handle() as usize, state.borrow().flags.clone());
         state.borrow_mut().cursor = Some(cursor);
         state.borrow_mut().x64 = x64;
+        if x64 {
+            // A 64-bit process's memory below 4 GiB is one range of host
+            // memory every CPU maps once (allocating is then bookkeeping).
+            process_shared.space.set_pool(&mut uc, POOL_START, POOL_END);
+        }
     }
 
     for module in &process.modules {

@@ -1346,6 +1346,6 @@ fn finish_overlapped<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
     let _ = memory.write_ptr(overlapped + size, bytes as u64);
     let event = memory.read_ptr(overlapped + 2 * size + 8).unwrap_or(0) as u32;
     if event & !1 != 0 {
-        crate::win32::sync::set_event(&mut ctx.shared.borrow_mut().sync, event & !1);
+        crate::win32::sync::signal(ctx, event & !1);
     }
 }

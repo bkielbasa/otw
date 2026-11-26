@@ -256,7 +256,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             // 64-bit programs map big files (Firefox its 50 MB archives):
             // their views get address space of their own.
             let x64 = ctx.shared.borrow().x64;
-            let view = if x64 { memory.map_region(0x2000_0000, length.max(1)) } else { ctx.shared.borrow_mut().heap.alloc(length.max(1)) };
+            let view = if x64 { memory.map_region(crate::kernel::memory::POOL_BASE, length.max(1)) } else { ctx.shared.borrow_mut().heap.alloc(length.max(1)) };
             let Some(view) = view else {
                 return ok(0);
             };

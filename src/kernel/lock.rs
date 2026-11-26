@@ -21,6 +21,8 @@ use std::{
 struct Owner {
     thread: Option<ThreadId>,
     depth: usize,
+    /// When the owner took it (OTW_TRACE_LOCK).
+    since: Option<std::time::Instant>,
     /// The owner's name (OTW_TRACE_LOCK).
     name: String,
 }
@@ -31,7 +33,17 @@ pub struct BigLock {
     free: Condvar,
 }
 
+fn trace_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OTW_TRACE_LOCK").is_some())
+}
+
 thread_local! {
+    /// Time holding the lock: total, longest since the last report, last
+    /// report.
+    static HELD: RefCell<(std::time::Duration, std::time::Duration, std::time::Instant)> = RefCell::new((std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Instant::now()));
+    /// Contended acquisitions: count, total wait, last report.
+    static WAITED: RefCell<(u64, std::time::Duration, std::time::Instant)> = RefCell::new((0, std::time::Duration::ZERO, std::time::Instant::now()));
     /// The processes this host thread is in the system for (entered with
     /// a `Hold`), innermost last: the one whose waits give up its lock.
     static ACTIVE: RefCell<Vec<Arc<BigLock>>> = const { RefCell::new(Vec::new()) };
@@ -60,12 +72,39 @@ impl BigLock {
     /// Take the lock (again, if this host thread holds it).
     pub fn acquire(self: &Arc<Self>) {
         let me = std::thread::current().id();
+        // Briefly spin before sleeping: the lock is held for short spells
+        // (a system call), and waking a sleeper costs more.
+        for _ in 0..200 {
+            let owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+            if owner.thread.is_none() || owner.thread == Some(me) {
+                break;
+            }
+            drop(owner);
+            std::hint::spin_loop();
+        }
         let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
-        while owner.thread.is_some_and(|t| t != me) {
-            owner = self.free.wait(owner).unwrap_or_else(|p| p.into_inner());
+        if owner.thread.is_some_and(|t| t != me) {
+            let started = std::time::Instant::now();
+            while owner.thread.is_some_and(|t| t != me) {
+                owner = self.free.wait(owner).unwrap_or_else(|p| p.into_inner());
+            }
+            if trace_lock() {
+                WAITED.with(|w| {
+                    let mut w = w.borrow_mut();
+                    w.0 += 1;
+                    w.1 += started.elapsed();
+                    if w.2.elapsed() >= std::time::Duration::from_secs(10) {
+                        eprintln!("[lock] {}: waited {} times, {:.2?} in all", std::thread::current().name().unwrap_or("?"), w.0, w.1);
+                        w.2 = std::time::Instant::now();
+                    }
+                });
+            }
         }
         if owner.thread.is_none() && std::env::var_os("OTW_TRACE_LOCK").is_some() {
             owner.name = std::thread::current().name().unwrap_or("?").to_string();
+        }
+        if owner.thread.is_none() && trace_lock() {
+            owner.since = Some(std::time::Instant::now());
         }
         owner.thread = Some(me);
         owner.depth += 1;
@@ -80,6 +119,19 @@ impl BigLock {
         owner.depth -= 1;
         if owner.depth == 0 {
             owner.thread = None;
+            if let Some(since) = owner.since.take() {
+                let held = since.elapsed();
+                HELD.with(|h| {
+                    let mut h = h.borrow_mut();
+                    h.0 += held;
+                    h.1 = h.1.max(held);
+                    if h.2.elapsed() >= std::time::Duration::from_secs(10) {
+                        eprintln!("[lock] {}: held {:.2?} in all, longest {:.2?}", std::thread::current().name().unwrap_or("?"), h.0, h.1);
+                        h.2 = std::time::Instant::now();
+                        h.1 = std::time::Duration::ZERO;
+                    }
+                });
+            }
             self.free.notify_one();
         }
     }

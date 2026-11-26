@@ -68,7 +68,7 @@ pub fn native_address<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M,
     }
     let (page, used) = match ctx.shared.borrow().ucrt.native_page {
         Some(page) => page,
-        None => (memory.map_region(0x2000_0000, 0x1000)?, 0),
+        None => (memory.map_region(crate::kernel::memory::POOL_BASE, 0x1000)?, 0),
     };
     if used as usize + code.len() > 0x1000 {
         return None;
