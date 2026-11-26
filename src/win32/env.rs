@@ -98,3 +98,16 @@ pub fn expand(ctx: &ApiContext, text: &str) -> String {
     out.push_str(rest);
     out
 }
+
+/// Replace the whole environment (a child given one by its parent).
+pub fn set_all(state: &mut State, block: &[String]) {
+    let vars = block
+        .iter()
+        .filter_map(|entry| {
+            // Entries such as `=C:=C:\` start with the separator.
+            let split = entry.char_indices().skip(1).find(|&(_, c)| c == '=').map(|(i, _)| i)?;
+            Some((entry[..split].to_string(), entry[split + 1..].to_string()))
+        })
+        .collect();
+    state.vars = Some(vars);
+}

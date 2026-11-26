@@ -162,6 +162,8 @@ struct RunState<'a> {
     /// Memory mapped with `map_shared`: its bytes, size and low alias, by
     /// address.
     shared_buffers: std::collections::HashMap<u64, (Box<[u8]>, Option<u32>)>,
+    /// Views of sections, by address: the section's memory and the size.
+    section_views: std::collections::HashMap<u32, (std::sync::Arc<memory::SharedMemory>, u64)>,
 }
 
 /// A thread off the CPU.
@@ -910,6 +912,37 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             let _ = self.uc.mem_unmap(low as u64, size);
         }
         drop(buffer);
+        true
+    }
+
+    fn map_section(&mut self, section: std::sync::Arc<memory::SharedMemory>, offset: usize, size: u32, preferred: u32) -> Option<u32> {
+        let run = self.run?;
+        let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
+        if offset as u64 + size > section.len() as u64 {
+            return None;
+        }
+        // Find room, then put the section's bytes there.
+        let va = self.map_region(preferred, size as u32)?;
+        let _ = self.uc.mem_unmap(va as u64, size);
+        let pointer = section.pointer(offset) as *mut std::ffi::c_void;
+        // SAFETY: the run state keeps the section alive until the view is
+        // unmapped.
+        if unsafe { self.uc.mem_map_ptr(va as u64, size, Prot::ALL, pointer) }.is_err() {
+            return None;
+        }
+        run.borrow_mut().section_views.insert(va, (section, size));
+        Some(va)
+    }
+
+    fn unmap_section(&mut self, va: u32) -> bool {
+        let Some(run) = self.run else {
+            return false;
+        };
+        let Some((section, size)) = run.borrow_mut().section_views.remove(&va) else {
+            return false;
+        };
+        let _ = self.uc.mem_unmap(va as u64, size);
+        drop(section);
         true
     }
 
@@ -1789,6 +1822,12 @@ fn build<'a>(
     let thunk_state = state.clone();
     let thunk_iat = iat.clone();
     let thunk_calls = syscalls;
+    // OTW_TRACE_API=1 traces every call; a comma-separated list of names
+    // traces only those functions.
+    let trace_filter: Option<Vec<String>> = std::env::var("OTW_TRACE_API")
+        .ok()
+        .filter(|v| v != "1")
+        .map(|v| v.split(',').map(|n| n.trim().to_string()).collect());
     let trace_api = std::env::var_os("OTW_TRACE_API").is_some();
     let trace_results = std::env::var_os("OTW_TRACE_RESULTS").is_some();
     let trace_code = std::env::var_os("OTW_TRACE_CODE").is_some();
@@ -1981,7 +2020,13 @@ fn build<'a>(
             }
             let args: Vec<u32> = wide_args.iter().map(|&value| value as u32).collect();
 
-            if trace_api {
+            let traced = trace_api
+                && trace_filter.as_ref().is_none_or(|names| {
+                    let described = thunk_calls.describe(&entry.dll, &entry.name);
+                    let name = described.rsplit('!').next().unwrap_or("");
+                    names.iter().any(|n| name == n)
+                });
+            if traced {
                 let thread = thunk_state.borrow().running.last().copied().unwrap_or(1);
                 eprintln!(
                     "api {} esp={esp:#010x} ret={return_address:#010x} args={:08x?} t={thread}",
@@ -2097,7 +2142,7 @@ fn build<'a>(
                 );
                 return;
             };
-            if trace_results {
+            if trace_results && (traced || !trace_api) {
                 eprintln!(
                     "ret {} = {:#x} (ebx={:x} esi={:x} edi={:x} ebp={:x})",
                     thunk_calls.describe(&entry.dll, &entry.name),

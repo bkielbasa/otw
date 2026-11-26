@@ -408,6 +408,95 @@ impl Launcher for NestedLauncher {
     }
 
     fn exit_code(&self, pid: u32) -> Option<u32> {
-        self.exits.borrow().get(&pid).copied()
+        self.exits.borrow().get(&pid).copied().or_else(|| win32::kobj::exit_code(pid))
     }
+
+    fn start_with(&self, parent: &ApiContext, path: &[u8], command_line: &[u8], directory: &[u8], options: win32::LaunchOptions) -> Result<u32, String> {
+        // 64-bit programs a 64-bit program starts run alongside it (the
+        // content processes of a browser talk to theirs while both run);
+        // others run to the end inside the call.
+        let child64 = win32::crt::host_path(path)
+            .and_then(|host| fs::read(host).ok())
+            .and_then(|bytes| PeImage::parse(bytes).ok())
+            .is_some_and(|image| image.is64);
+        if !(child64 && parent.shared.borrow().x64) {
+            return self.start(parent, path, command_line, directory);
+        }
+        start_alongside(parent, path, command_line, directory, options)
+    }
+}
+
+/// Start a program on a host thread of its own, to run alongside the
+/// others: it shares only the kernel objects in [`win32::kobj`] with them
+/// (and the drive). Returns its process ID.
+fn start_alongside(parent: &ApiContext, path: &[u8], command_line: &[u8], directory: &[u8], options: win32::LaunchOptions) -> Result<u32, String> {
+    let parent_pid = parent.shared.borrow().pid;
+    let pid = win32::kobj::with(|k| {
+        let pid = k.new_pid(parent_pid, options.suspended);
+        if options.inherit {
+            let handles = options.handles.clone().unwrap_or_else(|| k.inheritable(parent_pid));
+            for handle in handles {
+                // Inherited handles keep their numbers.
+                if k.owns(parent_pid, handle) {
+                    k.duplicate(parent_pid, handle, pid, Some(handle));
+                }
+            }
+        }
+        pid
+    });
+    let screen = parent.shared.borrow().gui.screen;
+    let environment = options.environment.clone();
+    let (path, command_line, directory) = (path.to_vec(), command_line.to_vec(), directory.to_vec());
+    let name = String::from_utf8_lossy(path.rsplit(|&b| b == b'\\').next().unwrap_or(&path)).into_owned();
+    if std::env::var_os("OTW_TRACE_THREADS").is_some() {
+        eprintln!("[process] {name} starts as process {pid:#x} alongside {parent_pid:#x}: {}", String::from_utf8_lossy(&command_line));
+    }
+    std::thread::Builder::new()
+        .name(format!("{name} {pid:#x}"))
+        .stack_size(256 << 20)
+        .spawn(move || {
+            win32::registry::set_read_only();
+            let shared = Rc::new(RefCell::new(SharedState::default()));
+            {
+                let mut state = shared.borrow_mut();
+                state.pid = pid;
+                state.gui.screen = screen;
+                if let Some(block) = &environment {
+                    win32::env::set_all(&mut state.env, block);
+                }
+            }
+            NestedLauncher::new(None, None).install(&shared);
+            let code = match Vm::from_drive(&path, &command_line, shared.clone()) {
+                Ok(vm) => {
+                    if !directory.is_empty() {
+                        shared.borrow_mut().current_dir = directory.clone();
+                    }
+                    while win32::kobj::with(|k| k.processes.get(&pid).is_some_and(|p| p.suspended && p.exit.is_none())) {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    match vm.run() {
+                        Ok(result) => result.exit_code,
+                        Err(error) => {
+                            eprintln!("[process] {name} (process {pid:#x}) failed: {error}");
+                            0xC000_0005
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[process] {name} (process {pid:#x}) did not load: {error}");
+                    0xC000_0135
+                }
+            };
+            if std::env::var_os("OTW_TRACE_THREADS").is_some() {
+                eprintln!("[process] {name} (process {pid:#x}) exited with {code:#x}");
+            }
+            win32::kobj::with(|k| {
+                if let Some(process) = k.processes.get_mut(&pid) {
+                    process.exit.get_or_insert(code);
+                }
+                k.close_all(pid);
+            });
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(pid)
 }

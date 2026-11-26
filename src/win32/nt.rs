@@ -22,7 +22,7 @@ const STATUS_INVALID_INFO_CLASS: u64 = 0xC000_0003;
 #[derive(Debug, Default)]
 pub struct State {
     /// Completion ports: queued (bytes, key, overlapped) packets.
-    ports: HashMap<u32, VecDeque<(u32, u64, u64)>>,
+    pub ports: HashMap<u32, VecDeque<(u32, u64, u64)>>,
     /// Vectored exception handlers, first to call first.
     pub vectored: Vec<(u32, u64)>,
     next_vectored: u32,
@@ -354,7 +354,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         "SetThreadAffinityMask" => ok(1),
         "SetThreadInformation" | "SetProcessMitigationPolicy" | "HeapSetInformation" | "SetDefaultDllDirectories"
         | "SetHandleInformation" | "SetFileInformationByHandle" | "SetInformationJobObject" | "TerminateJobObject"
-        | "AssignProcessToJobObject" | "UpdateProcThreadAttribute"
+        | "AssignProcessToJobObject"
         | "UnregisterWaitEx" | "EnumSystemLocalesEx" => ok(1),
         "GetProcessMitigationPolicy" | "QueryInformationJobObject" | "GetLogicalProcessorInformationEx"
         | "GetThreadContext" | "SetThreadContext" | "CreateHardLinkW" | "CreateSymbolicLinkW" | "AttachConsole"
@@ -388,6 +388,19 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 return ok(0);
             }
             let _ = memory.write_bytes(p(0), &vec![0u8; needed as usize]);
+            ok(1)
+        }
+        "UpdateProcThreadAttribute" => {
+            // (list, flags, attribute, value, size, ...): kept as a count
+            // and (attribute, value, size) entries after the list's
+            // first 8 bytes, for CreateProcess to read.
+            let entries = memory.read_u32(p(0) + 4).unwrap_or(0);
+            let entry = p(0) + 8 + entries * 24;
+            let _ = memory.write_u64(entry, arg(2));
+            let _ = memory.write_u64(entry + 8, arg(3));
+            let _ = memory.write_u64(entry + 16, arg(4));
+            let _ = memory.write_u32(p(0), 0x4C57_544F);
+            let _ = memory.write_u32(p(0) + 4, entries + 1);
             ok(1)
         }
         "DeleteProcThreadAttributeList" => ok(0),

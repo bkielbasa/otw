@@ -34,6 +34,8 @@ pub mod gfx;
 pub mod icon;
 pub mod inf;
 pub mod kernel32;
+pub mod kobj;
+pub mod ipc;
 pub mod menu;
 pub mod misc;
 pub mod module;
@@ -81,8 +83,27 @@ pub trait Launcher {
     /// Start `path` (on drive C:) with `command_line` in `directory`.
     /// Returns its process ID.
     fn start(&self, parent: &ApiContext, path: &[u8], command_line: &[u8], directory: &[u8]) -> Result<u32, String>;
+    /// Start a program as `start` does, with what else `CreateProcess`
+    /// asked for.
+    fn start_with(&self, parent: &ApiContext, path: &[u8], command_line: &[u8], directory: &[u8], options: LaunchOptions) -> Result<u32, String> {
+        let _ = options;
+        self.start(parent, path, command_line, directory)
+    }
     /// The exit code of a started program, once it has ended.
     fn exit_code(&self, pid: u32) -> Option<u32>;
+}
+
+/// What else `CreateProcess` asks for.
+#[derive(Clone, Debug, Default)]
+pub struct LaunchOptions {
+    /// Its environment (`name=value` strings), instead of the defaults.
+    pub environment: Option<Vec<String>>,
+    /// The handles it inherits: `None` for all inheritable ones (when it
+    /// inherits at all, see `inherit`).
+    pub handles: Option<Vec<u32>>,
+    pub inherit: bool,
+    /// Created suspended (its main thread waits for `ResumeThread`).
+    pub suspended: bool,
 }
 
 /// A program's [`Launcher`], if it may start others.
@@ -791,6 +812,11 @@ pub struct SharedState {
     pub sync: sync::SyncState,
     /// Starts programs for CreateProcess.
     pub launcher: LauncherSlot,
+    /// The process id (1 for the first program; processes started to run
+    /// alongside it get their own).
+    pub pid: u32,
+    /// Pipes, sections and completion ports of this process.
+    pub ipc: ipc::State,
     /// The program asked Windows to restart (ExitWindowsEx).
     pub restart_requested: bool,
     /// The current directory (a guest path such as `C:\\WINDOWS`).
@@ -845,6 +871,8 @@ impl Default for SharedState {
             categories: catmgr::CatState::default(),
             sync: sync::SyncState::default(),
             launcher: LauncherSlot::default(),
+            pid: 1,
+            ipc: ipc::State::default(),
             restart_requested: false,
             image_lists: HashMap::new(),
             cursor_count: 0,
@@ -1430,7 +1458,7 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
 /// Whether an API has an implementation, without calling it.
 pub fn has_implementation(dll: &str, name: &ImportName) -> bool {
     arg_count(dll, name).is_some()
-        || name.as_str().is_some_and(|text| nt::arg_count(text).is_some() || x64::x64_only(text).is_some())
+        || name.as_str().is_some_and(|text| nt::arg_count(text).is_some() || ipc::arg_count(text).is_some() || x64::x64_only(text).is_some())
 }
 
 /// DLLs that must keep Rust handlers even when a genuine copy is next to the

@@ -3586,6 +3586,21 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 0,
                 info.height.unsigned_abs() as usize,
             );
+            if let Some(dir) = std::env::var_os("OTW_DUMP_DIBS") {
+                // Debugging: each picture drawn, as a PPM file.
+                static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[gdi] {name} #{n}: dest ({x},{y} {w}x{h}) src ({sx},{sy} {sw}x{sh}) dib {}x{} {}bpp", info.width, info.height, info.bpp);
+                let (width, height) = (info.width.abs(), info.height.abs());
+                let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+                for row in 0..height {
+                    for column in 0..width {
+                        let c = source.get(column, row).unwrap_or_default();
+                        ppm.extend_from_slice(&[(c >> 16) as u8, (c >> 8) as u8, c as u8]);
+                    }
+                }
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("dib{n:04}.ppm")), ppm);
+            }
             // DIB source coordinates are bottom-up for positive heights.
             let sy = if info.height > 0 && name == "StretchDIBits" {
                 info.height - sy - sh

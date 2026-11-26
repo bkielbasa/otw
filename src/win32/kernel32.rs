@@ -461,7 +461,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "GetCurrentProcess" => ok(0xFFFF_FFFF),
         "GetCurrentThread" => ok(0xFFFF_FFFE),
-        "GetCurrentProcessId" => ok(1),
+        "GetCurrentProcessId" => ok(ctx.shared.borrow().pid),
         "GetACP" => ok(1252),
         "GetOEMCP" => ok(437),
         "GetProcessHeap" => ok(0x0050_0001),

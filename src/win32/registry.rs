@@ -116,6 +116,14 @@ struct Registry {
 
 thread_local! {
     static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
+    /// The registry file is left to another process (this host thread runs
+    /// one started alongside its parent, which owns the file).
+    static READ_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keep this host thread's changes to the registry in memory.
+pub fn set_read_only() {
+    READ_ONLY.with(|r| r.set(true));
 }
 
 fn split(path: &str) -> Vec<String> {
@@ -192,7 +200,7 @@ impl Registry {
     }
 
     fn save(&mut self) {
-        if !self.dirty {
+        if !self.dirty || READ_ONLY.with(|r| r.get()) {
             return;
         }
         if let Some(parent) = self.file.parent() {

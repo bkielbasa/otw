@@ -18,6 +18,62 @@ pub const NTDLL_HANDLE: u32 = 0xFFF0_0000;
 pub const HEAP64_EXTRA_BASE: u32 = 0x4000_0000;
 pub const HEAP64_EXTRA_SIZE: u32 = 0x1000_0000;
 
+/// Memory several processes map (a section backed by the paging file):
+/// page-aligned host memory that each process's CPU maps directly, so what
+/// one writes the others see at once.
+pub struct SharedMemory {
+    pointer: *mut u8,
+    size: usize,
+}
+
+// SAFETY: the bytes are only reached through guest mappings and raw
+// copies; like memory shared between Windows processes, it is up to the
+// programs to synchronise.
+unsafe impl Send for SharedMemory {}
+unsafe impl Sync for SharedMemory {}
+
+impl SharedMemory {
+    /// `size` zeroed bytes, rounded up to whole pages.
+    pub fn new(size: usize) -> Option<std::sync::Arc<Self>> {
+        let size = (size.max(1) + 0xFFF) & !0xFFF;
+        let layout = std::alloc::Layout::from_size_align(size, 0x1000).ok()?;
+        // SAFETY: the layout has a non-zero size.
+        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+        (!pointer.is_null()).then(|| std::sync::Arc::new(Self { pointer, size }))
+    }
+
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// The host address of byte `offset`.
+    pub fn pointer(&self, offset: usize) -> *mut u8 {
+        // SAFETY: callers keep offsets inside the allocation.
+        unsafe { self.pointer.add(offset.min(self.size)) }
+    }
+
+    /// A copy of `len` bytes from `offset`.
+    pub fn read(&self, offset: usize, len: usize) -> Vec<u8> {
+        let end = (offset + len).min(self.size);
+        let start = offset.min(end);
+        // SAFETY: the range is inside the allocation.
+        unsafe { std::slice::from_raw_parts(self.pointer.add(start), end - start).to_vec() }
+    }
+}
+
+impl Drop for SharedMemory {
+    fn drop(&mut self) {
+        if let Ok(layout) = std::alloc::Layout::from_size_align(self.size, 0x1000) {
+            // SAFETY: allocated in `new` with this layout.
+            unsafe { std::alloc::dealloc(self.pointer, layout) };
+        }
+    }
+}
+
 /// What became of a thread given the CPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadRun {
@@ -105,6 +161,18 @@ pub trait GuestMemory {
     /// Unmap a range mapped with `map_shared` (and its alias, which is left
     /// unmapped).
     fn unmap_shared(&mut self, _va: u64) -> bool {
+        false
+    }
+
+    /// Map `size` bytes of `memory` from `offset` (page-aligned) somewhere
+    /// free from `preferred` up: a view of a section other processes may
+    /// map too. Returns the address.
+    fn map_section(&mut self, _memory: std::sync::Arc<SharedMemory>, _offset: usize, _size: u32, _preferred: u32) -> Option<u32> {
+        None
+    }
+
+    /// Unmap a view mapped with `map_section`.
+    fn unmap_section(&mut self, _va: u32) -> bool {
         false
     }
 

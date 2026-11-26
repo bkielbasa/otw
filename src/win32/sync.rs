@@ -294,6 +294,8 @@ fn ready<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, thread: u32,
 /// ran.
 pub fn run_ready_threads<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) -> bool {
     let mut ran = false;
+    // Pipe reads whose data came from another process.
+    crate::win32::ipc::poll(ctx, memory);
     let now = ctx.shared.borrow().ticks();
     ctx.shared.borrow_mut().sync.now = now;
     for thread in memory.waiting_threads() {
@@ -336,17 +338,89 @@ pub fn run_ready_threads<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut
 /// Note the exit codes of started programs that have ended.
 fn refresh_processes(ctx: &ApiContext) {
     let launcher = ctx.shared.borrow().launcher.0.clone();
-    let Some(launcher) = launcher else {
-        return;
-    };
     let mut shared = ctx.shared.borrow_mut();
     for object in shared.sync.objects.values_mut() {
         if let Object::Process { pid, exit } = object {
             if exit.is_none() {
-                *exit = launcher.exit_code(*pid);
+                *exit = launcher.as_ref().and_then(|l| l.exit_code(*pid)).or_else(|| crate::win32::kobj::exit_code(*pid));
             }
         }
     }
+}
+
+/// Signal an event (another part of the subsystem finished something a
+/// thread may wait for).
+pub fn set_event(sync: &mut SyncState, handle: u32) {
+    if let Some(Object::Event { signaled, .. }) = sync.objects.get_mut(&handle) {
+        *signaled = true;
+    }
+}
+
+/// The process a process handle of this process names.
+pub fn process_id(ctx: &ApiContext, handle: u32) -> Option<u32> {
+    if let Some(Object::Process { pid, .. }) = ctx.shared.borrow().sync.objects.get(&handle) {
+        return Some(*pid);
+    }
+    let me = ctx.shared.borrow().pid;
+    crate::win32::kobj::with(|k| match k.get(me, handle) {
+        Some(crate::win32::kobj::Object::Process { pid }) => Some(*pid),
+        _ => None,
+    })
+}
+
+/// A handle to another process (OpenProcess).
+pub fn open_process(ctx: &ApiContext, pid: u32) -> u32 {
+    create(ctx, None, Object::Process { pid, exit: None })
+}
+
+/// What `CreateProcess` asks for besides the program: the environment,
+/// the handles to inherit (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` in an
+/// extended STARTUPINFO), whether to start suspended.
+fn launch_options<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, args: &[u32], wide: bool) -> crate::win32::LaunchOptions {
+    let flags = args[5];
+    let environment = (args[6] != 0).then(|| {
+        let unicode = flags & 0x400 != 0;
+        let mut strings = Vec::new();
+        let mut at = args[6];
+        loop {
+            let text = if unicode {
+                let units = crate::win32::unicode::read_wstr(memory, at);
+                at += 2 * (units.len() as u32 + 1);
+                String::from_utf16_lossy(&units)
+            } else {
+                let bytes = crate::win32::read_cstr(memory, at);
+                at += bytes.len() as u32 + 1;
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            if text.is_empty() || strings.len() > 4096 {
+                break;
+            }
+            strings.push(text);
+        }
+        strings
+    });
+    let mut handles = None;
+    if flags & 0x8_0000 != 0 && args[8] != 0 {
+        // STARTUPINFOEX: the attribute list follows STARTUPINFO.
+        let x64 = memory.ptr_size() == 8;
+        let list = memory.read_ptr(args[8] + if x64 { 104 } else { 68 }).unwrap_or(0) as u32;
+        if list != 0 && memory.read_u32(list) == Some(0x4C57_544F) {
+            let entries = memory.read_u32(list + 4).unwrap_or(0).min(16);
+            for index in 0..entries {
+                let entry = list + 8 + index * 24;
+                let attribute = memory.read_u64(entry).unwrap_or(0);
+                let value = memory.read_u64(entry + 8).unwrap_or(0) as u32;
+                let size = memory.read_u64(entry + 16).unwrap_or(0) as u32;
+                if attribute == 0x2_0002 {
+                    let width = memory.ptr_size();
+                    let list: Vec<u32> = (0..size / width).filter_map(|i| memory.read_ptr(value + i * width).map(|h| h as u32)).collect();
+                    handles = Some(list);
+                }
+            }
+        }
+    }
+    let _ = (ctx, wide);
+    crate::win32::LaunchOptions { environment, handles, inherit: args[4] != 0, suspended: flags & 4 != 0 }
 }
 
 /// The program a `CreateProcess` call names: its application name, or the
@@ -484,6 +558,14 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             }
         }
         refresh_processes(ctx);
+        crate::win32::ipc::poll(ctx, memory);
+        let me = ctx.shared.borrow().pid;
+        if crate::win32::kobj::terminated(me) {
+            // Another process ended this one: stop here for good.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
         {
             let mut shared = ctx.shared.borrow_mut();
             shared.sync.now = shared.ticks();
@@ -815,7 +897,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             } else {
                 crate::win32::crt::absolute(ctx, &directory)
             };
-            match launcher.start(ctx, &path, &command_line, &directory) {
+            let options = launch_options(ctx, memory, args, wide);
+            match launcher.start_with(ctx, &path, &command_line, &directory, options) {
                 Ok(pid) => {
                     let process = create(ctx, None, Object::Process { pid, exit: None });
                     let main_thread = create(ctx, None, Object::Process { pid, exit: None });
@@ -852,6 +935,17 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         "ResumeThread" | "SuspendThread" => {
             let id = match ctx.shared.borrow().sync.objects.get(&args[0]) {
                 Some(Object::Thread { id, .. }) => *id,
+                Some(Object::Process { pid, .. }) => {
+                    // The main thread of a process started alongside this one.
+                    let pid = *pid;
+                    let was = crate::win32::kobj::with(|k| {
+                        let process = k.processes.get_mut(&pid)?;
+                        let was = process.suspended;
+                        process.suspended = name == "SuspendThread";
+                        Some(was)
+                    });
+                    return ok(u32::from(was.unwrap_or(false)));
+                }
                 _ => return ok(0),
             };
             let mut shared = ctx.shared.borrow_mut();

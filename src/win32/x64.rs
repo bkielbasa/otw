@@ -276,6 +276,9 @@ pub fn arg_count(ctx: &ApiContext, dll: &str, name: &ImportName) -> Option<usize
     if dll.eq_ignore_ascii_case("dwrite.dll") {
         return crate::win32::dwrite::arg_count(by_name(name)?);
     }
+    if let Some(count) = by_name(name).and_then(crate::win32::ipc::arg_count) {
+        return Some(count);
+    }
     if let Some(count) = by_name(name).and_then(crate::win32::seh64::arg_count) {
         return Some(count);
     }
@@ -318,6 +321,9 @@ pub fn call(
     }
     if dll.eq_ignore_ascii_case("dwrite.dll") {
         return crate::win32::dwrite::call(ctx, memory, by_name(name)?, args);
+    }
+    if let Some(outcome) = by_name(name).and_then(|text| crate::win32::ipc::call(ctx, memory, text, args)) {
+        return Some(outcome);
     }
     if let Some(outcome) = by_name(name).and_then(|text| crate::win32::seh64::call(ctx, memory, text, args)) {
         return Some(outcome);
