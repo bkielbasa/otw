@@ -34,7 +34,18 @@ pub fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<(
 }
 
 pub fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
-    system().create_dir(text(&path)).then_some(()).ok_or_else(failed)
+    let path = path.as_ref();
+    // The errors programs tell apart (Windows: ERROR_ALREADY_EXISTS,
+    // ERROR_PATH_NOT_FOUND).
+    if system().info(path.as_str()).is_some() {
+        return Err(Error::from(ErrorKind::AlreadyExists));
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_str().is_empty()) {
+        if !parent.is_dir() {
+            return Err(not_found());
+        }
+    }
+    system().create_dir(path.as_str()).then_some(()).ok_or_else(failed)
 }
 
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {

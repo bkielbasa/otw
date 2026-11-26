@@ -33,6 +33,10 @@ pub trait System: Send + Sync {
     fn unix_time(&self) -> u64;
     fn log(&self, text: &str);
     fn env(&self, name: &str) -> Option<String>;
+    /// Every configuration variable (name, value).
+    fn vars(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
     fn sleep_us(&self, us: u64);
     fn yield_now(&self) {
         self.sleep_us(0);
@@ -248,7 +252,6 @@ pub mod time {
 pub mod env {
     use super::path::{OsString, PathBuf};
     use alloc::string::String;
-    use alloc::vec::Vec;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum VarError {
@@ -274,7 +277,7 @@ pub mod env {
     pub fn set_var(_name: impl AsRef<str>, _value: impl AsRef<str>) {}
 
     pub fn vars() -> impl Iterator<Item = (String, String)> {
-        Vec::new().into_iter()
+        super::system().vars().into_iter()
     }
 
     pub fn temp_dir() -> PathBuf {

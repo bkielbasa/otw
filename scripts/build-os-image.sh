@@ -38,4 +38,4 @@ else
   partitions+=("data:OTW-C:auto:$EXTRA")
 fi
 echo "==> making the disk"
-python3 -I "$ROOT/scripts/make-disk.py" "$OUT/otw.img" "${partitions[@]}"
+python3 -I "$ROOT/scripts/make-disk.py" "${OS_IMAGE:-$OUT/otw.img}" "${partitions[@]}"

@@ -32,9 +32,22 @@ else
   echo "no access to /dev/kvm: emulating the CPU (slow)" >&2
   cpu_args=(-machine q35,accel=tcg -cpu max)
 fi
+# A window where there is a desktop to show it on (GTK, else SDL); a VNC
+# server (vnc://localhost:5901) otherwise.
+display="${VM_DISPLAY:-}"
+if [[ -z "$display" ]]; then
+  if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    display=gtk
+  else
+    display=vnc=127.0.0.1:1
+    echo "no desktop session here: the screen is at vnc://127.0.0.1:5901 (VM_DISPLAY=gtk or sdl to choose)" >&2
+  fi
+fi
+display_args=(-display "$display")
 args=()
 [[ -n "${VM_MONITOR:-}" ]] && args+=(-monitor "unix:$VM_MONITOR,server,nowait")
 [[ -n "${VM_QMP:-}" ]] && args+=(-qmp "unix:$VM_QMP,server,nowait")
+[[ -n "${VM_PIDFILE:-}" ]] && args+=(-pidfile "$VM_PIDFILE")
 [[ -n "${VM_SERIAL:-}" ]] && args+=(-serial "file:$VM_SERIAL")
 
 exec qemu-system-x86_64 \
@@ -48,5 +61,5 @@ exec qemu-system-x86_64 \
   "${disk_args[@]}" \
   -nic user,model=virtio-net-pci \
   -vga std \
-  -display "${VM_DISPLAY:-gtk}" \
+  "${display_args[@]}" \
   "${args[@]}"

@@ -27,7 +27,7 @@ use otw_vm::kernel::memory::{self, FullRegisters, GuestMemory, Registers, Resume
 use otw_vm::kernel::pe::ImportName;
 use otw_vm::kernel::syscall::{widen, Args, SystemCalls};
 use otw_vm::vm::Vm;
-use otw_vm::win32::SharedState;
+use otw_vm::win32::{kobj, SharedState};
 
 use crate::arch::{self, write_msr};
 use crate::paging::AddressSpace;
@@ -148,6 +148,8 @@ struct Runner {
     /// Memory shared between mappings (sections, and 64-bit memory above
     /// 4 GiB with its low alias), by address: size, alias, the memory.
     shared: RefCell<alloc::collections::BTreeMap<u64, (u64, Option<u64>, alloc::sync::Arc<memory::SharedMemory>)>>,
+    /// The last ranges unmapped (for when a program touches one).
+    unmapped: RefCell<alloc::collections::VecDeque<(u64, u64)>>,
     /// The last calls made (for when a program ends badly).
     recent: RefCell<alloc::collections::VecDeque<String>>,
 }
@@ -293,7 +295,9 @@ impl Runner {
             let stop = match regs.vector as u8 {
                 arch::SYSTEM_CALL_VECTOR => self.system_call(regs),
                 arch::CALLBACK_RETURN_VECTOR => Some(Stop::Returned(regs.rax)),
-                14 if regs.error & 1 == 0 && self.fault_in(regs.fault_address) => None,
+                // A page to make (or one another CPU made meanwhile, as this
+                // one waited for the lock).
+                14 if regs.error & 1 == 0 && (self.space.is_mapped(regs.fault_address) || self.fault_in(regs.fault_address)) => None,
                 vector => self.raise_fault(regs, vector),
             };
             if let Some(stop) = stop {
@@ -318,6 +322,10 @@ impl Runner {
         let at = if vector == 3 { regs.rip - 1 } else { regs.rip };
         log!("OTW kernel: {} at {at:#x} ({:#x})", exception_name(vector), regs.fault_address);
         {
+            let address = regs.fault_address;
+            let gone: Vec<(u64, u64)> = self.unmapped.borrow().iter().copied().filter(|&(s, e)| address >= s && address < e).collect();
+            let shared: Vec<(u64, u64, Option<u64>)> = self.shared.borrow().iter().filter(|(&va, &(size, alias, _))| (address >= va && address < va + size) || alias.is_some_and(|l| address >= l && address < l + size)).map(|(&va, &(size, alias, _))| (va, size, alias)).collect();
+            log!("[eh] {address:#x}: reserved {}, unmapped earlier {gone:x?}, shared {shared:x?}", self.reserved_at(address));
             // What the program was doing: return addresses on its stack,
             // strings its registers point at (a crash reason), its code.
             let stack: Vec<u64> = (0..24).filter_map(|i| self.read_u64(regs.rsp + i * 8)).filter(|v| (0x1000_0000..0x8000_0000).contains(v)).collect();
@@ -407,7 +415,7 @@ impl Runner {
         self.api_calls.set(self.api_calls.get() + 1);
         {
             let mut recent = self.recent.borrow_mut();
-            if recent.len() >= 600 {
+            if recent.len() >= 40 {
                 recent.pop_front();
             }
             recent.push_back(self.syscalls.describe(&entry.dll, &entry.name));
@@ -795,6 +803,13 @@ impl NativeMemory<'_> {
     /// Unmap [va, va + size): no longer the program's.
     fn unmap_range(&mut self, va: u64, size: u64) -> bool {
         let (start, end) = (va & !(PAGE - 1), (va + size + PAGE - 1) & !(PAGE - 1));
+        {
+            let mut unmapped = self.runner.unmapped.borrow_mut();
+            if unmapped.len() >= 256 {
+                unmapped.pop_front();
+            }
+            unmapped.push_back((start, end));
+        }
         let mut reserved = self.runner.reserved.borrow_mut();
         let mut kept = Vec::new();
         for &(s, e) in reserved.iter() {
@@ -1135,14 +1150,153 @@ fn tls_templates(image: &Image, runner: &Runner) -> Vec<Vec<u8>> {
 }
 
 /// Load the program at `path` (`C:\\…`) from drive C: and run it to the
-/// end.
+/// end (a program the desktop starts).
 pub fn run(path: &str, command_line: &str) -> Ended {
-    let started = apic::now_us();
     let shared = Rc::new(RefCell::new(SharedState::default()));
+    let pid = kobj::with(|k| k.new_pid(0, false));
+    shared.borrow_mut().pid = pid;
+    KernelLauncher::install(&shared);
+    let ended = run_process(&shared, path, command_line, b"");
+    finish_process(pid, &ended);
+    ended
+}
+
+/// A process ended: its exit code for those who wait for it, its handles
+/// closed.
+fn finish_process(pid: u32, ended: &Ended) {
+    let code = match ended {
+        Ended::Exited(code) => *code,
+        Ended::Failed(_) => 0xC000_0005,
+    };
+    kobj::with(|k| {
+        if let Some(process) = k.processes.get_mut(&pid) {
+            process.exit.get_or_insert(code);
+        }
+        k.close_all(pid);
+    });
+    kobj::notify();
+}
+
+/// Starts the programs a program creates (`CreateProcess`), as on Linux
+/// (`vm::NestedLauncher`): a 64-bit program's 64-bit child that shares
+/// handles with it (a browser's content process) runs alongside, as a
+/// task of its own; others run to the end inside the call.
+struct KernelLauncher;
+
+impl KernelLauncher {
+    fn install(shared: &Rc<RefCell<SharedState>>) {
+        shared.borrow_mut().launcher = otw_vm::win32::LauncherSlot(Some(Rc::new(KernelLauncher)));
+    }
+}
+
+impl otw_vm::win32::Launcher for KernelLauncher {
+    fn start(&self, parent: &otw_vm::win32::ApiContext, path: &[u8], command_line: &[u8], directory: &[u8]) -> Result<u32, String> {
+        let shared = Rc::new(RefCell::new(SharedState::default()));
+        let parent_pid = parent.shared.borrow().pid;
+        if let Some(environment) = parent.shared.borrow_mut().pending_environment.take() {
+            otw_vm::win32::env::set_all(&mut shared.borrow_mut().env, &environment);
+        }
+        let pid = kobj::with(|k| k.new_pid(parent_pid, false));
+        shared.borrow_mut().pid = pid;
+        KernelLauncher::install(&shared);
+        let path = String::from_utf8_lossy(path).into_owned();
+        let command_line = String::from_utf8_lossy(command_line).into_owned();
+        // In the parent's place: its address space and thread block come
+        // back afterwards.
+        let task = crate::sched::current();
+        let saved = (task.cr3, task.fs_base, task.gs_base, task.compat);
+        let ended = otw_vm::kernel::lock::unlocked(|| run_process(&shared, &path, &command_line, directory));
+        let task = crate::sched::current();
+        (task.cr3, task.fs_base, task.gs_base, task.compat) = saved;
+        if task.cr3 != 0 {
+            unsafe { core::arch::asm!("mov cr3, {}", in(reg) task.cr3) };
+        }
+        if let Ended::Failed(why) = &ended {
+            log!("OTW kernel: {path} failed: {why}");
+        }
+        finish_process(pid, &ended);
+        Ok(pid)
+    }
+
+    fn start_with(&self, parent: &otw_vm::win32::ApiContext, path: &[u8], command_line: &[u8], directory: &[u8], options: otw_vm::win32::LaunchOptions) -> Result<u32, String> {
+        let child64 = otw_vm::win32::crt::host_path(path)
+            .and_then(|host| otw_vm::platform::fs::read(host).ok())
+            .and_then(|bytes| otw_vm::kernel::pe::PeImage::parse(bytes).ok())
+            .is_some_and(|image| image.is64);
+        let parent_pid = parent.shared.borrow().pid;
+        let shares = options.inherit
+            && match &options.handles {
+                Some(handles) => handles.iter().any(|&h| kobj::with(|k| k.owns(parent_pid, h))),
+                None => kobj::with(|k| !k.inheritable(parent_pid).is_empty()),
+            };
+        if !(child64 && parent.shared.borrow().x64 && shares) {
+            if let Some(environment) = options.environment {
+                parent.shared.borrow_mut().pending_environment = Some(environment);
+            }
+            return self.start(parent, path, command_line, directory);
+        }
+        // Alongside: a process of its own, on a task of its own.
+        let pid = kobj::with(|k| {
+            let pid = k.new_pid(parent_pid, options.suspended);
+            if options.inherit {
+                let handles = options.handles.clone().unwrap_or_else(|| k.inheritable(parent_pid));
+                for handle in handles {
+                    // Inherited handles keep their numbers.
+                    if k.owns(parent_pid, handle) {
+                        k.duplicate(parent_pid, handle, pid, Some(handle));
+                    }
+                }
+            }
+            pid
+        });
+        let screen = parent.shared.borrow().gui.screen;
+        let environment = options.environment.clone();
+        let path = String::from_utf8_lossy(path).into_owned();
+        let command_line = String::from_utf8_lossy(command_line).into_owned();
+        let directory = directory.to_vec();
+        log!("OTW kernel: process {pid:#x} starts alongside {parent_pid:#x}: {command_line}");
+        crate::sched::spawn(move || {
+            let shared = Rc::new(RefCell::new(SharedState::default()));
+            {
+                let mut state = shared.borrow_mut();
+                state.pid = pid;
+                state.alongside = true;
+                state.gui.screen = screen;
+                state.gui.script = Some(Default::default());
+                if let Some(block) = &environment {
+                    otw_vm::win32::env::set_all(&mut state.env, block);
+                }
+            }
+            KernelLauncher::install(&shared);
+            // Created suspended: it waits to be resumed.
+            while kobj::with(|k| k.processes.get(&pid).is_some_and(|p| p.suspended && p.exit.is_none())) {
+                crate::sched::sleep_us(1000);
+            }
+            let ended = run_process(&shared, &path, &command_line, &directory);
+            if let Ended::Failed(why) = &ended {
+                log!("OTW kernel: process {pid:#x} failed: {why}");
+            }
+            finish_process(pid, &ended);
+        });
+        Ok(pid)
+    }
+
+    fn exit_code(&self, pid: u32) -> Option<u32> {
+        kobj::exit_code(pid)
+    }
+}
+
+/// Load the program at `path` into a process whose Win32 state is
+/// `shared`, and run it to the end.
+fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str, directory: &[u8]) -> Ended {
+    let started = apic::now_us();
     let vm = match Vm::from_drive(path.as_bytes(), command_line.as_bytes(), shared.clone()) {
         Ok(vm) => vm,
         Err(error) => return Ended::Failed(format!("cannot load {path}: {error}")),
     };
+    if !directory.is_empty() {
+        shared.borrow_mut().current_dir = directory.to_vec();
+    }
     let image = vm.process_image();
     let main = image.main();
     let x64 = main.is64;
@@ -1168,6 +1322,7 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         workers: RefCell::new(alloc::collections::BTreeMap::new()),
         tls: RefCell::new(Vec::new()),
         recent: RefCell::new(alloc::collections::VecDeque::new()),
+        unmapped: RefCell::new(alloc::collections::VecDeque::new()),
         shared: RefCell::new(alloc::collections::BTreeMap::new()),
     };
 
@@ -1262,7 +1417,7 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         (apic::now_us() - started) / 1000
     );
 
-    crate::desktop::program_started(&shared, path.rsplit('\\').next().unwrap_or(path));
+    let on_desktop = crate::desktop::program_started(shared, &runner.lock, path.rsplit('\\').next().unwrap_or(path));
     // In the subsystem (until program code runs).
     let hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
     // Its memory, its thread block.
@@ -1302,6 +1457,7 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         }
     }
     drop(hold);
+    crate::desktop::program_ended(on_desktop);
     // Back to the kernel's tables before the program's go.
     let task = crate::sched::current();
     task.cr3 = 0;

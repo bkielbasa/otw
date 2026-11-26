@@ -15,6 +15,18 @@ use crate::{apic, io, log};
 
 pub const DRIVE_C: &str = "/C";
 
+/// OTW's settings (what are environment variables on Linux).
+const CONFIGURATION: &[(&str, &str)] = &[
+    ("OTW_DRIVE_C", DRIVE_C),
+    ("OTW_HOST_CLIPBOARD", "0"),
+    ("HOME", "/home"),
+    // Functions OTW lacks return 0 (and are named in the log).
+    ("OTW_STUB_MISSING", "1"),
+    // Firefox: no crash reporter, no sandbox broker.
+    ("OTW_ENV_MOZ_CRASHREPORTER_DISABLE", "1"),
+    ("OTW_ENV_MOZ_DISABLE_CONTENT_SANDBOX", "1"),
+];
+
 pub struct Kernel {
     drive: Option<Fat32FileSystem>,
     boot_unix_time: u64,
@@ -98,15 +110,11 @@ impl System for Kernel {
     }
 
     fn env(&self, name: &str) -> Option<String> {
-        match name {
-            "OTW_DRIVE_C" => Some(DRIVE_C.to_string()),
-            "OTW_HOST_CLIPBOARD" => Some("0".to_string()),
-            "HOME" => Some("/home".to_string()),
-            // Firefox: no crash reporter, no sandbox broker; functions OTW
-            // lacks return 0 (and are named in the log).
-            "OTW_ENV_MOZ_CRASHREPORTER_DISABLE" | "OTW_ENV_MOZ_DISABLE_CONTENT_SANDBOX" | "OTW_STUB_MISSING" => Some("1".to_string()),
-            _ => None,
-        }
+        CONFIGURATION.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
+    }
+
+    fn vars(&self) -> Vec<(String, String)> {
+        CONFIGURATION.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
     }
 
     fn sleep_us(&self, us: u64) {

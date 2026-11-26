@@ -32,6 +32,27 @@ struct Input8042 {
 /// A program on the desktop: its windows, and where its input goes.
 type Program = Rc<RefCell<SharedState>>;
 
+/// A running program, as the desktop sees it: its Win32 state (reached
+/// only under its subsystem lock) and name.
+struct Running {
+    id: u64,
+    shared: *const RefCell<SharedState>,
+    lock: alloc::sync::Arc<otw_vm::kernel::lock::BigLock>,
+    name: String,
+}
+
+struct RunningList(Vec<Running>);
+// Each program's state is touched only under its own lock.
+unsafe impl Send for RunningList {}
+
+/// The programs on the desktop, the front one last. A program adds and
+/// removes itself while not holding its lock; the desktop takes this list,
+/// then a program's lock (never the other way round).
+static RUNNING: otw_vm::platform::sync::Mutex<RunningList> = otw_vm::platform::sync::Mutex::new(RunningList(Vec::new()));
+static NEXT_RUNNING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// Messages to show (title, text): how programs ended.
+static NOTICES: otw_vm::platform::sync::Mutex<Vec<(String, String)>> = otw_vm::platform::sync::Mutex::new(Vec::new());
+
 /// The desktop's state, shared by its own loop and by programs' waits
 /// (which keep the desktop going while a program waits for input).
 pub struct Desktop {
@@ -43,8 +64,8 @@ pub struct Desktop {
     dirty: bool,
     width: i32,
     height: i32,
-    /// The running program (one at a time, for now).
-    program: Option<(Program, String)>,
+    /// Programs were running at the last step.
+    had_programs: bool,
     last_frame: u64,
 }
 
@@ -76,7 +97,7 @@ pub fn run(system: &System) -> ! {
         dirty: true,
         width: width as i32,
         height: height as i32,
-        program: None,
+        had_programs: false,
         last_frame: 0,
     }));
     DESKTOP.store(desktop, Ordering::SeqCst);
@@ -89,52 +110,54 @@ pub fn run(system: &System) -> ! {
     }
 }
 
-/// Run a program the shell asked for, to its end; the desktop keeps going
-/// while it waits.
+/// Start a program the shell asked for, as a task of its own (the desktop
+/// goes on; several programs run side by side).
 fn launch(path: &str, name: &str) {
     // The shell names paths on drive C: from its root.
-    let path = &if path.starts_with('\\') { format!("C:{path}") } else { String::from(path) };
+    let path = if path.starts_with('\\') { format!("C:{path}") } else { String::from(path) };
+    let name = String::from(name);
     log!("OTW kernel: asked to run {path}");
-    let ended = crate::process::run(path, name);
-    let desktop = unsafe { &mut *DESKTOP.load(Ordering::SeqCst) };
-    desktop.program = None;
-    desktop.shell.program_exited(None);
-    match ended {
-        crate::process::Ended::Exited(code) => {
-            log!("OTW kernel: {name} exited with {code}");
-            if code != 0 {
-                desktop.shell.show_message(name, &format!("{name} exited with code {code}."));
+    crate::sched::spawn(move || {
+        let ended = crate::process::run(&path, &name);
+        let notice = match ended {
+            crate::process::Ended::Exited(code) => {
+                log!("OTW kernel: {name} exited with {code}");
+                (code != 0).then(|| (name.clone(), format!("{name} exited with code {code}.")))
             }
+            crate::process::Ended::Failed(why) => {
+                log!("OTW kernel: {name} failed: {why}");
+                Some((String::from("Program Error"), format!("{name}: {why}")))
+            }
+        };
+        if let Some(notice) = notice {
+            NOTICES.lock().unwrap().push(notice);
         }
-        crate::process::Ended::Failed(why) => {
-            log!("OTW kernel: {name} failed: {why}");
-            desktop.shell.show_message("Program Error", &format!("{name}: {why}"));
-        }
+    });
+}
+
+/// A program starts (call without holding its lock): it is shown on the
+/// desktop and gets the input. Returns its place for `program_ended`.
+pub fn program_started(program: &Program, lock: &alloc::sync::Arc<otw_vm::kernel::lock::BigLock>, name: &str) -> u64 {
+    let desktop = DESKTOP.load(Ordering::SeqCst);
+    if !desktop.is_null() {
+        let desktop = unsafe { &*desktop };
+        program.borrow_mut().gui.screen = (desktop.width, desktop.height);
     }
-    desktop.dirty = true;
+    let id = NEXT_RUNNING.fetch_add(1, Ordering::SeqCst);
+    RUNNING.lock().unwrap().0.push(Running { id, shared: Rc::as_ptr(program), lock: lock.clone(), name: String::from(name) });
+    id
 }
 
-/// A program starts: it is shown on the desktop, gets the input.
-pub fn program_started(program: &Program, name: &str) {
-    let desktop = unsafe { &mut *DESKTOP.load(Ordering::SeqCst) };
-    program.borrow_mut().gui.screen = (desktop.width, desktop.height);
-    desktop.program = Some((program.clone(), String::from(name)));
-    desktop.shell.focus_program();
-    desktop.dirty = true;
+/// A program ended (call without holding its lock).
+pub fn program_ended(id: u64) {
+    RUNNING.lock().unwrap().0.retain(|r| r.id != id);
 }
 
-/// A program waits (for input, or to let time pass): keep the desktop
-/// going — input, launching, drawing.
+/// A program waits (for input, or to let time pass). The desktop runs on
+/// its own: sleep, without the program's lock.
 pub fn pump(block: bool) {
-    let pointer = DESKTOP.load(Ordering::SeqCst);
-    if pointer.is_null() {
-        return;
-    }
-    let desktop = unsafe { &mut *pointer };
-    desktop.step(block);
-    if let Some(request) = desktop.shell.take_launch() {
-        desktop.shell.show_message(&request.name, "One program runs at a time so far: close the running one first.");
-        desktop.dirty = true;
+    if block {
+        otw_vm::kernel::lock::unlocked(|| crate::sched::sleep_us(1000));
     }
 }
 
@@ -145,11 +168,23 @@ impl Desktop {
             self.dirty |= self.handle(byte);
         }
         self.dirty |= self.shell.clock_changed();
-        // Programs draw into their windows at any time: with one running,
+        for (title, text) in core::mem::take(&mut *NOTICES.lock().unwrap()) {
+            self.shell.show_message(&title, &text);
+            self.dirty = true;
+        }
+        let running = !RUNNING.lock().unwrap().0.is_empty();
+        if running && !self.had_programs {
+            self.shell.focus_program();
+        } else if !running && self.had_programs {
+            self.shell.program_exited(None);
+            self.dirty = true;
+        }
+        self.had_programs = running;
+        // Programs draw into their windows at any time: with any running,
         // the screen follows (at most 30 times a second; only changed rows
         // reach it).
         let now = apic::now_us();
-        if self.program.is_some() && now - self.last_frame >= 33_000 {
+        if running && now - self.last_frame >= 33_000 {
             self.dirty = true;
         }
         if self.dirty {
@@ -168,15 +203,19 @@ impl Desktop {
     }
 
     fn tasks(&self) -> Vec<Task> {
-        let Some((program, name)) = &self.program else { return Vec::new() };
-        let shared = program.borrow();
-        shared
-            .gui
-            .windows
-            .iter()
-            .filter(|w| w.visible && w.parent == 0 && w.style & WS_CHILD == 0 && !w.title.is_empty())
-            .map(|w| Task { label: w.title.clone(), active: w.hwnd == shared.gui.active_hwnd, program: name.clone() })
-            .collect()
+        let mut tasks = Vec::new();
+        each_program(|shared, name| {
+            tasks.extend(
+                shared
+                    .gui
+                    .windows
+                    .iter()
+                    .filter(|w| w.visible && w.parent == 0 && w.style & WS_CHILD == 0 && !w.title.is_empty())
+                    .map(|w| Task { label: w.title.clone(), active: w.hwnd == shared.gui.active_hwnd, program: String::from(name) }),
+            );
+            false
+        });
+        tasks
     }
 
     fn draw(&mut self) {
@@ -184,17 +223,18 @@ impl Desktop {
         let tasks = self.tasks();
         self.frame.pixels.fill(0);
         self.shell.paint(&mut self.frame, Layer::Background, &tasks);
-        if let Some((program, _)) = &self.program {
-            let shared = program.borrow();
+        let frame = &mut self.frame;
+        each_program(|shared, _| {
             for window in &shared.gui.windows {
                 if !window.visible || window.minimized || window.style & WS_CHILD != 0 {
                     continue;
                 }
                 if let Some(surface) = shared.gdi.surfaces.get(&window.hwnd) {
-                    blit(&mut self.frame, surface, window.x, window.y);
+                    blit(frame, surface, window.x, window.y);
                 }
             }
-        }
+            false
+        });
         self.shell.paint(&mut self.frame, Layer::Foreground, &tasks);
         self.shell.paint(&mut self.frame, Layer::Top, &tasks);
         let painted = apic::now_us();
@@ -206,19 +246,49 @@ impl Desktop {
         self.dirty = false;
     }
 
-    /// Whether the pointer is over one of the program's windows.
+    /// Whether the pointer is over one of a program's windows.
     fn over_program(&self, x: i32, y: i32) -> bool {
-        self.program.as_ref().is_some_and(|(p, _)| top_level_at(&p.borrow().gui, x, y).is_some())
+        let mut over = false;
+        each_program(|shared, _| {
+            over |= top_level_at(&shared.gui, x, y).is_some();
+            over
+        });
+        over
     }
 
+    fn has_programs(&self) -> bool {
+        !RUNNING.lock().unwrap().0.is_empty()
+    }
+
+    /// Input for a program: the one whose window is under the pointer (a
+    /// pointer event), else the front one; it becomes the front one.
     fn to_program(&self, event: RawInput) {
-        if let Some((program, _)) = &self.program {
-            let mut shared = program.borrow_mut();
-            if let (RawInput::Move { .. }, Some(RawInput::Move { .. })) = (event, shared.gui.input.back()) {
-                shared.gui.input.pop_back();
-            }
-            shared.gui.input.push_back(event);
+        let at = match event {
+            RawInput::Move { x, y } | RawInput::Button { x, y, .. } => Some((x, y)),
+            RawInput::Key { .. } => None,
+        };
+        let mut running = RUNNING.lock().unwrap();
+        let list = &mut running.0;
+        let target = at
+            .and_then(|(x, y)| {
+                list.iter().rposition(|r| {
+                    let _hold = otw_vm::kernel::lock::Hold::new(&r.lock);
+                    top_level_at(&unsafe { &*r.shared }.borrow().gui, x, y).is_some()
+                })
+            })
+            .or(list.len().checked_sub(1));
+        let Some(index) = target else { return };
+        if matches!(event, RawInput::Button { down: true, .. }) && index + 1 != list.len() {
+            let front = list.remove(index);
+            list.push(front);
         }
+        let r = if matches!(event, RawInput::Button { down: true, .. }) { list.last().unwrap() } else { &list[index] };
+        let _hold = otw_vm::kernel::lock::Hold::new(&r.lock);
+        let mut shared = unsafe { &*r.shared }.borrow_mut();
+        if let (RawInput::Move { .. }, Some(RawInput::Move { .. })) = (event, shared.gui.input.back()) {
+            shared.gui.input.pop_back();
+        }
+        shared.gui.input.push_back(event);
     }
 
     fn handle(&mut self, byte: Input) -> bool {
@@ -262,7 +332,7 @@ impl Desktop {
                     } else {
                         self.shell.pointer_up(x, y, button, over)
                     };
-                    if matches!(outcome, PointerOutcome::Unhandled) && self.program.is_some() {
+                    if matches!(outcome, PointerOutcome::Unhandled) && self.has_programs() {
                         if now {
                             self.shell.focus_program();
                         }
@@ -287,7 +357,7 @@ impl Desktop {
                     0x38 => self.input.mods.alt = !released,
                     _ => {}
                 }
-                let to_program = self.program.is_some() && !self.shell.wants_keyboard();
+                let to_program = self.has_programs() && !self.shell.wants_keyboard();
                 if to_program {
                     if let Some(vk) = virtual_key(scan, extended) {
                         let ch = if released {
@@ -315,6 +385,19 @@ impl Desktop {
                     None => false,
                 }
             }
+        }
+    }
+}
+
+/// Run `f` on each program's Win32 state (back to front), under its lock;
+/// `f` returning true stops.
+fn each_program(mut f: impl FnMut(&SharedState, &str) -> bool) {
+    let running = RUNNING.lock().unwrap();
+    for r in &running.0 {
+        let _hold = otw_vm::kernel::lock::Hold::new(&r.lock);
+        let shared = unsafe { &*r.shared }.borrow();
+        if f(&shared, &r.name) {
+            break;
         }
     }
 }
