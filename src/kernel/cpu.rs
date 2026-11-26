@@ -202,6 +202,8 @@ struct RunState<'a> {
     worker: bool,
     /// How to make a CPU for another thread.
     recipe: Option<Rc<Recipe>>,
+    /// This CPU's flags for address-space barriers.
+    flags: Arc<super::space::CpuFlags>,
     exit_code: Option<u32>,
     api_calls: usize,
     error: Option<String>,
@@ -256,6 +258,7 @@ impl<'a> RunState<'a> {
             cursor: None,
             worker: false,
             recipe: None,
+            flags: Arc::new(super::space::CpuFlags::default()),
             exit_code: None,
             api_calls: 0,
             error: None,
@@ -665,10 +668,28 @@ fn emulate(
     // Guest code runs without the subsystem lock (other threads of the
     // process may be in the system meanwhile).
     let lock = state.borrow().process.lock.clone();
+    let flags = state.borrow().flags.clone();
     sync_space(uc, state);
     let run = |uc: &mut Unicorn<'_, ()>, from: u64| {
         let depth = lock.release_all();
-        let result = uc.emu_start(from, until as u64, timeout, count);
+        let mut pc = from;
+        let result = loop {
+            flags.in_guest.store(true, Ordering::SeqCst);
+            // Changes made before this CPU counted as running guest code.
+            sync_space(uc, state);
+            let result = uc.emu_start(pc, until as u64, timeout, count);
+            flags.in_guest.store(false, Ordering::SeqCst);
+            // Stopped to apply another CPU's unmap: apply it, go on.
+            if flags.stop.swap(false, Ordering::SeqCst) && result.is_ok() {
+                let rip = uc.reg_read(Reg::RIP).unwrap_or(until as u64);
+                let done = rip == until as u64 || state.borrow().exit_code.is_some() || state.borrow().error.is_some();
+                if !done {
+                    pc = rip;
+                    continue;
+                }
+            }
+            break result;
+        };
         lock.reacquire(depth);
         result
     };
@@ -1843,6 +1864,30 @@ fn parallel_threads() -> bool {
     })
 }
 
+/// A hook entered from guest code: the CPU is in the system (not running
+/// guest code) and holds the lock, and has applied other CPUs' memory
+/// changes; on leaving it goes back to guest code.
+struct HookEntry {
+    _hold: super::lock::Hold,
+    flags: Arc<super::space::CpuFlags>,
+}
+
+impl HookEntry {
+    fn new(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>, lock: &Arc<BigLock>) -> Self {
+        let flags = state.borrow().flags.clone();
+        flags.in_guest.store(false, Ordering::SeqCst);
+        let hold = super::lock::Hold::new(lock);
+        sync_space(uc, state);
+        Self { _hold: hold, flags }
+    }
+}
+
+impl Drop for HookEntry {
+    fn drop(&mut self) {
+        self.flags.in_guest.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Moves a value of the single-threaded subsystem world to a new host
 /// thread, which touches it only under the process's lock.
 struct SendBox<T>(T);
@@ -1887,6 +1932,7 @@ fn run_worker(process: Arc<ProcessShared>, recipe: Rc<Recipe>, [id, entry, param
         hide_sse42(&mut uc).map_err(|error| RunError::Unicorn("hooking CPUID", error))?;
         let cursor = process.space.attach(&mut uc);
         let state = Rc::new(RefCell::new(RunState::new(process.clone())));
+        process.space.register(cursor, uc.get_handle() as usize, state.borrow().flags.clone());
         {
             let mut s = state.borrow_mut();
             s.cursor = Some(cursor);
@@ -2061,8 +2107,7 @@ fn install_hooks<'a>(
             let Some(entry) = thunk_iat.entry_for_thunk(address as u32) else {
                 return;
             };
-            let _hold = super::lock::Hold::new(&thunk_lock);
-            sync_space(uc, &thunk_state);
+            let _entry = HookEntry::new(uc, &thunk_state, &thunk_lock);
             // The process is ending (another thread ended it).
             {
                 let process = thunk_state.borrow().process.clone();
@@ -2438,11 +2483,10 @@ fn install_hooks<'a>(
         0,
         u64::MAX,
         move |uc, access, address, size, _value| {
-            let _hold = super::lock::Hold::new(&invalid_lock);
-            // Memory another thread mapped, not yet here: map it and go on.
+            let _entry = HookEntry::new(uc, &invalid_state, &invalid_lock);
+            // Memory another thread mapped, not yet here: now mapped, go on.
             let space = invalid_state.borrow().process.space.clone();
             if matches!(access, MemType::READ_UNMAPPED | MemType::WRITE_UNMAPPED | MemType::FETCH_UNMAPPED) && space.contains(address) {
-                sync_space(uc, &invalid_state);
                 return true;
             }
             if trace_code {
@@ -2471,7 +2515,7 @@ fn install_hooks<'a>(
     let intr_state = state.clone();
     let intr_lock = state.borrow().process.lock.clone();
     uc.add_intr_hook(move |uc, intno| {
-        let _hold = super::lock::Hold::new(&intr_lock);
+        let _entry = HookEntry::new(uc, &intr_state, &intr_lock);
         let eip = uc.reg_read(Reg::EIP).unwrap_or(0) as u32;
         if intno == 0 {
             intr_state.borrow_mut().fault = Some(Fault {
@@ -2537,6 +2581,7 @@ fn build<'a>(
     let state = Rc::new(RefCell::new(RunState::new(process_shared.clone())));
     {
         let cursor = process_shared.space.attach(&mut uc);
+        process_shared.space.register(cursor, uc.get_handle() as usize, state.borrow().flags.clone());
         state.borrow_mut().cursor = Some(cursor);
         state.borrow_mut().x64 = x64;
     }

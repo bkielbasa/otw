@@ -35,6 +35,13 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Release code with symbols and line tables, for profilers and debuggers.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+lto = "thin"
+
 # Unicorn with locked instructions atomic across CPUs (threads of a 64-bit
 # process run on CPUs of their own); see vendor/unicorn-engine-sys/OTW.md.
 [patch.crates-io]

@@ -44,11 +44,18 @@ struct Inner {
     /// Each CPU's position: the number of the next change it applies.
     cpus: std::collections::HashMap<u32, usize>,
     next_cpu: u32,
-    /// Ranges unmapped that some CPU may still have mapped: (start, size,
-    /// number of the unmap change). They are not given out again until
-    /// every CPU has applied the unmap (a CPU that had not would go on
-    /// using the old memory there).
-    quarantine: Vec<(u64, u64, usize)>,
+    /// Each CPU's engine (to stop it) and flags.
+    engines: std::collections::HashMap<u32, (usize, Arc<CpuFlags>)>,
+}
+
+/// What another thread needs to know of a CPU to make it apply an unmap
+/// before it runs on.
+#[derive(Default)]
+pub struct CpuFlags {
+    /// It runs guest code (without the subsystem lock).
+    pub in_guest: std::sync::atomic::AtomicBool,
+    /// It was stopped to apply address-space changes; it goes on after.
+    pub stop: std::sync::atomic::AtomicBool,
 }
 
 impl Inner {
@@ -63,14 +70,11 @@ impl Inner {
             self.log.pop_front();
             self.base += 1;
         }
-        let base = self.base;
-        self.quarantine.retain(|&(_, _, change)| change >= base);
     }
 
-    /// Whether `[start, start + size)` is mapped or quarantined.
+    /// Whether `[start, start + size)` is mapped.
     fn taken(&self, start: u64, size: u64) -> bool {
         self.mappings.range(..start + size).next_back().is_some_and(|(&s, m)| s + m.size > start)
-            || self.quarantine.iter().any(|&(s, n, _)| s < start + size && start < s + n)
     }
 
     fn push(&mut self, cpu: u32, change: Change) {
@@ -102,10 +106,7 @@ impl AddressSpace {
     /// The mapped ranges, as (first, last) addresses inclusive.
     pub fn ranges(&self) -> Vec<(u64, u64)> {
         let inner = self.lock();
-        let mut ranges: Vec<(u64, u64)> = inner.mappings.iter().map(|(&start, m)| (start, start + m.size - 1)).collect();
-        ranges.extend(inner.quarantine.iter().map(|&(s, n, _)| (s, s + n - 1)));
-        ranges.sort_unstable();
-        ranges
+        inner.mappings.iter().map(|(&start, m)| (start, start + m.size - 1)).collect()
     }
 
     /// Whether any of `[start, start + size)` is mapped.
@@ -166,9 +167,11 @@ impl AddressSpace {
             }
         }
         let _ = uc.mem_unmap(start, size);
-        let index = inner.end();
-        inner.quarantine.push((start, size, index));
         inner.push(cursor.0, Change::Unmap { start, size, _keep: keep });
+        drop(inner);
+        // No CPU may go on with the old memory there: the range may be
+        // given out again at once.
+        self.barrier(cursor.0);
         true
     }
 
@@ -197,6 +200,57 @@ impl AddressSpace {
         inner.trim();
     }
 
+    /// Make every other CPU apply the changes so far: those running guest
+    /// code are stopped, apply them and go on (the others apply them
+    /// before they run guest code or touch memory again).
+    fn barrier(&self, me: u32) {
+        use std::sync::atomic::Ordering;
+        unsafe extern "C" {
+            fn uc_emu_stop(uc: *mut std::ffi::c_void) -> i32;
+        }
+        let (target, others) = {
+            let inner = self.lock();
+            let others: Vec<(u32, usize, Arc<CpuFlags>)> = inner
+                .engines
+                .iter()
+                .filter(|(&id, _)| id != me)
+                .map(|(&id, (handle, flags))| (id, *handle, flags.clone()))
+                .collect();
+            (inner.end(), others)
+        };
+        if others.is_empty() {
+            return;
+        }
+        for (_, handle, flags) in &others {
+            if flags.in_guest.load(Ordering::SeqCst) {
+                flags.stop.store(true, Ordering::SeqCst);
+                // SAFETY: an engine leaves this list (detach) before it is
+                // closed; uc_emu_stop may be called from another thread.
+                unsafe { uc_emu_stop(*handle as *mut std::ffi::c_void) };
+            }
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let pending = {
+                let inner = self.lock();
+                others.iter().any(|(id, _, flags)| {
+                    inner.engines.contains_key(id)
+                        && flags.in_guest.load(Ordering::SeqCst)
+                        && inner.cpus.get(id).is_some_and(|&p| p < target)
+                })
+            };
+            if !pending || started.elapsed() > std::time::Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+
+    /// Register a CPU's engine and flags (for `barrier`).
+    pub fn register(&self, cursor: Cursor, engine: usize, flags: Arc<CpuFlags>) {
+        self.lock().engines.insert(cursor.0, (engine, flags));
+    }
+
     /// Attach a CPU: map everything mapped now into it (none for the
     /// first, which maps as it goes).
     pub fn attach(&self, uc: &mut Unicorn<'_, ()>) -> Cursor {
@@ -217,6 +271,7 @@ impl AddressSpace {
     pub fn detach(&self, cursor: Cursor) {
         let mut inner = self.lock();
         inner.cpus.remove(&cursor.0);
+        inner.engines.remove(&cursor.0);
         inner.trim();
     }
 
