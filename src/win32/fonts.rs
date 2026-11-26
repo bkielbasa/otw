@@ -17,7 +17,13 @@ pub struct FontFile {
     /// The file's name in the guest's fonts folder.
     pub guest_name: String,
     pub size: u64,
+    /// A font OTW carries itself (no host file).
+    pub embedded: Option<&'static [u8]>,
 }
+
+/// OTW's own stand-in for the icon fonts Windows draws caption buttons
+/// with (built by `scripts/build-caption-font.py`).
+static CAPTION_FONT: &[u8] = include_bytes!("../../binaries/fonts/OTWCAPTION.TTF");
 
 #[derive(Clone, Debug, Default)]
 pub struct Face {
@@ -297,6 +303,8 @@ const ALIASES: &[(&str, &[&str])] = &[
     ("Georgia", &["DejaVu Serif", "Noto Serif", "Liberation Serif"]),
     ("Trebuchet MS", &["DejaVu Sans", "Noto Sans"]),
     ("Lucida Console", &["DejaVu Sans Mono", "Liberation Mono"]),
+    ("Segoe Fluent Icons", &["OTW Caption Icons"]),
+    ("Segoe MDL2 Assets", &["OTW Caption Icons"]),
 ];
 
 fn build() -> FontDb {
@@ -326,8 +334,15 @@ fn build() -> FontDb {
         let count = names.entry(base.clone()).or_insert(0);
         *count += 1;
         let guest_name = if *count == 1 { base } else { format!("{count}_{base}") };
-        files.push(FontFile { path, guest_name, size });
+        files.push(FontFile { path, guest_name, size, embedded: None });
         faces.extend(found);
+    }
+    {
+        let file = files.len();
+        if let Some(face) = describe(CAPTION_FONT, file, 0, 0) {
+            files.push(FontFile { path: PathBuf::new(), guest_name: "OTWCAPTION.TTF".into(), size: CAPTION_FONT.len() as u64, embedded: Some(CAPTION_FONT) });
+            faces.push(face);
+        }
     }
     let mut by_family: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, face) in faces.iter().enumerate() {
@@ -355,7 +370,13 @@ impl FontDb {
         let mut cache = self.data.lock().expect("font cache");
         cache
             .entry(file)
-            .or_insert_with(|| Arc::new(self.files.get(file).and_then(|f| std::fs::read(&f.path).ok()).unwrap_or_default()))
+            .or_insert_with(|| {
+                let bytes = self.files.get(file).and_then(|f| match f.embedded {
+                    Some(bytes) => Some(bytes.to_vec()),
+                    None => std::fs::read(&f.path).ok(),
+                });
+                Arc::new(bytes.unwrap_or_default())
+            })
             .clone()
     }
 
@@ -387,7 +408,7 @@ impl FontDb {
 
     /// Where a guest fonts-folder name is on the host.
     pub fn host_path(&self, guest_name: &str) -> Option<PathBuf> {
-        self.files.iter().find(|f| f.guest_name.eq_ignore_ascii_case(guest_name)).map(|f| f.path.clone())
+        self.files.iter().find(|f| f.embedded.is_none() && f.guest_name.eq_ignore_ascii_case(guest_name)).map(|f| f.path.clone())
     }
 }
 

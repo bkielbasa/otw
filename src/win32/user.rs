@@ -822,7 +822,7 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
                 .or(close)
                 .map(|r| r.left - 2)
                 .unwrap_or(w - frame);
-            let title = window.title.as_bytes();
+            let title = &crate::win32::unicode::string_to_ansi(&window.title)[..];
             let face = gfx::pick_face(13, true);
             let mut shown = title.to_vec();
             while !shown.is_empty() && text_x + face.text_width(&shown) > limit {
@@ -1649,7 +1649,7 @@ pub fn create_window<M: GuestMemory + ?Sized>(
             hwnd,
             thread: memory.current_thread(),
             class: class_record.name.clone(),
-            title: String::from_utf8_lossy(&params.title).into_owned(),
+            title: crate::win32::unicode::ansi_to_string(&params.title),
             parent: parent_hwnd,
             x,
             y,
@@ -2493,7 +2493,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
                     let title = read_cstr(memory, title_va);
                     let mut shared = ctx.shared.borrow_mut();
                     if let Some(window) = shared.gui.window_mut(hwnd) {
-                        window.title = String::from_utf8_lossy(&title).into_owned();
+                        window.title = crate::win32::unicode::ansi_to_string(&title);
                     }
                 }
             }
@@ -2565,7 +2565,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
             let text = read_cstr(memory, lparam);
             let mut shared = ctx.shared.borrow_mut();
             if let Some(window) = shared.gui.window_mut(hwnd) {
-                window.title = String::from_utf8_lossy(&text).into_owned();
+                window.title = crate::win32::unicode::ansi_to_string(&text);
                 window.nc_dirty = true;
             }
             shared.gui.dirty = true;
@@ -2577,7 +2577,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
                 .borrow()
                 .gui
                 .window(hwnd)
-                .map(|w| w.title.as_bytes().to_vec())
+                .map(|w| crate::win32::unicode::string_to_ansi(&w.title))
                 .unwrap_or_default();
             if wparam == 0 {
                 return 0;
@@ -2592,7 +2592,7 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
             .borrow()
             .gui
             .window(hwnd)
-            .map(|w| w.title.len() as u32)
+            .map(|w| crate::win32::unicode::string_to_ansi(&w.title).len() as u32)
             .unwrap_or(0),
         WM_SETFONT => {
             if let Some(window) = ctx.shared.borrow_mut().gui.window_mut(hwnd) {
@@ -5076,7 +5076,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 None
             };
             let title = if args[1] != 0 {
-                Some(String::from_utf8_lossy(&read_cstr(memory, args[1])).into_owned())
+                Some(crate::win32::unicode::ansi_to_string(&read_cstr(memory, args[1])))
             } else {
                 None
             };

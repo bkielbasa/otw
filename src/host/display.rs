@@ -2213,7 +2213,7 @@ fn draw_window(
         title,
         title.x + 4,
         title.y + 3,
-        window.title.as_bytes(),
+        &otw_title_bytes(&window.title),
         HIGHLIGHT_COLOR,
     );
 
@@ -2644,4 +2644,9 @@ mod tests {
         assert_eq!(at(900, 100), (0x00, 0x80, 0x80), "desktop");
         assert_eq!(at(900, 690), (0xC0, 0xC0, 0xC0), "taskbar");
     }
+}
+
+/// A window title as the bitmap font's ANSI text.
+fn otw_title_bytes(title: &str) -> Vec<u8> {
+    crate::win32::unicode::string_to_ansi(title)
 }

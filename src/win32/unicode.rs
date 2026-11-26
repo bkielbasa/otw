@@ -37,13 +37,34 @@ pub const SYMBOLS: [(u16, u8); 12] = [
     (0x02C5, 0x8B), // ˅
 ];
 
+/// Windows-1252 characters in 0x8C-0x9F (the range below holds
+/// `SYMBOLS`): dashes, quotation marks and a few letters.
+pub const CP1252: [(u16, u8); 16] = [
+    (0x0152, 0x8C), // Œ
+    (0x017D, 0x8E), // Ž
+    (0x2018, 0x91), // ‘
+    (0x2019, 0x92), // ’
+    (0x201C, 0x93), // “
+    (0x201D, 0x94), // ”
+    (0x2022, 0x95), // •
+    (0x2013, 0x96), // –
+    (0x2014, 0x97), // —
+    (0x02DC, 0x98), // ˜
+    (0x2122, 0x99), // ™
+    (0x0161, 0x9A), // š
+    (0x203A, 0x9B), // ›
+    (0x0153, 0x9C), // œ
+    (0x017E, 0x9E), // ž
+    (0x0178, 0x9F), // Ÿ
+];
+
 pub fn wide_to_ansi(units: &[u16]) -> Vec<u8> {
     units
         .iter()
         .filter(|&&unit| unit != 0xFEFF) // byte-order mark / zero-width no-break space
         .map(|&unit| match unit {
             0..=0xFF => unit as u8,
-            _ => SYMBOLS.iter().find(|(c, _)| *c == unit).map(|(_, b)| *b).unwrap_or_else(|| {
+            _ => SYMBOLS.iter().chain(CP1252.iter()).find(|(c, _)| *c == unit).map(|(_, b)| *b).unwrap_or_else(|| {
                 if std::env::var_os("OTW_TRACE_UNMAPPED").is_some() {
                     eprintln!("[unicode] no ANSI form for U+{unit:04X}");
                 }
@@ -53,10 +74,20 @@ pub fn wide_to_ansi(units: &[u16]) -> Vec<u8> {
         .collect()
 }
 
+/// ANSI text (Windows-1252, with OTW's symbols) as a Rust string.
+pub fn ansi_to_string(bytes: &[u8]) -> String {
+    String::from_utf16_lossy(&ansi_to_wide(bytes))
+}
+
+/// A Rust string as ANSI text.
+pub fn string_to_ansi(text: &str) -> Vec<u8> {
+    wide_to_ansi(&text.encode_utf16().collect::<Vec<_>>())
+}
+
 pub fn ansi_to_wide(bytes: &[u8]) -> Vec<u16> {
     bytes
         .iter()
-        .map(|&byte| SYMBOLS.iter().find(|(_, b)| *b == byte).map(|(c, _)| *c).unwrap_or(byte as u16))
+        .map(|&byte| SYMBOLS.iter().chain(CP1252.iter()).find(|(_, b)| *b == byte).map(|(c, _)| *c).unwrap_or(byte as u16))
         .collect()
 }
 

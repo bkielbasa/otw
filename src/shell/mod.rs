@@ -1527,7 +1527,7 @@ impl Shell {
         BAR_MENUS
             .iter()
             .map(|label| {
-                let width = text_width(label.as_bytes()) + 12;
+                let width = text_width(&crate::win32::unicode::string_to_ansi(label)) + 12;
                 let rect = Rect::new(x, top + 1, x + width, top + MENU_BAR - 1);
                 x += width;
                 rect
@@ -2418,9 +2418,9 @@ impl Shell {
         for (index, (rect, label)) in self.bar_rects().iter().zip(BAR_MENUS).enumerate() {
             if hot_bar == Some(index) {
                 p.fill(*rect, sys_color(13));
-                p.mnemonic_text(rect.left + 6, rect.top + 2, label.as_bytes(), sys_color(14));
+                p.mnemonic_text(rect.left + 6, rect.top + 2, &crate::win32::unicode::string_to_ansi(label), sys_color(14));
             } else {
-                p.mnemonic_text(rect.left + 6, rect.top + 2, label.as_bytes(), sys_color(7));
+                p.mnemonic_text(rect.left + 6, rect.top + 2, &crate::win32::unicode::string_to_ansi(label), sys_color(7));
             }
         }
         let toolbar_top = r.top + 3 + CAPTION + MENU_BAR;
@@ -2490,7 +2490,7 @@ impl Shell {
                 p.text(
                     left + 5,
                     header.top + 2,
-                    label.as_bytes(),
+                    &crate::win32::unicode::string_to_ansi(label),
                     sys_color(18),
                     false,
                 );
@@ -2674,11 +2674,11 @@ impl Shell {
         self.clock_minute.set(minute);
         let clock = self.clock_rect();
         let text = format!("{hour:02}:{minute:02}");
-        let width = text_width(text.as_bytes());
+        let width = text_width(&crate::win32::unicode::string_to_ansi(&text));
         p.text(
             clock.left + (clock.width() - width) / 2,
             clock.top + (clock.height() - 13) / 2,
-            text.as_bytes(),
+            &crate::win32::unicode::string_to_ansi(&text),
             0x000000,
             false,
         );

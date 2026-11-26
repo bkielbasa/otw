@@ -657,7 +657,7 @@ pub fn sheet_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwn
             let label = text(memory, lparam, msg == 0x479);
             let item = controls::dialog_item_of(ctx, hwnd, ID_FINISH);
             if let Some(window) = ctx.shared.borrow_mut().gui.window_mut(item) {
-                window.title = String::from_utf8_lossy(&label).into_owned();
+                window.title = crate::win32::unicode::ansi_to_string(&label);
             }
             set_button(ctx, memory, hwnd, ID_BACK, false, false);
             set_button(ctx, memory, hwnd, ID_NEXT, false, false);
@@ -668,7 +668,7 @@ pub fn sheet_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwn
         0x46F | 0x478 => {
             let title = text(memory, lparam, msg == 0x478);
             if let Some(window) = ctx.shared.borrow_mut().gui.window_mut(hwnd) {
-                window.title = String::from_utf8_lossy(&title).into_owned();
+                window.title = crate::win32::unicode::ansi_to_string(&title);
                 window.nc_dirty = true;
             }
             answer(0)

@@ -17,6 +17,17 @@ BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 HEIGHTS = [11, 13, 16, 19, 24, 32, 40, 52]
 
 
+# Windows-1252 punctuation and letters in 0x8C-0x9F (0x80-0x8B hold OTW's
+# drawn symbols, see `unicode::SYMBOLS`); Latin-1 elsewhere.
+def glyph_char(code):
+    if 0x8C <= code <= 0x9F:
+        try:
+            return bytes([code]).decode("cp1252")
+        except UnicodeDecodeError:
+            pass
+    return bytes([code]).decode("latin-1")
+
+
 def face(path, cell, bold):
     # Pick the largest point size whose ascent+descent fits the cell.
     size = cell
@@ -30,7 +41,7 @@ def face(path, cell, bold):
     ascent = min(ascent, cell)
     out = bytearray([1 if bold else 0, cell, ascent, 0])
     for code in range(32, 256):
-        ch = bytes([code]).decode("latin-1")
+        ch = glyph_char(code)
         advance = max(1, round(font.getlength(ch)))
         if code == 32:
             advance = max(advance, cell // 4)

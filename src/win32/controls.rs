@@ -157,7 +157,7 @@ fn paint_button<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd:
     let rect = Rect::new(0, 0, cw, ch);
     let focused = ctx.shared.borrow().gui.focus_hwnd == hwnd;
     let disabled = window.disabled;
-    let text = window.title.as_bytes().to_vec();
+    let text = crate::win32::unicode::string_to_ansi(&window.title);
     select_font(ctx, hwnd, hdc);
     match kind {
         0 | 1 => {
@@ -656,7 +656,7 @@ fn static_proc<M: GuestMemory + ?Sized>(
                         memory,
                         hdc,
                         rect,
-                        window.title.as_bytes(),
+                        &crate::win32::unicode::string_to_ansi(&window.title),
                         align | wrap | prefix | 0x40,
                     );
                 }
@@ -4186,7 +4186,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                     {
                         w.text.clone()
                     } else {
-                        w.title.as_bytes().to_vec()
+                        crate::win32::unicode::string_to_ansi(&w.title)
                     }
                 })
                 .unwrap_or_default();
