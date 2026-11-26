@@ -382,7 +382,7 @@ pub fn preempt(ctx: &ApiContext, memory: &mut dyn GuestMemory) -> bool {
     if memory.suspend_thread() {
         return true;
     }
-    if !memory.callback_levels().is_empty() {
+    if !memory.callback_levels().is_empty() || memory.waiting_threads().is_empty() {
         // Not from inside a callback the subsystem made (a window
         // procedure it is running), only from the thread's own code.
         return false;

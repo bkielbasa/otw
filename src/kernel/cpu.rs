@@ -2496,14 +2496,18 @@ mod api_stats {
             if last.elapsed() >= Duration::from_secs(15) {
                 stats.1 = Some(Instant::now());
                 let mut rows: Vec<(&String, &(u64, Duration))> = stats.0.iter().collect();
-                rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                if std::env::var_os("OTW_STATS_BY_COUNT").is_some() {
+                    rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+                } else {
+                    rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                }
                 let calls: u64 = stats.0.values().map(|v| v.0).sum();
                 eprintln!(
                     "[stats] {} after {:.0?}: {calls} calls",
                     std::thread::current().name().unwrap_or("main"),
                     begun.elapsed()
                 );
-                for (name, (count, total)) in rows.into_iter().take(12) {
+                for (name, (count, total)) in rows.into_iter().take(20) {
                     eprintln!("[stats]   {name:<36} {count:>9} calls {total:>10.2?}");
                 }
             }

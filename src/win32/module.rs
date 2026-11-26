@@ -164,7 +164,9 @@ pub fn load_library<M: GuestMemory + ?Sized>(
             if genuine.is_none() && trace() && !crate::win32::has_implementation(&dll.dll, name) {
                 eprintln!("[module] {file}: missing {}!{}", dll.dll, name.display());
             }
-            let address = genuine.unwrap_or_else(|| import_thunk(ctx, &dll.dll, name));
+            let address = genuine
+                .or_else(|| name.as_str().and_then(|n| crate::win32::ucrt::native_address(ctx, memory, &dll.dll, n)))
+                .unwrap_or_else(|| import_thunk(ctx, &dll.dll, name));
             let size = memory.ptr_size();
             let slot = base
                 .wrapping_add(dll.first_thunk_rva)
@@ -291,6 +293,9 @@ pub fn proc_address<M: GuestMemory + ?Sized>(
             ImportName::ByName(name) => name.clone(),
             ImportName::Ordinal(ordinal) => format!("#{ordinal}"),
         };
+        if let Some(native) = crate::win32::ucrt::native_address(ctx, memory, dll, &name) {
+            return Some(native);
+        }
         return kernel32::dynamic_thunk(ctx, dll, &name);
     }
     let forward = {

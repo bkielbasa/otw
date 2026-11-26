@@ -2376,7 +2376,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             }
             let _ = memory.write_bytes(bits, &vec![0u8; size as usize]);
             if args[3] != 0 {
-                let _ = memory.write_u32(args[3], bits);
+                let _ = memory.write_ptr(args[3], bits as u64);
             }
             let colors = if info.bpp <= 8 {
                 info.colors.clone()
