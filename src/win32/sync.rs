@@ -51,6 +51,29 @@ pub struct Wait {
     /// The timeout the wait was made with (to tell the same call made
     /// again from another).
     timeout: u32,
+    /// A slim reader/writer lock to take (shared or exclusive).
+    srw: u32,
+    srw_exclusive: bool,
+    /// A wake-up on this address (condition variable, WakeByAddress*)
+    /// ends the wait: the address's wake count when it began.
+    wake_key: u32,
+    wake_count: u64,
+}
+
+/// A slim reader/writer lock that is held.
+#[derive(Clone, Copy, Debug, Default)]
+struct Srw {
+    /// The thread holding it exclusively, or 0.
+    exclusive: u32,
+    shared: u32,
+}
+
+/// Wake-ups of a condition variable or address: all waiters (a count),
+/// or single ones not yet taken.
+#[derive(Clone, Copy, Debug, Default)]
+struct Wakes {
+    all: u64,
+    single: u32,
 }
 
 fn address_changed<M: GuestMemory + ?Sized>(memory: &mut M, wait: &Wait) -> bool {
@@ -61,7 +84,8 @@ fn address_changed<M: GuestMemory + ?Sized>(memory: &mut M, wait: &Wait) -> bool
 /// `compare` or the timeout passes. Returns whether it changed (or the
 /// thread came off the CPU, to make the call again).
 pub fn wait_on_address<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address: u32, compare: Vec<u8>, timeout: u32) -> bool {
-    let spec = Wait { address, compare, ..Wait::default() };
+    let wake_count = ctx.shared.borrow().sync.wakes.get(&address).map(|w| w.all).unwrap_or(0);
+    let spec = Wait { address, compare, wake_key: address, wake_count, ..Wait::default() };
     !matches!(wait(ctx, memory, spec, timeout), Outcome::Timeout)
 }
 
@@ -77,6 +101,10 @@ pub struct SyncState {
     waits: HashMap<u32, Wait>,
     /// Threads created suspended, not yet resumed.
     suspended: HashSet<u32>,
+    /// Slim reader/writer locks that are held, by address.
+    srw: HashMap<u32, Srw>,
+    /// Wake-ups by address.
+    wakes: HashMap<u32, Wakes>,
     /// Thread-local storage of threads other than the first, by (thread, slot).
     tls: HashMap<(u32, u32), u32>,
     /// Start routines of new threads, by start token.
@@ -91,6 +119,17 @@ pub struct SyncState {
     preempting: bool,
     /// The last error of each thread off the CPU.
     last_errors: HashMap<u32, u32>,
+}
+
+impl SyncState {
+    /// A thread's last error.
+    pub fn last_error_of(&self, thread: u32) -> u32 {
+        self.last_errors.get(&thread).copied().unwrap_or(0)
+    }
+
+    pub fn set_last_error_of(&mut self, thread: u32, error: u32) {
+        self.last_errors.insert(thread, error);
+    }
 }
 
 pub fn arg_count(name: &str) -> Option<usize> {
@@ -249,6 +288,101 @@ fn try_wait(sync: &mut SyncState, wait: &Wait, thread: u32) -> Option<u32> {
     Some(index as u32)
 }
 
+/// Take a slim reader/writer lock if it is free.
+fn srw_take(sync: &mut SyncState, lock: u32, exclusive: bool, thread: u32) -> bool {
+    let entry = sync.srw.entry(lock).or_default();
+    let free = entry.exclusive == 0 && (!exclusive || entry.shared == 0);
+    if free {
+        if exclusive {
+            entry.exclusive = thread;
+        } else {
+            entry.shared += 1;
+        }
+    } else if entry.exclusive == 0 && entry.shared == 0 {
+        sync.srw.remove(&lock);
+    }
+    free
+}
+
+fn srw_free(sync: &SyncState, lock: u32, exclusive: bool) -> bool {
+    sync.srw.get(&lock).is_none_or(|e| e.exclusive == 0 && (!exclusive || e.shared == 0))
+}
+
+/// Whether a wake-up came for a wait (taking a single one).
+fn woken(sync: &mut SyncState, wait: &Wait) -> bool {
+    if wait.wake_key == 0 {
+        return false;
+    }
+    let Some(wakes) = sync.wakes.get_mut(&wait.wake_key) else {
+        return false;
+    };
+    if wakes.all != wait.wake_count {
+        return true;
+    }
+    if wakes.single > 0 {
+        wakes.single -= 1;
+        return true;
+    }
+    false
+}
+
+/// AcquireSRWLock*: take the lock, waiting while another holds it.
+pub fn srw_acquire<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, lock: u32, exclusive: bool) -> bool {
+    let thread = memory.current_thread();
+    if srw_take(&mut ctx.shared.borrow_mut().sync, lock, exclusive, thread) {
+        return true;
+    }
+    let spec = Wait { srw: lock, srw_exclusive: exclusive, ..Wait::default() };
+    matches!(wait(ctx, memory, spec, INFINITE), Outcome::Signaled(_))
+}
+
+/// TryAcquireSRWLock*.
+pub fn srw_try(ctx: &ApiContext, thread: u32, lock: u32, exclusive: bool) -> bool {
+    srw_take(&mut ctx.shared.borrow_mut().sync, lock, exclusive, thread)
+}
+
+/// ReleaseSRWLock*.
+pub fn srw_release(ctx: &ApiContext, lock: u32, exclusive: bool) {
+    {
+        let mut shared = ctx.shared.borrow_mut();
+        if let Some(entry) = shared.sync.srw.get_mut(&lock) {
+            if exclusive {
+                entry.exclusive = 0;
+            } else {
+                entry.shared = entry.shared.saturating_sub(1);
+            }
+            if entry.exclusive == 0 && entry.shared == 0 {
+                shared.sync.srw.remove(&lock);
+            }
+        }
+    }
+    crate::win32::kobj::notify();
+}
+
+/// WakeConditionVariable / WakeByAddressSingle (`all` false) and the
+/// wake-all forms.
+pub fn wake(ctx: &ApiContext, key: u32, all: bool) {
+    {
+        let mut shared = ctx.shared.borrow_mut();
+        let wakes = shared.sync.wakes.entry(key).or_default();
+        if all {
+            wakes.all += 1;
+            wakes.single = 0;
+        } else {
+            wakes.single = wakes.single.saturating_add(1).min(64);
+        }
+    }
+    crate::win32::kobj::notify();
+}
+
+/// Sleep on a condition variable (or address) until woken or the timeout
+/// passes. Returns whether it was woken.
+pub fn sleep_on<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, key: u32, timeout: u32) -> bool {
+    let wake_count = ctx.shared.borrow().sync.wakes.get(&key).map(|w| w.all).unwrap_or(0);
+    let spec = Wait { wake_key: key, wake_count, ..Wait::default() };
+    !matches!(wait(ctx, memory, spec, timeout), Outcome::Timeout)
+}
+
 fn section_free<M: GuestMemory + ?Sized>(memory: &mut M, section: u32, thread: u32) -> bool {
     let owner = memory.read_u32(section + 12).unwrap_or(0);
     owner == 0 || owner == thread
@@ -282,6 +416,15 @@ fn ready<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, thread: u32,
     }
     if wait.section != 0 {
         return section_free(memory, wait.section, thread);
+    }
+    if wait.srw != 0 {
+        return srw_free(&ctx.shared.borrow().sync, wait.srw, wait.srw_exclusive);
+    }
+    if wait.wake_key != 0 {
+        let wakes = ctx.shared.borrow().sync.wakes.get(&wait.wake_key).copied().unwrap_or_default();
+        if wakes.all != wait.wake_count || wakes.single > 0 {
+            return true;
+        }
     }
     if wait.address != 0 {
         return address_changed(memory, &wait);
@@ -327,20 +470,7 @@ pub fn run_ready_threads<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut
         }
         match outcome {
             Some(ThreadRun::Exited(code)) => {
-                let mut shared = ctx.shared.borrow_mut();
-                shared.sync.waits.remove(&thread);
-                shared.sync.tls.retain(|(t, _), _| *t != thread);
-                for object in shared.sync.objects.values_mut() {
-                    match object {
-                        Object::Thread { id, exit } if *id == thread => *exit = Some(code),
-                        // A mutex its owner left behind is abandoned (free).
-                        Object::Mutex { owner, count } if *owner == thread => {
-                            *owner = 0;
-                            *count = 0;
-                        }
-                        _ => {}
-                    }
-                }
+                thread_exited(ctx, thread, code);
                 ran = true;
             }
             Some(ThreadRun::Waiting) => ran = true,
@@ -348,6 +478,34 @@ pub fn run_ready_threads<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut
         }
     }
     ran
+}
+
+/// A thread ended: its handle is signalled, its waits and thread-local
+/// storage go, mutexes it held are abandoned.
+pub fn thread_exited(ctx: &ApiContext, thread: u32, code: u32) {
+    {
+        let mut shared = ctx.shared.borrow_mut();
+        shared.sync.waits.remove(&thread);
+        shared.sync.tls.retain(|(t, _), _| *t != thread);
+        shared.sync.last_errors.remove(&thread);
+        for object in shared.sync.objects.values_mut() {
+            match object {
+                Object::Thread { id, exit } if *id == thread => *exit = Some(code),
+                // A mutex its owner left behind is abandoned (free).
+                Object::Mutex { owner, count } if *owner == thread => {
+                    *owner = 0;
+                    *count = 0;
+                }
+                _ => {}
+            }
+        }
+    }
+    crate::win32::kobj::notify();
+}
+
+/// Whether a thread was created suspended and is not yet resumed.
+pub fn thread_suspended(ctx: &ApiContext, thread: u32) -> bool {
+    ctx.shared.borrow().sync.suspended.contains(&thread)
 }
 
 /// Note the exit codes of started programs that have ended.
@@ -589,6 +747,8 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
                 && p.messages == wait.messages
                 && p.section == wait.section
                 && p.address == wait.address
+                && p.srw == wait.srw
+                && p.wake_key == wait.wake_key
                 && p.timeout == timeout
         });
     wait.timeout = timeout;
@@ -622,7 +782,7 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         if crate::win32::kobj::terminated(me) {
             // Another process ended this one: stop here for good.
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                crate::kernel::lock::unlocked(|| std::thread::sleep(std::time::Duration::from_secs(1)));
             }
         }
         {
@@ -635,10 +795,16 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         if wait.section != 0 && section_free(memory, wait.section, thread) {
             return Outcome::Signaled(0);
         }
+        if wait.srw != 0 && srw_take(&mut ctx.shared.borrow_mut().sync, wait.srw, wait.srw_exclusive, thread) {
+            return Outcome::Signaled(0);
+        }
+        if woken(&mut ctx.shared.borrow_mut().sync, &wait) {
+            return Outcome::Signaled(0);
+        }
         if address_changed(memory, &wait) {
             return Outcome::Signaled(0);
         }
-        if wait.messages && !memory.has_host() && ctx.shared.borrow().x64 {
+        if wait.messages && !memory.has_host() && !memory.is_worker() && ctx.shared.borrow().x64 {
             // Headless, scripted input (OTW_INPUT) stands in for the
             // host's, also while other threads keep running. (Only for
             // 64-bit programs, which wait in MsgWaitForMultipleObjects
@@ -673,7 +839,7 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             memory.pump(true);
             continue;
         }
-        if memory.waiting_threads().is_empty() && wait.deadline.is_none() && !wait.messages {
+        if memory.waiting_threads().is_empty() && wait.deadline.is_none() && !wait.messages && !memory.others_running() {
             if std::env::var_os("OTW_TRACE_THREADS").is_some() {
                 eprintln!("[thread] {thread} wait on {:?}: nothing else can run; it succeeds", wait.handles);
             }
@@ -689,7 +855,7 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         } else {
             let remaining = wait.deadline.map(|d| d.saturating_sub(now)).unwrap_or(10);
             // Until another process changes something, or a while.
-            crate::win32::kobj::wait_change(generation, std::time::Duration::from_millis(remaining.clamp(1, 10)));
+            crate::kernel::lock::unlocked(|| crate::win32::kobj::wait_change(generation, std::time::Duration::from_millis(remaining.clamp(1, 10))));
         }
     }
 }
@@ -816,13 +982,14 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         "Sleep" | "SleepEx" => {
             if args[0] == 0 {
                 run_ready_threads(ctx, memory);
+                crate::kernel::lock::unlocked(std::thread::yield_now);
                 return ok(0);
             }
             let spec = Wait::default();
             let timeout = args[0];
-            if memory.waiting_threads().is_empty() && memory.current_thread() == 1 {
+            if memory.waiting_threads().is_empty() && memory.current_thread() == 1 && !memory.others_running() {
                 // Alone: sleep a little, as before threads.
-                std::thread::sleep(std::time::Duration::from_millis(timeout.min(50) as u64));
+                crate::kernel::lock::unlocked(|| std::thread::sleep(std::time::Duration::from_millis(timeout.min(50) as u64)));
                 return ok(0);
             }
             let _ = wait(ctx, memory, spec, timeout);

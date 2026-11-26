@@ -21,6 +21,8 @@ use std::{
 struct Owner {
     thread: Option<ThreadId>,
     depth: usize,
+    /// The owner's name (OTW_TRACE_LOCK).
+    name: String,
 }
 
 #[derive(Default)]
@@ -30,13 +32,29 @@ pub struct BigLock {
 }
 
 thread_local! {
-    /// The locks this host thread holds, innermost last.
-    static HELD: RefCell<Vec<Arc<BigLock>>> = const { RefCell::new(Vec::new()) };
+    /// The processes this host thread is in the system for (entered with
+    /// a `Hold`), innermost last: the one whose waits give up its lock.
+    static ACTIVE: RefCell<Vec<Arc<BigLock>>> = const { RefCell::new(Vec::new()) };
 }
 
 impl BigLock {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        let lock = Arc::new(Self::default());
+        if std::env::var_os("OTW_TRACE_LOCK").is_some() {
+            static LOCKS: Mutex<Vec<std::sync::Weak<BigLock>>> = Mutex::new(Vec::new());
+            static WATCH: std::sync::Once = std::sync::Once::new();
+            LOCKS.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::downgrade(&lock));
+            WATCH.call_once(|| {
+                std::thread::spawn(|| loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    for lock in LOCKS.lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(std::sync::Weak::upgrade) {
+                        let owner = lock.owner.lock().unwrap_or_else(|p| p.into_inner());
+                        eprintln!("[lock] {:p}: held by {:?} ({}) depth {}", Arc::as_ptr(&lock), owner.thread, owner.name, owner.depth);
+                    }
+                });
+            });
+        }
+        lock
     }
 
     /// Take the lock (again, if this host thread holds it).
@@ -46,11 +64,11 @@ impl BigLock {
         while owner.thread.is_some_and(|t| t != me) {
             owner = self.free.wait(owner).unwrap_or_else(|p| p.into_inner());
         }
+        if owner.thread.is_none() && std::env::var_os("OTW_TRACE_LOCK").is_some() {
+            owner.name = std::thread::current().name().unwrap_or("?").to_string();
+        }
         owner.thread = Some(me);
         owner.depth += 1;
-        if owner.depth == 1 {
-            HELD.with(|held| held.borrow_mut().push(self.clone()));
-        }
     }
 
     /// Give up one hold.
@@ -63,12 +81,6 @@ impl BigLock {
         if owner.depth == 0 {
             owner.thread = None;
             self.free.notify_one();
-            HELD.with(|held| {
-                let mut held = held.borrow_mut();
-                if let Some(index) = held.iter().rposition(|l| Arc::ptr_eq(l, self)) {
-                    held.remove(index);
-                }
-            });
         }
     }
 
@@ -96,10 +108,10 @@ impl BigLock {
     }
 }
 
-/// Run `f` without the innermost process lock this host thread holds
-/// (sleeping, waiting for another thread or process).
+/// Run `f` without the lock of the process this host thread is in the
+/// system for (sleeping, waiting for another thread or process).
 pub fn unlocked<R>(f: impl FnOnce() -> R) -> R {
-    let lock = HELD.with(|held| held.borrow().last().cloned());
+    let lock = ACTIVE.with(|active| active.borrow().last().cloned());
     match lock {
         Some(lock) => {
             let depth = lock.release_all();
@@ -115,14 +127,22 @@ pub fn unlocked<R>(f: impl FnOnce() -> R) -> R {
 pub struct Hold(Arc<BigLock>);
 
 impl Hold {
+    /// Take the lock and be in the system for its process.
     pub fn new(lock: &Arc<BigLock>) -> Self {
         lock.acquire();
+        ACTIVE.with(|active| active.borrow_mut().push(lock.clone()));
         Self(lock.clone())
     }
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            if let Some(index) = active.iter().rposition(|l| Arc::ptr_eq(l, &self.0)) {
+                active.remove(index);
+            }
+        });
         self.0.release();
     }
 }

@@ -564,19 +564,30 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             })
         }
         // ── Locks, one-time initialisation (the native names) ──
-        "RtlAcquireSRWLockExclusive" | "RtlAcquireSRWLockShared" | "RtlReleaseSRWLockExclusive"
-        | "RtlReleaseSRWLockShared" | "RtlWakeAllConditionVariable" | "RtlWakeConditionVariable"
-        | "WakeByAddressAll" | "WakeByAddressSingle" => ok(0),
+        "RtlAcquireSRWLockExclusive" | "RtlAcquireSRWLockShared" => {
+            crate::win32::sync::srw_acquire(ctx, memory, p(0), name.ends_with("Exclusive"));
+            ok(0)
+        }
+        "RtlReleaseSRWLockExclusive" | "RtlReleaseSRWLockShared" => {
+            crate::win32::sync::srw_release(ctx, p(0), name.ends_with("Exclusive"));
+            ok(0)
+        }
+        "RtlWakeAllConditionVariable" | "RtlWakeConditionVariable" | "WakeByAddressAll" | "WakeByAddressSingle" => {
+            crate::win32::sync::wake(ctx, p(0), name.ends_with("All") || name == "RtlWakeAllConditionVariable");
+            ok(0)
+        }
         "RtlInitializeSRWLock" | "RtlInitializeConditionVariable" | "RtlRunOnceInitialize" => {
             let _ = memory.write_ptr(p(0), 0);
             ok(0)
         }
         "RtlSleepConditionVariableSRW" => {
-            // (condition, lock, timeout*, flags): a spurious wake-up after
-            // the others ran.
-            let timeout = if p(2) == 0 { u32::MAX } else { (memory.read_u64(p(2)).unwrap_or(0) as i64).unsigned_abs() as u32 / 10_000 };
-            win32(ctx, memory, "KERNEL32.dll", "Sleep", &[timeout.min(10)]);
-            ok(STATUS_SUCCESS)
+            // (condition, lock, timeout*, flags)
+            let timeout = if p(2) == 0 { u32::MAX } else { ((memory.read_u64(p(2)).unwrap_or(0) as i64).unsigned_abs() / 10_000).min(u32::MAX as u64 - 1) as u32 };
+            let exclusive = p(3) & 1 == 0;
+            crate::win32::sync::srw_release(ctx, p(1), exclusive);
+            let woken = crate::win32::sync::sleep_on(ctx, memory, p(0), timeout);
+            crate::win32::sync::srw_acquire(ctx, memory, p(1), exclusive);
+            ok(if woken { STATUS_SUCCESS } else { 0x102 }) // STATUS_TIMEOUT
         }
         "RtlRunOnceBeginInitialize" => {
             let state = memory.read_ptr(p(0)).unwrap_or(0);
@@ -591,12 +602,19 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(STATUS_SUCCESS)
         }
         "RtlRunOnceExecuteOnce" => {
-            if memory.read_ptr(p(0)).unwrap_or(0) == 2 {
-                return ok(STATUS_SUCCESS);
+            loop {
+                match memory.read_ptr(p(0)).unwrap_or(0) {
+                    2 => return ok(STATUS_SUCCESS),
+                    1 if memory.others_running() => {
+                        win32(ctx, memory, "KERNEL32.dll", "Sleep", &[1]);
+                    }
+                    _ => break,
+                }
             }
+            let _ = memory.write_ptr(p(0), 1);
             let result = memory.call_guest_wide(p(1), &[arg(0), arg(2), arg(3)]).unwrap_or(0) as u32;
+            let _ = memory.write_ptr(p(0), if result != 0 { 2 } else { 0 });
             if result != 0 {
-                let _ = memory.write_ptr(p(0), 2);
                 ok(STATUS_SUCCESS)
             } else {
                 ok(0xC000_0001)

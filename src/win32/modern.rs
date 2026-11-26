@@ -106,19 +106,45 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             let _ = memory.write_ptr(args[0], 0);
             ok(0)
         }
-        "AcquireSRWLockExclusive" | "AcquireSRWLockShared" | "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared"
-        | "WakeAllConditionVariable" | "WakeConditionVariable" => ok(0),
-        "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" => ok(1),
+        "AcquireSRWLockExclusive" | "AcquireSRWLockShared" => {
+            crate::win32::sync::srw_acquire(ctx, memory, args[0], name.ends_with("Exclusive"));
+            ok(0)
+        }
+        "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared" => {
+            crate::win32::sync::srw_release(ctx, args[0], name.ends_with("Exclusive"));
+            ok(0)
+        }
+        "WakeAllConditionVariable" | "WakeConditionVariable" => {
+            crate::win32::sync::wake(ctx, args[0], name == "WakeAllConditionVariable");
+            ok(0)
+        }
+        "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" => {
+            let thread = memory.current_thread();
+            ok(u32::from(crate::win32::sync::srw_try(ctx, thread, args[0], name.ends_with("Exclusive"))))
+        }
         "SleepConditionVariableSRW" | "SleepConditionVariableCS" => {
-            if args[1] != 0 && name == "SleepConditionVariableCS" {
-                call(ctx, memory, "KERNEL32.dll", "LeaveCriticalSection", &[args[1]]);
+            // (condition, lock, timeout[, flags]): give up the lock, sleep
+            // until woken, take the lock again.
+            let shared_mode = name == "SleepConditionVariableSRW" && args[3] & 1 != 0;
+            if args[1] != 0 {
+                if name == "SleepConditionVariableCS" {
+                    call(ctx, memory, "KERNEL32.dll", "LeaveCriticalSection", &[args[1]]);
+                } else {
+                    crate::win32::sync::srw_release(ctx, args[1], !shared_mode);
+                }
             }
-            let timeout = args[2];
-            call(ctx, memory, "KERNEL32.dll", "Sleep", &[if timeout == INVALID { 10 } else { timeout.min(10) }]);
-            if args[1] != 0 && name == "SleepConditionVariableCS" {
-                call(ctx, memory, "KERNEL32.dll", "EnterCriticalSection", &[args[1]]);
+            let woken = crate::win32::sync::sleep_on(ctx, memory, args[0], args[2]);
+            if args[1] != 0 {
+                if name == "SleepConditionVariableCS" {
+                    call(ctx, memory, "KERNEL32.dll", "EnterCriticalSection", &[args[1]]);
+                } else {
+                    crate::win32::sync::srw_acquire(ctx, memory, args[1], !shared_mode);
+                }
             }
-            ok(1)
+            if !woken {
+                ctx.shared.borrow_mut().last_error = 1460; // ERROR_TIMEOUT
+            }
+            ok(u32::from(woken))
         }
         // One-time initialisation: the INIT_ONCE holds 0 (not started), 1
         // (running) or 2 (done).
@@ -127,6 +153,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(0)
         }
         "InitOnceBeginInitialize" => {
+            // Another thread's initialisation runs: wait for its end.
+            while memory.read_ptr(args[0]).unwrap_or(0) == 1 && args[1] & 2 == 0 && memory.others_running() {
+                call(ctx, memory, "KERNEL32.dll", "Sleep", &[1]);
+            }
             let state = memory.read_ptr(args[0]).unwrap_or(0);
             let pending = state != 2;
             if pending {
@@ -144,13 +174,20 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(1)
         }
         "InitOnceExecuteOnce" => {
-            if memory.read_ptr(args[0]).unwrap_or(0) == 2 {
-                return ok(1);
+            loop {
+                match memory.read_ptr(args[0]).unwrap_or(0) {
+                    2 => return ok(1),
+                    // Another thread runs the initialisation.
+                    1 if memory.others_running() => {
+                        call(ctx, memory, "KERNEL32.dll", "Sleep", &[1]);
+                    }
+                    _ => break,
+                }
             }
+            let _ = memory.write_ptr(args[0], 1);
             let result = memory.call_guest(args[1], &[args[0], args[2], args[3]]).unwrap_or(0);
-            if result != 0 {
-                let _ = memory.write_ptr(args[0], 2);
-            }
+            let _ = memory.write_ptr(args[0], if result != 0 { 2 } else { 0 });
+            crate::win32::kobj::notify();
             ok(result)
         }
         // Thread-pool work runs at once on the submitting thread.

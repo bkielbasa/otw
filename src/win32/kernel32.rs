@@ -456,7 +456,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             ))
         }
         "Sleep" => {
-            std::thread::sleep(std::time::Duration::from_millis(args[0].min(50) as u64));
+            crate::kernel::lock::unlocked(|| std::thread::sleep(std::time::Duration::from_millis(args[0].min(50) as u64)));
             ok(0)
         }
         "GetCurrentProcess" => ok(0xFFFF_FFFF),

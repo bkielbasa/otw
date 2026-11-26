@@ -200,6 +200,8 @@ struct RunState<'a> {
     cursor: Option<Cursor>,
     /// This CPU runs one thread on a host thread of its own.
     worker: bool,
+    /// How to make a CPU for another thread.
+    recipe: Option<Rc<Recipe>>,
     exit_code: Option<u32>,
     api_calls: usize,
     error: Option<String>,
@@ -253,6 +255,7 @@ impl<'a> RunState<'a> {
             process,
             cursor: None,
             worker: false,
+            recipe: None,
             exit_code: None,
             api_calls: 0,
             error: None,
@@ -659,10 +662,20 @@ fn emulate(
     timeout: u64,
     count: usize,
 ) -> Result<(), uc_error> {
-    let mut result = uc.emu_start(begin as u64, until as u64, timeout, count);
+    // Guest code runs without the subsystem lock (other threads of the
+    // process may be in the system meanwhile).
+    let lock = state.borrow().process.lock.clone();
+    sync_space(uc, state);
+    let run = |uc: &mut Unicorn<'_, ()>, from: u64| {
+        let depth = lock.release_all();
+        let result = uc.emu_start(from, until as u64, timeout, count);
+        lock.reacquire(depth);
+        result
+    };
+    let mut result = run(uc, begin as u64);
     while result.is_err() && deliver_fault(uc, state) {
         let eip = uc.reg_read(Reg::EIP).unwrap_or(0);
-        result = uc.emu_start(eip, until as u64, timeout, count);
+        result = run(uc, eip);
     }
     if result.is_err() {
         let mut run = state.borrow_mut();
@@ -922,6 +935,12 @@ impl UnicornGuestMemory<'_, '_, '_, '_> {
         install_tls(self.uc, run, &templates, teb, true).ok()?;
         let rsp = ((top - 0x40) & !0xF) - 8;
         self.uc.mem_write(rsp as u64, &(thread_return as u64).to_le_bytes()).ok()?;
+        if process.parallel {
+            // A CPU and a host thread of its own.
+            self.uc.context_restore(&current).ok()?;
+            process.tibs().push((id, teb));
+            return spawn_worker(run, id, entry, param, rsp, teb).then_some(id);
+        }
         for register in SAVED_REGISTERS_64 {
             self.uc.reg_write(register, 0).ok()?;
         }
@@ -1282,7 +1301,7 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             return false;
         };
         let mut state = run.borrow_mut();
-        if state.running.len() < 2 || !state.levels.is_empty() || state.resume.is_some() {
+        if state.worker || state.running.len() < 2 || !state.levels.is_empty() || state.resume.is_some() {
             if std::env::var_os("OTW_TRACE_THREADS").is_some() {
                 eprintln!("[thread] cannot suspend: running {:?}, levels {:?}", state.running, state.levels);
             }
@@ -1297,11 +1316,22 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             return false;
         };
         let mut state = run.borrow_mut();
-        if state.running.len() < 2 || !state.levels.is_empty() {
+        if (!state.worker && state.running.len() < 2) || !state.levels.is_empty() {
             return false;
         }
         state.thread_signal = Some(ThreadSignal::Exit(code));
         true
+    }
+
+    fn is_worker(&self) -> bool {
+        self.run.is_some_and(|run| run.borrow().worker)
+    }
+
+    fn others_running(&self) -> bool {
+        self.run.is_some_and(|run| {
+            let state = run.borrow();
+            state.worker || !state.process.engines.lock().map(|e| e.is_empty()).unwrap_or(true)
+        })
     }
 
     fn xmm(&mut self, index: usize) -> u64 {
@@ -1429,7 +1459,11 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         self.run
             .map(|run| {
                 let state = run.borrow();
-                state.exit_code.is_some() || state.error.is_some() || state.resume.is_some()
+                state.exit_code.is_some()
+                    || state.error.is_some()
+                    || state.resume.is_some()
+                    || (state.worker && state.process.ending.load(Ordering::SeqCst))
+                    || (!state.worker && state.process.exit_request.lock().is_ok_and(|r| r.is_some()))
             })
             .unwrap_or(false)
     }
@@ -1668,10 +1702,10 @@ impl Drop for Process<'_> {
         // The other threads stop; the space forgets this CPU; the host
         // thread gives up the process's lock.
         process.end();
+        let _hold = super::lock::Hold::new(&process.lock);
         if let Some(cursor) = self.state.borrow().cursor {
             process.space.detach(cursor);
         }
-        process.lock.release_all();
     }
 }
 
@@ -1690,6 +1724,10 @@ impl<'a> Process<'a> {
 
     /// Run until the program exits (`Some`) or yields (`None`).
     pub fn resume(&mut self) -> Result<Option<RunResult>, RunError> {
+        // In the system for this process (the lock is given up while its
+        // guest code runs).
+        let lock = self.state.borrow().process.lock.clone();
+        let _hold = super::lock::Hold::new(&lock);
         let begin = if self.started {
             let eip = self.uc.reg_read(Reg::EIP).unwrap_or(0) as u32;
             if eip == YIELD_ADDRESS {
@@ -1782,258 +1820,145 @@ impl<'a> Process<'a> {
     }
 }
 
-fn build<'a>(
-    process: &Image,
-    syscalls: Rc<dyn SystemCalls>,
-    pump: Option<Box<dyn FnMut(bool) + 'a>>,
-) -> Result<Process<'a>, RunError> {
-    let image = process.main();
-    let iat = &process.iat;
-
-    let x64 = image.is64;
-    let mut uc = Unicorn::new(Arch::X86, if x64 { Mode::MODE_64 } else { Mode::MODE_32 })
-        .map_err(|error| RunError::Unicorn("creating the CPU", error))?;
-    hide_sse42(&mut uc).map_err(|error| RunError::Unicorn("hooking CPUID", error))?;
-    // 64-bit programs' threads each get a CPU and a host thread of their
-    // own (OTW_SERIAL_THREADS=1 keeps them taking turns on one).
-    let parallel = x64 && std::env::var_os("OTW_SERIAL_THREADS").is_none();
-    let process_shared = ProcessShared::new(parallel);
-    // The first thread holds the subsystem lock except while it runs
-    // guest code.
-    process_shared.lock.acquire();
-    let state = Rc::new(RefCell::new(RunState::new(process_shared.clone())));
-    {
-        let cursor = process_shared.space.attach(&mut uc);
-        state.borrow_mut().cursor = Some(cursor);
-        state.borrow_mut().x64 = x64;
-    }
-
-    for module in &process.modules {
-        let image_start = align_down(module.image.image_base, PAGE_SIZE);
-        let image_end = align_up(
-            module
-                .image
-                .image_base
-                .wrapping_add(module.memory.len() as u32),
-            PAGE_SIZE,
-        );
-        map_in(&mut uc, &state, image_start as u64,
-            (image_end - image_start) as u64)
-        .map_err(|error| RunError::Unicorn("mapping guest image", error))?;
-        uc.mem_write(module.image.image_base as u64, &module.memory)
-            .map_err(|error| RunError::Unicorn("writing guest image", error))?;
-    }
-
-    map_in(&mut uc, &state, SENTINEL_BASE as u64, PAGE_SIZE as u64)
-        .map_err(|error| RunError::Unicorn("mapping DllMain sentinel", error))?;
-    uc.mem_write(SENTINEL_BASE as u64, &[0xC3])
-        .map_err(|error| RunError::Unicorn("writing DllMain sentinel", error))?;
-    uc.mem_write(YIELD_ADDRESS as u64, &[0xC3])
-        .map_err(|error| RunError::Unicorn("writing yield address", error))?;
-    uc.mem_write(THREAD_STOP as u64, &[0xC3])
-        .map_err(|error| RunError::Unicorn("writing thread stop address", error))?;
-
-    // A 64-bit program's first thread gets nearly 2 MiB of stack (current
-    // programs check for at least 1 MiB), from 64 KiB up.
-    let stack_low = if x64 { X64_STACK_LOW } else { STACK_BASE };
-    map_in(&mut uc, &state, stack_low as u64, (STACK_BASE + STACK_SIZE - stack_low) as u64)
-        .map_err(|error| RunError::Unicorn("mapping guest stack", error))?;
-
-    // The heap's range, except where a program image already lies in it.
-    let mut images: Vec<(u32, u32)> = process
-        .modules
-        .iter()
-        .map(|module| {
-            let start = align_down(module.image.image_base, PAGE_SIZE);
-            (start, align_up(module.image.image_base + module.memory.len() as u32, PAGE_SIZE))
-        })
-        .filter(|&(start, end)| start < HEAP_BASE + HEAP_SIZE && end > HEAP_BASE)
-        .collect();
-    images.sort();
-    let mut cursor = HEAP_BASE;
-    for (start, end) in images.into_iter().chain([(HEAP_BASE + HEAP_SIZE, HEAP_BASE + HEAP_SIZE)]) {
-        if start > cursor {
-            map_in(&mut uc, &state, cursor as u64, (start - cursor) as u64)
-                .map_err(|error| RunError::Unicorn("mapping guest heap", error))?;
-        }
-        cursor = cursor.max(end);
-    }
-    if x64 {
-        map_in(&mut uc, &state, memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64)
-            .map_err(|error| RunError::Unicorn("mapping the 64-bit heap", error))?;
-        // NTDLL's headers, for programs that read their own module list.
-        let mut headers = vec![0u8; 0x1000];
-        headers[0..2].copy_from_slice(b"MZ");
-        headers[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        headers[0x80..0x84].copy_from_slice(b"PE\0\0");
-        headers[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
-        headers[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
-        headers[0x96..0x98].copy_from_slice(&0x2022u16.to_le_bytes());
-        let o = 0x98;
-        headers[o..o + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
-        headers[o + 24..o + 32].copy_from_slice(&(memory::NTDLL_HANDLE as u64).to_le_bytes());
-        headers[o + 32..o + 36].copy_from_slice(&0x1000u32.to_le_bytes());
-        headers[o + 36..o + 40].copy_from_slice(&0x200u32.to_le_bytes());
-        headers[o + 56..o + 60].copy_from_slice(&memory::NTDLL_SIZE.to_le_bytes());
-        headers[o + 60..o + 64].copy_from_slice(&0x200u32.to_le_bytes());
-        headers[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
-        // The rest of its image is for the subsystem's exports and their
-        // stubs (see `win32::nt::ntdll_exports`).
-        map_in(&mut uc, &state, memory::NTDLL_HANDLE as u64, memory::NTDLL_SIZE as u64)
-            .and_then(|()| uc.mem_write(memory::NTDLL_HANDLE as u64, &headers))
-            .map_err(|error| RunError::Unicorn("mapping NTDLL's headers", error))?;
-    }
-
-    map_in(&mut uc, &state, TIB_BASE as u64, if x64 { TEB64_SIZE } else { TIB_SIZE } as u64)
-        .map_err(|error| RunError::Unicorn("mapping guest TIB", error))?;
-    if x64 {
-        init_teb64(&mut uc, TIB_BASE, STACK_TOP, X64_STACK_LOW, 1)?;
-    } else {
-        // Win95 TIB: a terminated SEH chain, stack bounds and a pointer to the TIB
-        // itself. MFC's CRT and SEH prologues consult all four during startup.
-        // KERNEL32's private state helpers compare FS:[0] with -1 and skip the
-        // registration-record walk only when the chain head is the real terminator.
-        let tib_init = [
-            (0u32, u32::MAX),
-            (4, STACK_TOP),
-            (8, STACK_BASE),
-            // Win95 KERNEL32's private 16-bit thunk allocator pops blocks from
-            // FS:[0x10]. It expects a linked list of mapped free blocks, not zero.
-            (0x10, LOCAL_HANDLE_LIST_BASE),
-            (0x18, TIB_BASE),
-            // FS:[0x30] (NT's PEB): a zeroed block. MSHTML's allocator reads
-            // flags from it; KERNEL32's own code must not find the PDB there.
-            (0x30, WIN95_STATE_BASE + 0x3000),
-            // Win95 heap helpers load GS from FS:[0x0c] and test flag bits at
-            // GS:[0x16]. Point GS at the synthetic state page, whose flags stay
-            // zero so the simple (non-thunking) allocation path is used.
-            (0x0c, GS_SELECTOR),
-        ];
-        for (offset, value) in tib_init {
-            uc.mem_write((TIB_BASE + offset) as u64, &value.to_le_bytes())
-                .map_err(|error| RunError::Unicorn("initialising guest TIB", error))?;
-        }
-
-        // Unicorn 2.1.5 ignores FS_BASE writes in 32-bit mode, so install a small
-        // GDT and load FS with a selector whose descriptor bases it at TIB_BASE.
-        map_in(&mut uc, &state, GDT_BASE as u64, GDT_SIZE as u64)
-            .map_err(|error| RunError::Unicorn("mapping guest GDT", error))?;
-        let mut gdt = vec![0u8; 40];
-        // Flat 32-bit code and data selectors, the TIB selector, and a selector
-        // based at the synthetic Win95 state page for GS.
-        gdt[8..16].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x9A, 0xCF, 0]);
-        gdt[16..24].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x92, 0xCF, 0]);
-        gdt[24..32].copy_from_slice(&fs_descriptor(TIB_BASE));
-        let gs_base = WIN95_STATE_BASE;
-        let gs_limit = WIN95_STATE_SIZE - 1;
-        gdt[32..40].copy_from_slice(&[
-            gs_limit as u8,
-            (gs_limit >> 8) as u8,
-            gs_base as u8,
-            (gs_base >> 8) as u8,
-            (gs_base >> 16) as u8,
-            0x92,
-            0xC0, // 32-bit segment, 4 KiB granularity
-            (gs_base >> 24) as u8,
-        ]);
-        uc.mem_write(GDT_BASE as u64, &gdt)
-            .map_err(|error| RunError::Unicorn("writing guest GDT", error))?;
-        let mut gdtr = [0u8; 24];
-        gdtr[8..16].copy_from_slice(&(GDT_BASE as u64).to_le_bytes());
-        gdtr[16..20].copy_from_slice(&39u32.to_le_bytes());
-        uc.reg_write_long(Reg::GDTR, &gdtr)
-            .map_err(|error| RunError::Unicorn("initialising GDTR", error))?;
-        for (register, selector) in [
-            (Reg::CS, CODE_SELECTOR),
-            (Reg::DS, DATA_SELECTOR),
-            (Reg::ES, DATA_SELECTOR),
-            (Reg::SS, DATA_SELECTOR),
-            (Reg::FS, FS_SELECTOR),
-            (Reg::GS, DATA_SELECTOR),
-        ] {
-            uc.reg_write(register, selector as u64)
-                .map_err(|error| RunError::Unicorn("initialising guest segment selectors", error))?;
-        }
-    }
-
-    let thunk_end = align_up(
-        THUNK_BASE.wrapping_add((iat.thunk_count() as u32 + 1) * 4),
-        PAGE_SIZE,
-    );
-    let thunk_size = thunk_end - THUNK_BASE;
-    map_in(&mut uc, &state, THUNK_BASE as u64, thunk_size as u64)
-        .map_err(|error| RunError::Unicorn("mapping IAT thunks", error))?;
-    uc.mem_write(THUNK_BASE as u64, &vec![0xC3; thunk_size as usize])
-        .map_err(|error| RunError::Unicorn("writing IAT thunks", error))?;
-    if x64 {
-        // Leaf functions the subsystem has machine code for are bound to
-        // that code, after the thunks (outside the range calls are caught in).
-        let mut code = Vec::new();
-        let mut bindings = Vec::new();
-        let mut placed: std::collections::HashMap<&'static [u8], u32> = std::collections::HashMap::new();
-        for entry in iat.entries.iter().filter(|entry| entry.slot_va != 0) {
-            let Some(native) = syscalls.native_x64(&entry.dll, &entry.name) else {
-                continue;
-            };
-            let at = *placed.entry(native).or_insert_with(|| {
-                let at = thunk_end + code.len() as u32;
-                code.extend_from_slice(native);
-                code.resize((code.len() + 15) & !15, 0xCC);
-                at
-            });
-            bindings.push((entry.slot_va, at));
-        }
-        if !code.is_empty() {
-            map_in(&mut uc, &state, thunk_end as u64, align_up(code.len() as u32, PAGE_SIZE) as u64)
-                .and_then(|()| uc.mem_write(thunk_end as u64, &code))
-                .map_err(|error| RunError::Unicorn("writing native leaf functions", error))?;
-            for (slot, at) in bindings {
-                uc.mem_write(slot as u64, &(at as u64).to_le_bytes())
-                    .map_err(|error| RunError::Unicorn("binding native leaf functions", error))?;
+/// Whether threads run on CPUs of their own (OTW_PARALLEL_THREADS=1):
+/// then locked instructions are translated as host atomics, for every CPU.
+fn parallel_threads() -> bool {
+    static PARALLEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PARALLEL.get_or_init(|| {
+        let on = std::env::var_os("OTW_PARALLEL_THREADS").is_some_and(|v| v != "0");
+        if on {
+            unsafe extern "C" {
+                fn otw_set_parallel_cpus(parallel: i32);
             }
+            // SAFETY: a plain flag, set before any code is translated.
+            unsafe { otw_set_parallel_cpus(1) };
         }
-    }
+        on
+    })
+}
 
-    if !x64 {
-        init_win95_state(process, &mut uc, &state)?;
-    }
+/// Moves a value of the single-threaded subsystem world to a new host
+/// thread, which touches it only under the process's lock.
+struct SendBox<T>(T);
+// SAFETY: see above; the value is only used (and dropped) with the lock.
+unsafe impl<T> Send for SendBox<T> {}
 
-    let thread_return = process.entry_point(KERNEL_DLL, THREAD_RETURN).unwrap_or(0);
-    let initial_sp = if x64 {
-        // As if called: the entry point returns to the thread-end thunk,
-        // with the stack 16-byte aligned before the call.
-        let sp = (STACK_TOP & !0xF) - 8;
-        uc.mem_write(sp as u64, &(thread_return as u64).to_le_bytes())
-            .map_err(|error| RunError::Unicorn("initialising the stack", error))?;
-        sp
-    } else {
-        STACK_TOP
+impl<T> SendBox<T> {
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+/// Start thread `id` on a CPU and host thread of its own, at `entry` with
+/// `param` in RCX, its stack at `rsp` and its TEB at `teb`.
+fn spawn_worker(run: &Rc<RefCell<RunState<'_>>>, id: u32, entry: u32, param: u32, rsp: u32, teb: u32) -> bool {
+    let (process, recipe, dispatcher, thread_return) = {
+        let state = run.borrow();
+        let Some(recipe) = state.recipe.clone() else { return false };
+        (state.process.clone(), recipe, state.dispatcher, state.thread_return)
     };
-    uc.reg_write(Reg::ESP, initial_sp as u64)
-        .map_err(|error| RunError::Unicorn("initialising ESP", error))?;
-    uc.reg_write(Reg::EBP, 0)
-        .map_err(|error| RunError::Unicorn("initialising EBP", error))?;
-    // The x87 state a Windows process starts with: every exception masked,
-    // 53-bit precision, round to nearest. C runtimes check these masks and
-    // raise floating-point exceptions for any that are clear.
-    uc.reg_write(Reg::FPCW, 0x027F)
-        .map_err(|error| RunError::Unicorn("initialising the FPU control word", error))?;
-
-    {
-        let mut initial_state = state.borrow_mut();
-        initial_state.pump = pump;
-        initial_state.dispatcher = process
-            .entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER)
-            .unwrap_or(0);
-        initial_state.thread_return = thread_return;
-        initial_state.running = vec![1];
+    let name = format!("{} t{id}", std::thread::current().name().unwrap_or("main"));
+    let boxed = SendBox(recipe);
+    let worker_process = process.clone();
+    let spawned = std::thread::Builder::new().name(name).stack_size(64 << 20).spawn(move || {
+        let recipe = boxed.into_inner();
+        run_worker(worker_process, recipe, [id, entry, param, rsp, teb, dispatcher, thread_return]);
+    });
+    match spawned {
+        Ok(handle) => {
+            process.workers.lock().unwrap_or_else(|p| p.into_inner()).push(handle);
+            true
+        }
+        Err(_) => false,
     }
-    let templates = tls_templates(process, &mut uc);
-    *process_shared.tls_templates.lock().unwrap_or_else(|p| p.into_inner()) = templates.clone();
-    install_tls(&mut uc, &state, &templates, TIB_BASE, x64)
-        .map_err(|error| RunError::Unicorn("setting up thread-local storage", error))?;
-    process_shared.tibs().push((1, TIB_BASE));
+}
 
+/// The life of a thread on a CPU of its own.
+fn run_worker(process: Arc<ProcessShared>, recipe: Rc<Recipe>, [id, entry, param, rsp, teb, dispatcher, thread_return]: [u32; 7]) {
+    let hold = super::lock::Hold::new(&process.lock);
+    let outcome = (|| -> Result<(), RunError> {
+        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_64).map_err(|error| RunError::Unicorn("creating a CPU", error))?;
+        hide_sse42(&mut uc).map_err(|error| RunError::Unicorn("hooking CPUID", error))?;
+        let cursor = process.space.attach(&mut uc);
+        let state = Rc::new(RefCell::new(RunState::new(process.clone())));
+        {
+            let mut s = state.borrow_mut();
+            s.cursor = Some(cursor);
+            s.worker = true;
+            s.x64 = true;
+            s.dispatcher = dispatcher;
+            s.thread_return = thread_return;
+            s.running = vec![id];
+            s.recipe = Some(recipe.clone());
+        }
+        install_hooks(&mut uc, &state, &recipe.iat, recipe.syscalls.clone(), recipe.thunk_end)?;
+        for (register, value) in [(Reg::GS_BASE, teb as u64), (Reg::RSP, rsp as u64), (Reg::RCX, param as u64), (Reg::EFLAGS, 0x202), (Reg::FPCW, 0x027F)] {
+            uc.reg_write(register, value).map_err(|error| RunError::Unicorn("initialising a thread", error))?;
+        }
+        let handle = uc.get_handle() as usize;
+        process.engines.lock().unwrap_or_else(|p| p.into_inner()).push(handle);
+        // A thread created suspended waits to be resumed.
+        while recipe.syscalls.thread_suspended(id) && !process.ending.load(Ordering::SeqCst) {
+            memory::idle_wait(std::time::Duration::from_millis(5));
+        }
+        let result = if process.ending.load(Ordering::SeqCst) { Ok(()) } else { emulate(&mut uc, &state, entry, THREAD_STOP, 0, 0) };
+        let signal = state.borrow_mut().thread_signal.take();
+        let (exit_code, error) = {
+            let s = state.borrow();
+            (s.exit_code, s.error.clone())
+        };
+        let code = match signal {
+            Some(ThreadSignal::Exit(code)) => code,
+            _ => 0,
+        };
+        let failed = error.or_else(|| match (&result, signal, exit_code) {
+            (Err(error), None, None) if !process.ending.load(Ordering::SeqCst) => Some(format!("{error:?}")),
+            _ => None,
+        });
+        if let Some(error) = &failed {
+            // A thread's unhandled fault ends its process.
+            eprintln!("[thread] {id} failed: {error}");
+        }
+        if let Some(code) = exit_code.or(failed.map(|_| 0xC000_0005)) {
+            // ExitProcess on this thread (or its fault): the process ends.
+            process.exit_request.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(code);
+            process.ending.store(true, Ordering::SeqCst);
+        }
+        {
+            let mut memory = UnicornGuestMemory { uc: &mut uc, run: Some(&state) };
+            recipe.syscalls.thread_exited(&mut memory, id, code);
+        }
+        process.engines.lock().unwrap_or_else(|p| p.into_inner()).retain(|&e| e != handle);
+        process.space.detach(cursor);
+        process.tibs().retain(|(t, _)| *t != id);
+        drop(state);
+        drop(uc);
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        eprintln!("[thread] {id} could not run: {error}");
+    }
+    drop(recipe);
+    drop(hold);
+}
+
+/// What a new CPU for a thread of the process needs.
+struct Recipe {
+    iat: super::iat::Iat,
+    syscalls: Rc<dyn SystemCalls>,
+    thunk_end: u32,
+}
+
+/// Install the hooks through which the system runs: calls through the
+/// import thunks, faults, interrupts, and the debugging traces.
+fn install_hooks<'a>(
+    uc: &mut Unicorn<'a, ()>,
+    state: &Rc<RefCell<RunState<'a>>>,
+    iat: &super::iat::Iat,
+    syscalls: Rc<dyn SystemCalls>,
+    thunk_end: u32,
+) -> Result<(Rc<RefCell<VecDeque<String>>>, bool), RunError> {
+    let thunk_lock = state.borrow().process.lock.clone();
     let thunk_state = state.clone();
     let thunk_iat = iat.clone();
     let thunk_calls = syscalls;
@@ -2130,6 +2055,23 @@ fn build<'a>(
             let Some(entry) = thunk_iat.entry_for_thunk(address as u32) else {
                 return;
             };
+            let _hold = super::lock::Hold::new(&thunk_lock);
+            sync_space(uc, &thunk_state);
+            // The process is ending (another thread ended it).
+            {
+                let process = thunk_state.borrow().process.clone();
+                let worker = thunk_state.borrow().worker;
+                if worker && process.ending.load(Ordering::SeqCst) {
+                    let _ = uc.emu_stop();
+                    return;
+                }
+                let request = *process.exit_request.lock().unwrap_or_else(|p| p.into_inner());
+                if let (false, Some(code)) = (worker, request) {
+                    thunk_state.borrow_mut().exit_code = Some(code);
+                    let _ = uc.emu_stop();
+                    return;
+                }
+            }
             // A program busy for a while (an installer extracting files on a
             // worker thread, a long wait on other threads) still lets the
             // host window redraw and take input every few frames.
@@ -2165,7 +2107,7 @@ fn build<'a>(
                 // A thread's start routine returned: the thread ends.
                 let code = uc.reg_read(Reg::EAX).unwrap_or(0) as u32;
                 let mut state = thunk_state.borrow_mut();
-                if state.running.len() > 1 {
+                if state.running.len() > 1 || state.worker {
                     state.thread_signal = Some(ThreadSignal::Exit(code));
                     drop(state);
                     let _ = uc.reg_write(Reg::EIP, THREAD_STOP as u64);
@@ -2466,6 +2408,7 @@ fn build<'a>(
     }
 
     let invalid_state = state.clone();
+    let invalid_lock = state.borrow().process.lock.clone();
     let invalid_trace = code_trace.clone();
     // Debugging: OTW_WATCH=address reports every write to that dword.
     if let Some(watch) = std::env::var("OTW_WATCH")
@@ -2489,6 +2432,13 @@ fn build<'a>(
         0,
         u64::MAX,
         move |uc, access, address, size, _value| {
+            let _hold = super::lock::Hold::new(&invalid_lock);
+            // Memory another thread mapped, not yet here: map it and go on.
+            let space = invalid_state.borrow().process.space.clone();
+            if matches!(access, MemType::READ_UNMAPPED | MemType::WRITE_UNMAPPED | MemType::FETCH_UNMAPPED) && space.contains(address) {
+                sync_space(uc, &invalid_state);
+                return true;
+            }
             if trace_code {
                 eprintln!("last instructions before invalid memory access {access:?} at {address:#010x}, size {size}:");
                 for line in invalid_trace.borrow().iter() {
@@ -2513,7 +2463,9 @@ fn build<'a>(
     // CPU exceptions. #DE is raised in the guest; anything else (int3,
     // stray software interrupts) is a fatal VM error.
     let intr_state = state.clone();
+    let intr_lock = state.borrow().process.lock.clone();
     uc.add_intr_hook(move |uc, intno| {
+        let _hold = super::lock::Hold::new(&intr_lock);
         let eip = uc.reg_read(Reg::EIP).unwrap_or(0) as u32;
         if intno == 0 {
             intr_state.borrow_mut().fault = Some(Fault {
@@ -2555,6 +2507,262 @@ fn build<'a>(
         }
     })
     .map_err(|error| RunError::Unicorn("installing interrupt hook", error))?;
+    Ok((code_trace, trace_code))
+}
+
+fn build<'a>(
+    process: &Image,
+    syscalls: Rc<dyn SystemCalls>,
+    pump: Option<Box<dyn FnMut(bool) + 'a>>,
+) -> Result<Process<'a>, RunError> {
+    let image = process.main();
+    let iat = &process.iat;
+
+    let x64 = image.is64;
+    let mut uc = Unicorn::new(Arch::X86, if x64 { Mode::MODE_64 } else { Mode::MODE_32 })
+        .map_err(|error| RunError::Unicorn("creating the CPU", error))?;
+    hide_sse42(&mut uc).map_err(|error| RunError::Unicorn("hooking CPUID", error))?;
+    // OTW_PARALLEL_THREADS=1: a 64-bit program's threads each get a CPU
+    // and a host thread of their own (otherwise they take turns on one).
+    let parallel = x64 && parallel_threads();
+    let process_shared = ProcessShared::new(parallel);
+    // Loading holds the subsystem lock (except while guest code runs).
+    let _hold = super::lock::Hold::new(&process_shared.lock);
+    let state = Rc::new(RefCell::new(RunState::new(process_shared.clone())));
+    {
+        let cursor = process_shared.space.attach(&mut uc);
+        state.borrow_mut().cursor = Some(cursor);
+        state.borrow_mut().x64 = x64;
+    }
+
+    for module in &process.modules {
+        let image_start = align_down(module.image.image_base, PAGE_SIZE);
+        let image_end = align_up(
+            module
+                .image
+                .image_base
+                .wrapping_add(module.memory.len() as u32),
+            PAGE_SIZE,
+        );
+        map_in(&mut uc, &state, image_start as u64,
+            (image_end - image_start) as u64)
+        .map_err(|error| RunError::Unicorn("mapping guest image", error))?;
+        uc.mem_write(module.image.image_base as u64, &module.memory)
+            .map_err(|error| RunError::Unicorn("writing guest image", error))?;
+    }
+
+    map_in(&mut uc, &state, SENTINEL_BASE as u64, PAGE_SIZE as u64)
+        .map_err(|error| RunError::Unicorn("mapping DllMain sentinel", error))?;
+    uc.mem_write(SENTINEL_BASE as u64, &[0xC3])
+        .map_err(|error| RunError::Unicorn("writing DllMain sentinel", error))?;
+    uc.mem_write(YIELD_ADDRESS as u64, &[0xC3])
+        .map_err(|error| RunError::Unicorn("writing yield address", error))?;
+    uc.mem_write(THREAD_STOP as u64, &[0xC3])
+        .map_err(|error| RunError::Unicorn("writing thread stop address", error))?;
+
+    // A 64-bit program's first thread gets nearly 2 MiB of stack (current
+    // programs check for at least 1 MiB), from 64 KiB up.
+    let stack_low = if x64 { X64_STACK_LOW } else { STACK_BASE };
+    map_in(&mut uc, &state, stack_low as u64, (STACK_BASE + STACK_SIZE - stack_low) as u64)
+        .map_err(|error| RunError::Unicorn("mapping guest stack", error))?;
+
+    // The heap's range, except where a program image already lies in it.
+    let mut images: Vec<(u32, u32)> = process
+        .modules
+        .iter()
+        .map(|module| {
+            let start = align_down(module.image.image_base, PAGE_SIZE);
+            (start, align_up(module.image.image_base + module.memory.len() as u32, PAGE_SIZE))
+        })
+        .filter(|&(start, end)| start < HEAP_BASE + HEAP_SIZE && end > HEAP_BASE)
+        .collect();
+    images.sort();
+    let mut cursor = HEAP_BASE;
+    for (start, end) in images.into_iter().chain([(HEAP_BASE + HEAP_SIZE, HEAP_BASE + HEAP_SIZE)]) {
+        if start > cursor {
+            map_in(&mut uc, &state, cursor as u64, (start - cursor) as u64)
+                .map_err(|error| RunError::Unicorn("mapping guest heap", error))?;
+        }
+        cursor = cursor.max(end);
+    }
+    if x64 {
+        map_in(&mut uc, &state, memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64)
+            .map_err(|error| RunError::Unicorn("mapping the 64-bit heap", error))?;
+        // NTDLL's headers, for programs that read their own module list.
+        let mut headers = vec![0u8; 0x1000];
+        headers[0..2].copy_from_slice(b"MZ");
+        headers[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        headers[0x80..0x84].copy_from_slice(b"PE\0\0");
+        headers[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        headers[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+        headers[0x96..0x98].copy_from_slice(&0x2022u16.to_le_bytes());
+        let o = 0x98;
+        headers[o..o + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        headers[o + 24..o + 32].copy_from_slice(&(memory::NTDLL_HANDLE as u64).to_le_bytes());
+        headers[o + 32..o + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        headers[o + 36..o + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        headers[o + 56..o + 60].copy_from_slice(&memory::NTDLL_SIZE.to_le_bytes());
+        headers[o + 60..o + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        headers[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
+        // The rest of its image is for the subsystem's exports and their
+        // stubs (see `win32::nt::ntdll_exports`).
+        map_in(&mut uc, &state, memory::NTDLL_HANDLE as u64, memory::NTDLL_SIZE as u64)
+            .and_then(|()| uc.mem_write(memory::NTDLL_HANDLE as u64, &headers))
+            .map_err(|error| RunError::Unicorn("mapping NTDLL's headers", error))?;
+    }
+
+    map_in(&mut uc, &state, TIB_BASE as u64, if x64 { TEB64_SIZE } else { TIB_SIZE } as u64)
+        .map_err(|error| RunError::Unicorn("mapping guest TIB", error))?;
+    if x64 {
+        init_teb64(&mut uc, TIB_BASE, STACK_TOP, X64_STACK_LOW, 1)?;
+    } else {
+        // Win95 TIB: a terminated SEH chain, stack bounds and a pointer to the TIB
+        // itself. MFC's CRT and SEH prologues consult all four during startup.
+        // KERNEL32's private state helpers compare FS:[0] with -1 and skip the
+        // registration-record walk only when the chain head is the real terminator.
+        let tib_init = [
+            (0u32, u32::MAX),
+            (4, STACK_TOP),
+            (8, STACK_BASE),
+            // Win95 KERNEL32's private 16-bit thunk allocator pops blocks from
+            // FS:[0x10]. It expects a linked list of mapped free blocks, not zero.
+            (0x10, LOCAL_HANDLE_LIST_BASE),
+            (0x18, TIB_BASE),
+            // FS:[0x30] (NT's PEB): a zeroed block. MSHTML's allocator reads
+            // flags from it; KERNEL32's own code must not find the PDB there.
+            (0x30, WIN95_STATE_BASE + 0x3000),
+            // Win95 heap helpers load GS from FS:[0x0c] and test flag bits at
+            // GS:[0x16]. Point GS at the synthetic state page, whose flags stay
+            // zero so the simple (non-thunking) allocation path is used.
+            (0x0c, GS_SELECTOR),
+        ];
+        for (offset, value) in tib_init {
+            uc.mem_write((TIB_BASE + offset) as u64, &value.to_le_bytes())
+                .map_err(|error| RunError::Unicorn("initialising guest TIB", error))?;
+        }
+
+        // Unicorn 2.1.5 ignores FS_BASE writes in 32-bit mode, so install a small
+        // GDT and load FS with a selector whose descriptor bases it at TIB_BASE.
+        map_in(&mut uc, &state, GDT_BASE as u64, GDT_SIZE as u64)
+            .map_err(|error| RunError::Unicorn("mapping guest GDT", error))?;
+        let mut gdt = vec![0u8; 40];
+        // Flat 32-bit code and data selectors, the TIB selector, and a selector
+        // based at the synthetic Win95 state page for GS.
+        gdt[8..16].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x9A, 0xCF, 0]);
+        gdt[16..24].copy_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0x92, 0xCF, 0]);
+        gdt[24..32].copy_from_slice(&fs_descriptor(TIB_BASE));
+        let gs_base = WIN95_STATE_BASE;
+        let gs_limit = WIN95_STATE_SIZE - 1;
+        gdt[32..40].copy_from_slice(&[
+            gs_limit as u8,
+            (gs_limit >> 8) as u8,
+            gs_base as u8,
+            (gs_base >> 8) as u8,
+            (gs_base >> 16) as u8,
+            0x92,
+            0xC0, // 32-bit segment, 4 KiB granularity
+            (gs_base >> 24) as u8,
+        ]);
+        uc.mem_write(GDT_BASE as u64, &gdt)
+            .map_err(|error| RunError::Unicorn("writing guest GDT", error))?;
+        let mut gdtr = [0u8; 24];
+        gdtr[8..16].copy_from_slice(&(GDT_BASE as u64).to_le_bytes());
+        gdtr[16..20].copy_from_slice(&39u32.to_le_bytes());
+        uc.reg_write_long(Reg::GDTR, &gdtr)
+            .map_err(|error| RunError::Unicorn("initialising GDTR", error))?;
+        for (register, selector) in [
+            (Reg::CS, CODE_SELECTOR),
+            (Reg::DS, DATA_SELECTOR),
+            (Reg::ES, DATA_SELECTOR),
+            (Reg::SS, DATA_SELECTOR),
+            (Reg::FS, FS_SELECTOR),
+            (Reg::GS, DATA_SELECTOR),
+        ] {
+            uc.reg_write(register, selector as u64)
+                .map_err(|error| RunError::Unicorn("initialising guest segment selectors", error))?;
+        }
+    }
+
+    let thunk_end = align_up(
+        THUNK_BASE.wrapping_add((iat.thunk_count() as u32 + 1) * 4),
+        PAGE_SIZE,
+    );
+    let thunk_size = thunk_end - THUNK_BASE;
+    map_in(&mut uc, &state, THUNK_BASE as u64, thunk_size as u64)
+        .map_err(|error| RunError::Unicorn("mapping IAT thunks", error))?;
+    uc.mem_write(THUNK_BASE as u64, &vec![0xC3; thunk_size as usize])
+        .map_err(|error| RunError::Unicorn("writing IAT thunks", error))?;
+    if x64 {
+        // Leaf functions the subsystem has machine code for are bound to
+        // that code, after the thunks (outside the range calls are caught in).
+        let mut code = Vec::new();
+        let mut bindings = Vec::new();
+        let mut placed: std::collections::HashMap<&'static [u8], u32> = std::collections::HashMap::new();
+        for entry in iat.entries.iter().filter(|entry| entry.slot_va != 0) {
+            let Some(native) = syscalls.native_x64(&entry.dll, &entry.name) else {
+                continue;
+            };
+            let at = *placed.entry(native).or_insert_with(|| {
+                let at = thunk_end + code.len() as u32;
+                code.extend_from_slice(native);
+                code.resize((code.len() + 15) & !15, 0xCC);
+                at
+            });
+            bindings.push((entry.slot_va, at));
+        }
+        if !code.is_empty() {
+            map_in(&mut uc, &state, thunk_end as u64, align_up(code.len() as u32, PAGE_SIZE) as u64)
+                .and_then(|()| uc.mem_write(thunk_end as u64, &code))
+                .map_err(|error| RunError::Unicorn("writing native leaf functions", error))?;
+            for (slot, at) in bindings {
+                uc.mem_write(slot as u64, &(at as u64).to_le_bytes())
+                    .map_err(|error| RunError::Unicorn("binding native leaf functions", error))?;
+            }
+        }
+    }
+
+    if !x64 {
+        init_win95_state(process, &mut uc, &state)?;
+    }
+
+    let thread_return = process.entry_point(KERNEL_DLL, THREAD_RETURN).unwrap_or(0);
+    let initial_sp = if x64 {
+        // As if called: the entry point returns to the thread-end thunk,
+        // with the stack 16-byte aligned before the call.
+        let sp = (STACK_TOP & !0xF) - 8;
+        uc.mem_write(sp as u64, &(thread_return as u64).to_le_bytes())
+            .map_err(|error| RunError::Unicorn("initialising the stack", error))?;
+        sp
+    } else {
+        STACK_TOP
+    };
+    uc.reg_write(Reg::ESP, initial_sp as u64)
+        .map_err(|error| RunError::Unicorn("initialising ESP", error))?;
+    uc.reg_write(Reg::EBP, 0)
+        .map_err(|error| RunError::Unicorn("initialising EBP", error))?;
+    // The x87 state a Windows process starts with: every exception masked,
+    // 53-bit precision, round to nearest. C runtimes check these masks and
+    // raise floating-point exceptions for any that are clear.
+    uc.reg_write(Reg::FPCW, 0x027F)
+        .map_err(|error| RunError::Unicorn("initialising the FPU control word", error))?;
+
+    {
+        let mut initial_state = state.borrow_mut();
+        initial_state.pump = pump;
+        initial_state.dispatcher = process
+            .entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER)
+            .unwrap_or(0);
+        initial_state.thread_return = thread_return;
+        initial_state.running = vec![1];
+    }
+    let templates = tls_templates(process, &mut uc);
+    *process_shared.tls_templates.lock().unwrap_or_else(|p| p.into_inner()) = templates.clone();
+    install_tls(&mut uc, &state, &templates, TIB_BASE, x64)
+        .map_err(|error| RunError::Unicorn("setting up thread-local storage", error))?;
+    process_shared.tibs().push((1, TIB_BASE));
+
+    let (code_trace, trace_code) = install_hooks(&mut uc, &state, iat, syscalls.clone(), thunk_end)?;
+    state.borrow_mut().recipe = Some(Rc::new(Recipe { iat: iat.clone(), syscalls, thunk_end }));
 
     // Real MFC DLLs initialise their global state in DllMain. Call it with
     // DLL_PROCESS_ATTACH before handing control to the executable. DllMain is

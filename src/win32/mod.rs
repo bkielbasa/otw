@@ -1176,7 +1176,19 @@ impl SystemCalls for ApiContext {
     ) -> Option<ApiOutcome> {
         let (dll, name) = self.resolve(dll, name)?;
         if args.x64() {
-            return x64::call(self, memory, &dll, &name, args, caller);
+            // Each thread has its own last error (threads of a 64-bit
+            // process run at once, taking turns in the system).
+            let thread = memory.current_thread();
+            {
+                let mut shared = self.shared.borrow_mut();
+                let own = shared.sync.last_error_of(thread);
+                shared.last_error = own;
+            }
+            let outcome = x64::call(self, memory, &dll, &name, args, caller);
+            let mut shared = self.shared.borrow_mut();
+            let error = shared.last_error;
+            shared.sync.set_last_error_of(thread, error);
+            return outcome;
         }
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
     }
@@ -1184,6 +1196,14 @@ impl SystemCalls for ApiContext {
     fn arg_count64(&self, dll: &str, name: &ImportName) -> Option<usize> {
         let (dll, name) = self.resolve(dll, name)?;
         x64::arg_count(self, &dll, &name)
+    }
+
+    fn thread_suspended(&self, id: u32) -> bool {
+        sync::thread_suspended(self, id)
+    }
+
+    fn thread_exited(&self, _memory: &mut dyn GuestMemory, id: u32, code: u32) {
+        sync::thread_exited(self, id, code);
     }
 
     fn native_x64(&self, dll: &str, name: &ImportName) -> Option<&'static [u8]> {

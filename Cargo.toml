@@ -34,3 +34,8 @@ opt-level = 2
 lto = true
 codegen-units = 1
 strip = true
+
+# Unicorn with locked instructions atomic across CPUs (threads of a 64-bit
+# process run on CPUs of their own); see vendor/unicorn-engine-sys/OTW.md.
+[patch.crates-io]
+unicorn-engine-sys = { path = "vendor/unicorn-engine-sys" }

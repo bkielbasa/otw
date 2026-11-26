@@ -201,6 +201,12 @@ pub trait GuestMemory {
         false
     }
 
+    /// Other threads of the process run on CPUs of their own (a wait can
+    /// be ended by them).
+    fn others_running(&self) -> bool {
+        false
+    }
+
     /// The mapped ranges, as (first, last) addresses inclusive.
     fn mapped(&mut self) -> Vec<(u64, u64)> {
         Vec::new()

@@ -3528,11 +3528,11 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
             idle_rounds = 0;
             continue;
         }
-        if !memory.has_host() && feed_script(ctx) {
+        if !memory.has_host() && !memory.is_worker() && feed_script(ctx) {
             idle_rounds = 0;
             continue;
         }
-        if !memory.has_host() && !ctx.shared.borrow().alongside {
+        if !memory.has_host() && !memory.is_worker() && !ctx.shared.borrow().alongside {
             let idle_limit = std::env::var("OTW_IDLE_EXIT")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok());

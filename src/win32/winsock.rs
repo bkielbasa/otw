@@ -1351,7 +1351,7 @@ fn select_waiting<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, arg
         if memory.stopping() {
             return select_poll(&mut ctx.shared.borrow_mut(), memory, args, count, true).expect("expired");
         }
-        std::thread::sleep(Duration::from_millis(2));
+        crate::kernel::lock::unlocked(|| std::thread::sleep(Duration::from_millis(2)));
     }
 }
 
@@ -1690,7 +1690,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let (_stream, _) = listener.accept().unwrap();
-            std::thread::sleep(Duration::from_millis(20));
+            crate::kernel::lock::unlocked(|| std::thread::sleep(Duration::from_millis(20)));
         });
 
         let ctx = ApiContext::default();
