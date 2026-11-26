@@ -7,6 +7,11 @@
 //! one is in the foreground) and the clipboard, whose contents are copied
 //! between programs around their turns.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,

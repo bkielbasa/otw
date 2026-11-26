@@ -7,6 +7,11 @@
 //! point outside the loaded module set receive an IAT thunk handled by the
 //! Rust Win32 layers.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{collections::HashMap, fmt};
 
 use super::{

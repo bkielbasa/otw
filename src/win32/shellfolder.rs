@@ -9,6 +9,11 @@
 //! with its absolute ID list, so namespace extensions supply their own
 //! items below it.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{com, read_cstr, unicode, ApiContext, ApiOutcome, GuestMemory};
 
 const S_OK: u32 = 0;
@@ -676,6 +681,10 @@ pub fn ansi_arg<M: GuestMemory + ?Sized>(memory: &mut M, va: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

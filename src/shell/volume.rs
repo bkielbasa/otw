@@ -2,6 +2,11 @@
 //! (writable, the same files programs open and save) or a FAT32 disk image
 //! (read-only).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -366,6 +371,10 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     fn temp_volume(tag: &str) -> (Volume, PathBuf) {

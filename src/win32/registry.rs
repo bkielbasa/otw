@@ -10,6 +10,11 @@
 //! String data is stored in the ANSI code page (as Windows 95 does) and
 //! converted for the `W` functions.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -893,6 +898,10 @@ fn call<M: GuestMemory + ?Sized>(memory: &mut M, name: &str, wide: bool, args: &
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

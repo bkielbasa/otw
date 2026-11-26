@@ -5,6 +5,11 @@
 //! here. Selecting a tab with the mouse sends TCN_SELCHANGING and
 //! TCN_SELCHANGE. TCITEM is read in the process's layout.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{
     gdi::{self, sys_color},
     gfx::Rect,

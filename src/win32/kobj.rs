@@ -8,6 +8,11 @@
 //! state is behind a lock. Handles to these objects are numbered from
 //! `FIRST_HANDLE` up, apart from the ones each process numbers itself.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard, OnceLock},

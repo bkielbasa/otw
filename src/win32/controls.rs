@@ -1,5 +1,10 @@
 //! USER32 built-in control classes, dialog boxes and message boxes.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     win32::gdi::{self, sys_color, GdiObject, LogFont},
     win32::gfx::{self, Rect},
@@ -4270,6 +4275,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     struct Flat(Vec<u8>);

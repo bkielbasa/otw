@@ -2,6 +2,11 @@
 //! and decompressing them (stored, MSZIP and LZX). Installers extract their
 //! payload through ADVPACK's `ExtractFiles` and SETUPAPI.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -811,6 +816,10 @@ impl Lzx {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     /// Compare with a reference extraction: OTW_TEST_CAB=file.cab

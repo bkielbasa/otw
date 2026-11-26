@@ -9,6 +9,11 @@
 //! this trait. [`ImportPolicy`] lets the subsystem decide, at load time,
 //! which imports it provides even when a genuine DLL exports them.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use super::{
     memory::{ApiOutcome, GuestMemory},
     pe::ImportName,

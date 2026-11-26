@@ -6,6 +6,11 @@
 //! handles and window records live in [`SharedState`] so a host GUI backend can
 //! observe what the guest asked for and render it.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 pub mod advpack;
 pub mod bindctx;
 pub mod dwrite;
@@ -1783,6 +1788,14 @@ pub(crate) fn cstr_cmp(left: &[u8], right: &[u8]) -> i32 {
 // ── MSVCRT20 ───────────────────────────────────────────────────────────────
 
 mod msvcrt20 {
+
+    #[allow(unused_imports)]
+
+    use crate::platform as std;
+
+    #[allow(unused_imports)]
+
+    use crate::platform::prelude::*;
     use super::*;
 
     /// All MSVC 2.x runtime exports are `cdecl`: callers pop their own stack.
@@ -2119,6 +2132,14 @@ mod msvcrt20 {
 // ── MFC ordinals ───────────────────────────────────────────────────────────
 
 mod mfc {
+
+    #[allow(unused_imports)]
+
+    use crate::platform as std;
+
+    #[allow(unused_imports)]
+
+    use crate::platform::prelude::*;
     use super::*;
 
     /// One ordinal-only MFC export. MFC30.DLL has no name table, so the
@@ -2174,6 +2195,14 @@ mod mfc {
 // ── KERNEL32 ───────────────────────────────────────────────────────────────
 
 mod kernel32_base {
+
+    #[allow(unused_imports)]
+
+    use crate::platform as std;
+
+    #[allow(unused_imports)]
+
+    use crate::platform::prelude::*;
     use super::*;
 
     /// Windows 95 RTM's private GetProcessDword selector values, recovered from
@@ -2640,6 +2669,14 @@ mod kernel32_base {
 // ── SHELL32 ────────────────────────────────────────────────────────────────
 
 mod shell32 {
+
+    #[allow(unused_imports)]
+
+    use crate::platform as std;
+
+    #[allow(unused_imports)]
+
+    use crate::platform::prelude::*;
     use super::*;
 
     pub(super) fn arg_count(name: &str) -> Option<usize> {
@@ -2743,6 +2780,14 @@ fn notify_icon<M: GuestMemory + ?Sized>(
 // ── SHLWAPI ────────────────────────────────────────────────────────────────
 
 mod shlwapi {
+
+    #[allow(unused_imports)]
+
+    use crate::platform as std;
+
+    #[allow(unused_imports)]
+
+    use crate::platform::prelude::*;
     use super::*;
 
     pub(super) fn arg_count(name: &str) -> Option<usize> {
@@ -2797,6 +2842,14 @@ mod shlwapi {
 // ── COMDLG32 ───────────────────────────────────────────────────────────────
 
 mod comdlg32 {
+
+    #[allow(unused_imports)]
+
+    use crate::platform as std;
+
+    #[allow(unused_imports)]
+
+    use crate::platform::prelude::*;
     use super::*;
 
     pub(super) fn arg_count(name: &str) -> Option<usize> {
@@ -2851,6 +2904,10 @@ mod comdlg32 {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::is_rust_backed_dll;
 
     #[test]

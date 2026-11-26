@@ -6,6 +6,11 @@
 //! made here hold paths. There is no drag image, so the `DAD_*` functions
 //! succeed without drawing.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::{read_cstr, unicode, ApiContext, ApiOutcome, GuestMemory},
@@ -479,6 +484,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

@@ -7,6 +7,11 @@
 //! synchronised with the host surface around every operation that touches
 //! them, so the guest can read and write the bits directly.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 
 use crate::{
@@ -4074,6 +4079,10 @@ fn blit_dcs<M: GuestMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

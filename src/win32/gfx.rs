@@ -7,6 +7,11 @@
 //! font. The Win32 layer translates logical coordinates, `COLORREF`s and
 //! object handles into calls on these primitives.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::sync::OnceLock;
 
 /// A pixel in `0x00RRGGBB` form.
@@ -1310,6 +1315,10 @@ pub fn draw_text(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

@@ -10,8 +10,13 @@
 //! the faulting context. The frame handlers themselves belong to the
 //! language runtimes (see `win32::cxx` for MSVC C++ and `__try`).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use super::{
-    cpu::{STACK_BASE, STACK_TOP, TIB_BASE},
+    layout::{STACK_BASE, STACK_TOP, TIB_BASE},
     memory::{ApiOutcome, GuestMemory, Resume},
 };
 

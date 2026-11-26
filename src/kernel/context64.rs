@@ -1,6 +1,11 @@
 //! The x64 `CONTEXT` (0x4D0 bytes) and `EXCEPTION_RECORD` as Windows lays
 //! them out, to and from [`FullRegisters`].
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use super::memory::{FullRegisters, GuestMemory};
 
 pub const CONTEXT_SIZE: u32 = 0x4D0;

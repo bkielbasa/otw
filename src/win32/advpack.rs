@@ -4,6 +4,11 @@
 //! `RunSetupCommand` install INF sections from files; and small helpers
 //! (file versions, `DelNode`, reboot checks).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::{crt, inf::Inf, module, read_cstr, user, write_cstr, ApiContext, ApiOutcome, GuestMemory},

@@ -9,6 +9,11 @@
 //! with descriptions named by hexadecimal locale, and
 //! `HKCR\CLSID\{clsid}\Implemented Categories\{catid}` (or `Required`).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{registry, shell, unicode, ApiContext, ApiOutcome, GuestMemory};
 
 const S_OK: u32 = 0;

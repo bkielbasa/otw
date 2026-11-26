@@ -1,6 +1,11 @@
 //! Shell icons: a small built-in set in the Win95 style, and the genuine
 //! icons stored in program files (`RT_GROUP_ICON` / `RT_ICON` resources).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{win32::gfx::Rgb, win32::icon, win32::user::Painter};
 
 /// A decoded icon; `None` pixels are transparent.
@@ -339,6 +344,10 @@ pub fn from_pe(bytes: &[u8], size: i32) -> Option<Bitmap> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

@@ -2,6 +2,11 @@
 //! dropdowns and context menus. Pure layout and interaction state; the
 //! shell paints them with [`paint`].
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     win32::gdi::sys_color,
     win32::gfx::{self, Rect},
@@ -613,6 +618,10 @@ fn vertical_text(p: &mut Painter<'_>, x: i32, bottom: i32, text: &[u8], color: u
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
     use crate::shell::Key;
 

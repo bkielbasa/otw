@@ -1,231 +1,336 @@
-//! The desktop on bare metal: the Windows 95 style desktop, taskbar, Start
-//! menu and pointer, driven by the PS/2 keyboard and mouse.
+//! The desktop: OTW's own shell (`otw_vm::shell`), the same code as on
+//! Linux, drawn on the framebuffer and driven by the PS/2 keyboard and
+//! mouse.
 
 use alloc::format;
-use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
-use crate::heap::Heap;
+use otw_vm::shell::volume::Volume;
+use otw_vm::shell::{Button, Key, Layer, Mods, Shell};
+use otw_vm::win32::gfx::Surface;
+
 use crate::io::{self, Input};
-use crate::screen::{Screen, BLACK, FACE, NAVY, SHADOW, TEAL, WHITE};
-use crate::System;
+use crate::{apic, arch, log, System};
 
-const TASKBAR: i32 = 28;
-
-struct State {
+struct Input8042 {
     pointer: (i32, i32),
     buttons: u8,
     packet: [u8; 3],
     packet_len: usize,
-    menu_open: bool,
-    typed: String,
-    shift: bool,
-    ps2: bool,
+    mods: Mods,
+    extended: bool,
 }
 
-pub fn run(system: &System, heap: &Heap) -> ! {
+pub fn run(system: &System) -> ! {
     let info = &system.info;
-    let drive_c: alloc::vec::Vec<String> = system
-        .drive_c
-        .as_ref()
-        .and_then(|fs| fs.list("").ok())
-        .map(|entries| entries.into_iter().map(|e| if e.is_directory() { format!("{}\\", e.name) } else { e.name }).collect())
-        .unwrap_or_default();
-    crate::log!("OTW kernel: desktop");
-    let mut screen = Screen::new(info.framebuffer, info.width, info.height, info.stride, info.bgr);
-    let ps2 = io::ps2_init();
-    crate::log!("OTW kernel: PS/2 controller {}", if ps2 { "found" } else { "missing" });
-    let mut state = State {
-        pointer: (info.width as i32 / 2, info.height as i32 / 2),
+    let (width, height) = (info.width, info.height);
+    let started = apic::now_us();
+    let mut shell = Shell::new(Some(Volume::drive_c()), Vec::new());
+    shell.set_screen(width as i32, height as i32);
+    log!("OTW kernel: shell ready in {} ms ({} ms since start)", (apic::now_us() - started) / 1000, crate::ms_since_start());
+    for note in &system.notes {
+        log!("OTW kernel: {note}");
+    }
+
+    let mut input = Input8042 {
+        pointer: (width as i32 / 2, height as i32 / 2),
         buttons: 0,
         packet: [0; 3],
         packet_len: 0,
-        menu_open: false,
-        typed: String::new(),
-        shift: false,
-        ps2,
+        mods: Mods::default(),
+        extended: false,
     };
-    let mut last_clock = (99, 99, 99);
+    let mut frame = Surface::new(width as i32, height as i32, 24);
+    let mut screen = ScreenCopy::new(info);
     let mut dirty = true;
+    let mut stats = FrameStats::default();
     loop {
-        while let Some(input) = io::ps2_poll() {
-            dirty |= handle(&mut state, input, &screen);
+        let pointer_before = input.pointer;
+        while let Some(byte) = io::ps2_poll() {
+            dirty |= handle(&mut shell, &mut input, byte, width as i32, height as i32);
         }
-        let now = io::rtc_time();
-        if now != last_clock {
-            last_clock = now;
+        if let Some(request) = shell.take_launch() {
+            log!("OTW kernel: asked to run {}", request.path);
+            shell.program_exited(Some(format!(
+                "{} cannot run yet: OTW on bare metal does not run programs so far.",
+                request.name
+            )));
             dirty = true;
         }
+        dirty |= shell.clock_changed();
         if dirty {
-            draw(&mut screen, &state, system, &drive_c, heap, now);
-            screen.present();
+            let started = apic::now_us();
+            frame.pixels.fill(0);
+            shell.paint(&mut frame, Layer::Background, &[]);
+            shell.paint(&mut frame, Layer::Foreground, &[]);
+            shell.paint(&mut frame, Layer::Top, &[]);
+            let painted = apic::now_us();
+            let rows = screen.show(&frame, input.pointer);
+            if stats.frames == 0 {
+                log!("OTW kernel: desktop on the screen ({} ms since start)", crate::ms_since_start());
+            }
+            stats.add(painted - started, apic::now_us() - painted, rows);
             dirty = false;
+        } else if input.pointer != pointer_before {
+            // Only the pointer moved: put back what was under it, draw it
+            // again.
+            screen.move_pointer(input.pointer);
         }
         // Sleep until the next interrupt (the timer, 100 times a second).
-        crate::arch::wait_for_interrupt();
+        arch::wait_for_interrupt();
     }
 }
 
-fn handle(state: &mut State, input: Input, screen: &Screen) -> bool {
-    match input {
+fn handle(shell: &mut Shell, input: &mut Input8042, byte: Input, width: i32, height: i32) -> bool {
+    match byte {
         Input::Mouse(byte) => {
             // Packets are 3 bytes; the first always has bit 3 set.
-            if state.packet_len == 0 && byte & 0x08 == 0 {
+            if input.packet_len == 0 && byte & 0x08 == 0 {
                 return false;
             }
-            state.packet[state.packet_len] = byte;
-            state.packet_len += 1;
-            if state.packet_len < 3 {
+            input.packet[input.packet_len] = byte;
+            input.packet_len += 1;
+            if input.packet_len < 3 {
                 return false;
             }
-            state.packet_len = 0;
-            let [flags, dx, dy] = state.packet;
+            input.packet_len = 0;
+            let [flags, dx, dy] = input.packet;
             let dx = dx as i32 - if flags & 0x10 != 0 { 256 } else { 0 };
             let dy = dy as i32 - if flags & 0x20 != 0 { 256 } else { 0 };
-            state.pointer.0 = (state.pointer.0 + dx).clamp(0, screen.width as i32 - 1);
-            state.pointer.1 = (state.pointer.1 - dy).clamp(0, screen.height as i32 - 1);
-            let pressed = flags & 1 != 0 && state.buttons & 1 == 0;
-            state.buttons = flags & 7;
-            if pressed {
-                click(state, screen);
+            let (x, y) = (
+                (input.pointer.0 + dx).clamp(0, width - 1),
+                (input.pointer.1 - dy).clamp(0, height - 1),
+            );
+            let moved = (x, y) != input.pointer;
+            input.pointer = (x, y);
+            // A move needs a frame only if the shell changed (dragging,
+            // hovering); otherwise only the pointer is drawn again.
+            let mut changed = moved && shell.pointer_move(x, y);
+            for (bit, button) in [(1u8, Button::Left), (2u8, Button::Right)] {
+                let now = flags & bit != 0;
+                let before = input.buttons & bit != 0;
+                if now && !before {
+                    shell.pointer_down(x, y, button, false, &[]);
+                    changed = true;
+                } else if !now && before {
+                    shell.pointer_up(x, y, button, false);
+                    changed = true;
+                }
             }
-            true
+            input.buttons = flags & 7;
+            changed
+        }
+        Input::Key(0xE0) => {
+            input.extended = true;
+            false
         }
         Input::Key(code) => {
-            match code {
-                0x2A | 0x36 => state.shift = true,
-                0xAA | 0xB6 => state.shift = false,
-                0x0E => {
-                    state.typed.pop();
-                }
-                0x01 => state.menu_open = false,
-                _ if code & 0x80 == 0 => {
-                    if let Some(c) = scan_to_char(code, state.shift) {
-                        if state.typed.len() < 60 {
-                            state.typed.push(c);
-                        }
+            let extended = core::mem::take(&mut input.extended);
+            let released = code & 0x80 != 0;
+            match code & 0x7F {
+                0x2A | 0x36 => input.mods.shift = !released,
+                0x1D => input.mods.ctrl = !released,
+                0x38 => input.mods.alt = !released,
+                _ if released => {}
+                scan => {
+                    if let Some(key) = key_for(scan, extended, input.mods.shift) {
+                        return shell.key(key, input.mods);
                     }
                 }
-                _ => return false,
             }
-            true
+            false
         }
     }
 }
 
-fn click(state: &mut State, screen: &Screen) {
-    let (x, y) = state.pointer;
-    let taskbar_y = screen.height as i32 - TASKBAR;
-    if (2..72).contains(&x) && y >= taskbar_y + 2 {
-        state.menu_open = !state.menu_open;
-        return;
+/// Set 1 scan codes to the shell's keys.
+fn key_for(scan: u8, extended: bool, shift: bool) -> Option<Key> {
+    if extended {
+        return Some(match scan {
+            0x48 => Key::Up,
+            0x50 => Key::Down,
+            0x4B => Key::Left,
+            0x4D => Key::Right,
+            0x47 => Key::Home,
+            0x4F => Key::End,
+            0x49 => Key::PageUp,
+            0x51 => Key::PageDown,
+            0x53 => Key::Delete,
+            0x1C => Key::Enter,
+            0x5B | 0x5C => Key::Logo,
+            0x5D => Key::Apps,
+            _ => return None,
+        });
     }
-    if state.menu_open {
-        let menu_top = taskbar_y - 60;
-        if (2..160).contains(&x) && (menu_top..taskbar_y).contains(&y) {
-            // "Restart": pulse the CPU reset line through the keyboard
-            // controller.
-            crate::log!("OTW kernel: restarting");
-            unsafe { io::outb(0x64, 0xFE) };
-        }
-        state.menu_open = false;
-    }
-}
-
-fn draw(screen: &mut Screen, state: &State, system: &System, drive_c: &[String], heap: &Heap, now: (u8, u8, u8)) {
-    let info = &system.info;
-    let (w, h) = (screen.width as i32, screen.height as i32);
-    screen.fill(0, 0, w, h, TEAL);
-
-    // A window: what this machine is.
-    let disk_lines = system.disks.len().max(1);
-    let extra = disk_lines + drive_c.len().min(8).div_ceil(2) + system.notes.len();
-    let (ww, wh) = (720, 330 + 24 * extra as i32);
-    let (wx, wy) = (w / 2 - ww / 2, (h / 2 - wh / 2).max(10));
-    screen.fill(wx, wy, ww, wh, FACE);
-    screen.bevel(wx, wy, ww, wh, false);
-    screen.fill(wx + 3, wy + 3, ww - 6, 20, NAVY);
-    screen.text(wx + 8, wy + 6, "Welcome to OTW", WHITE, 2);
-    let mut lines = alloc::vec![
-        String::from("OTW is running on this machine by itself:"),
-        String::from("no other operating system underneath."),
-        String::new(),
-        format!("Screen      {} x {}", info.width, info.height),
-        format!("Memory      {} MiB ({} MiB free)", heap.total() >> 20, heap.free_bytes() >> 20),
-        format!("CPUs        {} running", system.cpus),
-        format!("Up for      {} s", crate::apic::now_us() / 1_000_000),
-        format!("Keyboard    {}", if state.ps2 { "PS/2" } else { "none found (USB to come)" }),
-    ];
-    if system.disks.is_empty() {
-        lines.push(String::from("Disks       none found"));
-    }
-    for (i, disk) in system.disks.iter().enumerate() {
-        lines.push(format!("{}{}", if i == 0 { "Disks       " } else { "            " }, disk));
-    }
-    match &system.drive_c {
-        None => lines.push(String::from("Drive C:    not found")),
-        Some(fs) => {
-            lines.push(format!("Drive C:    {} ({} MiB), holding:", fs.volume_label(), fs.total_sectors() as u64 * fs.bytes_per_sector() as u64 >> 20));
-            for row in drive_c.chunks(2).take(4) {
-                let mut line = String::from("            ");
-                for name in row {
-                    let mut name: String = name.chars().take(20).collect();
-                    while name.len() < 22 {
-                        name.push(' ');
-                    }
-                    line.push_str(&name);
+    Some(match scan {
+        0x01 => Key::Escape,
+        0x0E => Key::Backspace,
+        0x0F => Key::Tab,
+        0x1C => Key::Enter,
+        0x3C => Key::F2,
+        0x3E => Key::F4,
+        0x3F => Key::F5,
+        0x44 => Key::F10,
+        0x39 => Key::Char(' '),
+        _ => {
+            const ROWS: [(u8, &str, &str); 4] = [
+                (0x02, "1234567890-=", "!@#$%^&*()_+"),
+                (0x10, "qwertyuiop[]", "QWERTYUIOP{}"),
+                (0x1E, "asdfghjkl;'`", "ASDFGHJKL:\"~"),
+                (0x2C, "zxcvbnm,./", "ZXCVBNM<>?"),
+            ];
+            let mut found = None;
+            for (first, plain, shifted) in ROWS {
+                let chars = if shift { shifted } else { plain };
+                let index = scan.wrapping_sub(first) as usize;
+                if index < chars.len() {
+                    found = chars.chars().nth(index);
+                    break;
                 }
-                lines.push(line);
             }
+            if found.is_none() && scan == 0x2B {
+                found = Some(if shift { '|' } else { '\\' });
+            }
+            Key::Char(found?)
         }
-    }
-    lines.extend(system.notes.iter().cloned());
-    lines.push(String::new());
-    lines.push(format!("Type here:  {}_", state.typed));
-    for (i, line) in lines.iter().enumerate() {
-        screen.text(wx + 16, wy + 36 + i as i32 * 24, line, BLACK, 2);
-    }
-
-    // The taskbar, the Start button and the clock.
-    let ty = h - TASKBAR;
-    screen.fill(0, ty, w, TASKBAR, FACE);
-    screen.fill(0, ty, w, 1, FACE);
-    screen.fill(0, ty + 1, w, 1, WHITE);
-    screen.bevel(2, ty + 3, 70, TASKBAR - 5, state.menu_open);
-    screen.text(10, ty + 8, "Start", BLACK, 2);
-    let clock = format!("{:02}:{:02}", now.0, now.1);
-    screen.bevel(w - 74, ty + 3, 72, TASKBAR - 5, true);
-    screen.text(w - 68, ty + 8, &clock, BLACK, 2);
-
-    if state.menu_open {
-        let top = ty - 60;
-        screen.fill(2, top, 158, 60, FACE);
-        screen.bevel(2, top, 158, 60, false);
-        screen.fill(5, top + 3, 20, 54, SHADOW);
-        screen.text(32, top + 22, "Restart", BLACK, 2);
-    }
-
-    screen.pointer(state.pointer.0, state.pointer.1);
+    })
 }
 
-/// Set 1 scan codes for letters, digits and a few signs.
-fn scan_to_char(code: u8, shift: bool) -> Option<char> {
-    const ROW: [(u8, &str, &str); 4] = [
-        (0x02, "1234567890-=", "!@#$%^&*()_+"),
-        (0x10, "qwertyuiop[]", "QWERTYUIOP{}"),
-        (0x1E, "asdfghjkl;'`", "ASDFGHJKL:\"~"),
-        (0x2C, "zxcvbnm,./", "ZXCVBNM<>?"),
-    ];
-    if code == 0x39 {
-        return Some(' ');
+const ARROW: [&str; 16] = [
+    "X", "XX", "X.X", "X..X", "X...X", "X....X", "X.....X", "X......X", "X.......X", "X........X",
+    "X.....XXXXX", "X..X..X", "X.X X..X", "XX  X..X", "X    X..X", "     XXX",
+];
+
+/// What is on the screen (without the pointer), so that a frame writes only
+/// the rows that changed, and the pointer moves without a frame.
+struct ScreenCopy {
+    framebuffer: *mut u32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    bgr: bool,
+    pixels: Vec<u32>,
+    row: Vec<u32>,
+    pointer: (i32, i32),
+}
+
+impl ScreenCopy {
+    fn new(info: &crate::BootInfo) -> Self {
+        Self {
+            framebuffer: info.framebuffer,
+            width: info.width,
+            height: info.height,
+            stride: info.stride,
+            bgr: info.bgr,
+            // Nothing matches: the first frame is written whole.
+            pixels: vec![0xFF00_0000; info.width * info.height],
+            row: vec![0; info.width],
+            pointer: (-100, -100),
+        }
     }
-    for (first, plain, shifted) in ROW {
-        let index = code.wrapping_sub(first) as usize;
-        let chars = if shift { shifted } else { plain };
-        if let Some(c) = chars.chars().nth(index) {
-            if index < chars.len() {
-                return Some(c);
+
+    /// Show `frame`; returns how many rows changed.
+    fn show(&mut self, frame: &Surface, pointer: (i32, i32)) -> usize {
+        let width = self.width.min(frame.width as usize);
+        let mut changed = 0;
+        for y in 0..self.height.min(frame.height as usize) {
+            let source = &frame.pixels[y * frame.width as usize..][..width];
+            // The frame is 0x00RRGGBB: as it is for a BGR screen, swapped
+            // for RGB.
+            if self.bgr {
+                self.row[..width].copy_from_slice(source);
+            } else {
+                for (target, &p) in self.row.iter_mut().zip(source) {
+                    *target = (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF);
+                }
+            }
+            let copy = &mut self.pixels[y * self.width..][..width];
+            if copy[..] != self.row[..width] {
+                copy.copy_from_slice(&self.row[..width]);
+                self.write_row(y, 0, width);
+                changed += 1;
+            }
+        }
+        // The rows under the old pointer may not have changed: restore them.
+        self.restore_pointer_area();
+        self.pointer = pointer;
+        self.draw_pointer();
+        changed
+    }
+
+    fn move_pointer(&mut self, pointer: (i32, i32)) {
+        self.restore_pointer_area();
+        self.pointer = pointer;
+        self.draw_pointer();
+    }
+
+    fn write_row(&self, y: usize, x0: usize, x1: usize) {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.pixels.as_ptr().add(y * self.width + x0),
+                self.framebuffer.add(y * self.stride + x0),
+                x1 - x0,
+            );
+        }
+    }
+
+    fn restore_pointer_area(&self) {
+        let (px, py) = self.pointer;
+        let x0 = px.clamp(0, self.width as i32) as usize;
+        let x1 = (px + 12).clamp(0, self.width as i32) as usize;
+        for y in py.max(0)..(py + 16).min(self.height as i32) {
+            if x1 > x0 {
+                self.write_row(y as usize, x0, x1);
             }
         }
     }
-    None
+
+    fn draw_pointer(&self) {
+        let (px, py) = self.pointer;
+        for (dy, line) in ARROW.iter().enumerate() {
+            let y = py + dy as i32;
+            if y < 0 || y >= self.height as i32 {
+                continue;
+            }
+            for (dx, c) in line.chars().enumerate() {
+                let x = px + dx as i32;
+                let color = match c {
+                    'X' => 0,
+                    '.' => 0x00FF_FFFF,
+                    _ => continue,
+                };
+                if x >= 0 && (x as usize) < self.width {
+                    unsafe { *self.framebuffer.add(y as usize * self.stride + x as usize) = color };
+                }
+            }
+        }
+    }
+}
+
+/// How long frames take, reported now and then.
+#[derive(Default)]
+struct FrameStats {
+    frames: u64,
+    paint_us: u64,
+    show_us: u64,
+    rows: u64,
+}
+
+impl FrameStats {
+    fn add(&mut self, paint_us: u64, show_us: u64, rows: usize) {
+        self.frames += 1;
+        self.paint_us += paint_us;
+        self.show_us += show_us;
+        self.rows += rows as u64;
+        if self.frames % 20 == 1 {
+            log!(
+                "OTW kernel: frames: {} so far; on average {} us painting, {} us showing, {} rows changed",
+                self.frames,
+                self.paint_us / self.frames,
+                self.show_us / self.frames,
+                self.rows / self.frames
+            );
+        }
+    }
 }

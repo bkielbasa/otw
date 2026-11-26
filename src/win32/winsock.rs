@@ -6,6 +6,11 @@
 //! server or the internet without reimplementing TCP/IP in the VM. The guest
 //! still sees WinSock handles, error codes and structure layouts.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
@@ -1515,6 +1520,10 @@ fn bounded_length(length: u32) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use std::{net::TcpListener, thread};
 
     use super::*;

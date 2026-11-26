@@ -8,6 +8,11 @@
 //! answers through `DWL_MSGRESULT`) and pages talk to the sheet with
 //! `PSM_*` messages, as in Windows.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{
     controls::{self, DialogTemplate, TemplateItem},
     unicode,

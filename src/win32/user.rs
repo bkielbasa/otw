@@ -8,6 +8,11 @@
 //! into the queue at retrieval time, and WM_PAINT/WM_TIMER are synthesised
 //! from update regions and timers exactly when the queue is otherwise empty.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::gdi::{self, read_rect, sys_color, write_rect, DcTarget, SYSBRUSH_BASE},

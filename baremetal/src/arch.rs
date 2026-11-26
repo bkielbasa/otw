@@ -250,6 +250,10 @@ extern "sysv64" fn interrupt(frame: &mut Frame) {
             crate::apic::end_of_interrupt();
         }
         v if v == WAKE_VECTOR as u64 => crate::apic::end_of_interrupt(),
+        v if v == crate::io::KEYBOARD_VECTOR as u64 || v == crate::io::MOUSE_VECTOR as u64 => {
+            crate::io::ps2_interrupt();
+            crate::apic::end_of_interrupt();
+        }
         v if v == SPURIOUS_VECTOR as u64 => {}
         v if v < 32 => exception(frame),
         _ => crate::apic::end_of_interrupt(),
@@ -374,6 +378,30 @@ fn map_2mib(address: u64, flags: u64) {
         }
         *table.add((address >> 21 & 511) as usize) = address | PRESENT | WRITABLE | HUGE | flags;
     }
+}
+
+/// The page attribute table: entry 1 (page tables' write-through bit
+/// alone) becomes write-combining, for the framebuffer; the rest keep
+/// their power-on meaning. Every CPU loads the same table.
+pub fn load_page_attributes() {
+    // WB, WC, UC-, UC, WB, WT, UC-, UC
+    write_msr(0x277, 0x0007_0406_0007_0106);
+}
+
+/// Map the framebuffer write-combining: writes to it are batched rather
+/// than sent one at a time, which is what makes drawing fast on real
+/// hardware.
+pub fn map_framebuffer(address: u64, size: u64) {
+    let start = address / TWO_MIB * TWO_MIB;
+    let end = (address + size).div_ceil(TWO_MIB) * TWO_MIB;
+    let mut page = start;
+    while page < end {
+        map_2mib(page, WRITE_THROUGH);
+        unsafe { asm!("invlpg [{}]", in(reg) page) };
+        page += TWO_MIB;
+    }
+    // Drop whatever the caches hold for it.
+    unsafe { asm!("wbinvd") };
 }
 
 /// Make device registers at [address, address + size) reachable, uncached.

@@ -3,6 +3,11 @@
 //! expanding and collapsing, single selection, hit testing and the parent
 //! notifications programs rely on.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 
 use crate::win32::{

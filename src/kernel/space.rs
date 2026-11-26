@@ -8,6 +8,11 @@
 //! enters the system (an API call, a fault on memory it has not mapped
 //! yet).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard},

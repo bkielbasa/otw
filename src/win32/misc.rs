@@ -5,6 +5,11 @@
 //! and never block. DDE has no other programs to talk to: conversations fail
 //! to connect. Window regions are not modelled (windows stay rectangular).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::{unicode, ApiContext, ApiOutcome, GuestMemory},

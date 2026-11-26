@@ -5,6 +5,11 @@
 //! `\VarFileInfo\Translation` and `\StringFileInfo\<lang>\<name>` with the
 //! value, strings converted to ANSI.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{crt, read_cstr, ApiContext, ApiOutcome, GuestMemory};
 
 pub fn arg_count(name: &str) -> Option<usize> {

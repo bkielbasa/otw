@@ -4,6 +4,11 @@
 //! program sets. Host variables named `OTW_ENV_<NAME>` add `<NAME>`, to
 //! pass settings to a guest (e.g. `OTW_ENV_MOZ_CRASHREPORTER_DISABLE=1`).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::ApiContext;
 
 #[derive(Debug, Default)]

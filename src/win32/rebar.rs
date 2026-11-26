@@ -3,6 +3,11 @@
 //! parent. Bands are added and changed with `REBARBANDINFO`, read in the
 //! process's layout.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{
     gdi::sys_color,
     gfx::Rect,

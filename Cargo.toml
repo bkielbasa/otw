@@ -8,9 +8,13 @@ publish = false
 
 [dependencies]
 # x86-only CPU backend for the VM. Other architectures are not needed yet.
-unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"] }
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_x86"], optional = true }
 # Local time for the taskbar clock.
-libc = "0.2"
+libc = { version = "0.2", optional = true }
+# Hash maps without std (the bare-metal build).
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+# Floating point functions without std.
+libm = "0.2"
 
 # Optional host window for displaying captured guest frames. Kept out of the
 # default build so the packaged static-pie binary stays dependency-free.
@@ -20,11 +24,15 @@ glutin-winit = { version = "0.5", default-features = false, features = ["glx", "
 winit = { version = "0.30", default-features = false, features = ["x11", "rwh_06"], optional = true }
 
 [features]
-default = []
+default = ["std"]
+# Linux: std, the Unicorn CPU, the host's files, clock and network. Without
+# it the library builds for bare metal (baremetal/), where the kernel
+# provides those through `platform`.
+std = ["dep:unicorn-engine", "dep:libc"]
 # Embed the genuine Win95 NOTEPAD.EXE so the packaged binary is self-contained.
 embedded-target = []
 # Build the host-side OpenGL window and event loop.
-display = ["dep:glow", "dep:glutin", "dep:glutin-winit", "dep:winit"]
+display = ["std", "dep:glow", "dep:glutin", "dep:glutin-winit", "dep:winit"]
 
 [profile.dev]
 opt-level = 1

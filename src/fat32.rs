@@ -8,6 +8,11 @@
 //! It needs only `core` and `alloc`: the bare-metal kernel (`baremetal/`)
 //! builds it too, over a disk instead of an image in memory (`Volume`).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use alloc::{
     collections::BTreeSet,
     format,
@@ -591,6 +596,10 @@ fn build_long_name(slots: &[Option<LfnSlot>], len: usize, short_name: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     fn put_u16(image: &mut [u8], offset: usize, value: u16) {

@@ -11,6 +11,11 @@
 //! so on) are never loaded from disk, even when a genuine copy is there:
 //! their handles are synthetic and their exports are dynamic thunks.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::{
         loader,

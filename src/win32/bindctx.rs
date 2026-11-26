@@ -3,6 +3,11 @@
 //! together) and named object parameters (URL monikers keep their binding
 //! callbacks there).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::{unicode, ApiContext, ApiOutcome, GuestMemory},

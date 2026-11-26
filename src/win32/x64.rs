@@ -14,6 +14,11 @@
 //! procedure, and the program sending to the subsystem's), and results are
 //! widened to 64 bits. The subsystem's functions themselves stay 32-bit.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::{pe::ImportName, syscall::widen},
     win32::{ApiContext, ApiOutcome, GuestMemory},
@@ -435,6 +440,10 @@ pub fn call_hook<M: GuestMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

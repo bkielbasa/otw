@@ -4,6 +4,11 @@
 //! address. The CPU recognises a call to a thunk and turns it into a system
 //! call (see [`super::syscall`]).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 
 use super::pe::{ImportName, PeError, PeImage};

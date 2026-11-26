@@ -12,6 +12,15 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[dependencies]
+# OTW itself: the Win32 subsystem, the shell, FAT32 — built without std,
+# with this kernel providing what it needs (`platform::System`).
+otw-vm = { path = "..", default-features = false }
+
+[features]
+# Read a big file from drive C: at boot, to measure the disk.
+disk-test = []
+
 [profile.dev]
 panic = "abort"
 

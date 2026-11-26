@@ -4,8 +4,13 @@
 //! `__finally` (`_except_handler3`). These are frame handlers called by the
 //! kernel's exception dispatcher (`kernel::eh`).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
-    kernel::cpu::TIB_BASE,
+    kernel::layout::TIB_BASE,
     kernel::eh::{
         global_unwind, raise, rd, rdi, trace, wr, CONTINUE_EXECUTION, CONTINUE_SEARCH,
         EH_EXIT_UNWIND, EH_NONCONTINUABLE, EH_UNWINDING,

@@ -6,6 +6,11 @@
 //!
 //! Inside the guest the files appear as `C:\WINDOWS\FONTS\<name>`.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -908,6 +913,10 @@ pub fn render(face: &FaceData, glyphs: &[(u16, f32, f32)], scale: [f32; 4]) -> R
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

@@ -2,6 +2,11 @@
 //! `ShellLinkHeader`, a `LinkInfo` naming the local target path, and ANSI
 //! string data (description, working directory, arguments).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 const HEADER_SIZE: u32 = 0x4C;
 const LINK_CLSID: [u8; 16] = [
     0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
@@ -173,6 +178,10 @@ pub fn read(bytes: &[u8]) -> Option<ShellLink> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

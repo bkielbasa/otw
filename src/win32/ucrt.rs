@@ -8,6 +8,11 @@
 //! (x64), where floating-point results also go. Formatted output takes the
 //! `va_list` the inline `printf` family builds: pointer-sized slots.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -3171,6 +3176,10 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     struct Flat(Vec<u8>);

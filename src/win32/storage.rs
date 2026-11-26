@@ -3,6 +3,11 @@
 //! documents into storages; the tree of storages and streams lives here and
 //! the guest sees ordinary COM objects with Rust-backed vtables.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::win32::{ApiContext, ApiOutcome, GuestMemory};

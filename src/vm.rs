@@ -2,6 +2,11 @@
 //! genuine DLLs into a process image, and the Win32 subsystem provides the
 //! system calls behind its other imports.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},

@@ -5,14 +5,21 @@
 //! program. Double-clicking a shortcut reads the genuine bytes from the image,
 //! discovers the DLLs that binary imports, and maps them into a fresh guest VM.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
+#[cfg(feature = "std")]
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
     rc::Rc,
 };
 
+use crate::fat32::Fat32FileSystem;
+#[cfg(feature = "std")]
 use crate::{
-    fat32::Fat32FileSystem,
     kernel::pe::PeImage,
     session::Session,
     shell::volume::{parse_path, Volume},
@@ -112,6 +119,7 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 fn parent_path(path: &str) -> String {
     path.rsplit_once(['\\', '/'])
         .map(|(parent, _)| parent.to_string())
@@ -155,6 +163,7 @@ fn scan_directory(fs: &Fat32FileSystem, path: &str, out: &mut Vec<DesktopShortcu
     }
 }
 
+#[cfg(feature = "std")]
 /// Build a guest VM from a program on the shell's volume (drive C: or a
 /// disk image).
 ///
@@ -237,6 +246,7 @@ pub fn build_vm(
     Ok(vm)
 }
 
+#[cfg(feature = "std")]
 /// Start a program from the volume in a desktop session, running beside
 /// the others. Returns its process id.
 pub fn spawn(
@@ -255,6 +265,7 @@ pub fn spawn(
     })
 }
 
+#[cfg(feature = "std")]
 fn find_module(fs: &Volume, directory: &str, dll: &str) -> Option<Vec<u8>> {
     let candidates = [
         join_path(directory, dll),
@@ -270,6 +281,7 @@ fn find_module(fs: &Volume, directory: &str, dll: &str) -> Option<Vec<u8>> {
     find_module_in_tree(fs, dll, "/", 0)
 }
 
+#[cfg(feature = "std")]
 fn find_module_in_tree(fs: &Volume, dll: &str, path: &str, depth: usize) -> Option<Vec<u8>> {
     if depth > 16 {
         return None;
@@ -292,6 +304,10 @@ fn find_module_in_tree(fs: &Volume, dll: &str, path: &str, depth: usize) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

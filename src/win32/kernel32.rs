@@ -1,5 +1,10 @@
 //! KERNEL32 memory, file, resource, atom and time services.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     win32::crt,
     win32::user::{self, ResName},

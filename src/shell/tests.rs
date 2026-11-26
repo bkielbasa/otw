@@ -1,6 +1,11 @@
 //! Shell behaviour driven through pointer and key input, on a temporary
 //! drive C: set up like a fresh install.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use super::*;
 
 struct Fixture {

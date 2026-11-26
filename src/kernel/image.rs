@@ -2,6 +2,11 @@
 //! bases, their imports bound to DLL code or to system-call thunks, the
 //! subsystem's extra entry points, and the command line.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::fmt;
 
 use super::{

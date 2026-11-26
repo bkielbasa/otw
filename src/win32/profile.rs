@@ -3,6 +3,11 @@
 //! without a directory lives in the Windows directory; the plain `Profile`
 //! functions use WIN.INI.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{crt, read_cstr, unicode, ApiContext, ApiOutcome, GuestMemory};
 
 pub fn arg_count(name: &str) -> Option<usize> {
@@ -418,6 +423,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

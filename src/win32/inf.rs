@@ -2,6 +2,11 @@
 //! registry directives (`AddReg`, `DelReg`), as SETUPAPI and ADVPACK
 //! process them for installers and self-registering DLLs.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 
 use crate::win32::registry;
@@ -399,6 +404,10 @@ fn del_reg(fields: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

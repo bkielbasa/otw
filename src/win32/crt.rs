@@ -4,6 +4,11 @@
 //! Guest paths on drive C: map to a host directory (`OTW_DRIVE_C`, default
 //! `~/.otw/C`). Components are matched case-insensitively, like FAT.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -1151,6 +1156,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

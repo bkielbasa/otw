@@ -4,6 +4,11 @@
 //! implemented: DOS/PE headers, section table, and the import directory. The
 //! parser never executes the image.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{collections::HashMap, fmt};
 
 const DOS_HEADER_MIN: usize = 0x40;

@@ -7,6 +7,11 @@
 //! Windows does. While a host display is attached, `CF_TEXT` is mirrored to
 //! the host's X11 clipboard through `xclip`.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 
 use crate::{
@@ -151,6 +156,7 @@ fn host_enabled<M: GuestMemory + ?Sized>(memory: &M) -> bool {
 }
 
 /// Windows text (Latin-1, CRLF) to host UTF-8 with LF.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 fn to_host_text(text: &[u8]) -> String {
     text.iter()
         .filter(|b| **b != b'\r')
@@ -172,6 +178,10 @@ fn from_host_text(text: &str) -> Vec<u8> {
     out
 }
 
+#[cfg(not(feature = "std"))]
+fn push_host(_ctx: &ApiContext, _text: &[u8]) {}
+
+#[cfg(feature = "std")]
 fn push_host(ctx: &ApiContext, text: &[u8]) {
     use std::io::Write;
     let host = to_host_text(text);
@@ -791,6 +801,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

@@ -6,6 +6,11 @@
 //! its waits call `run` to let the others proceed — and a process is never
 //! resumed from inside itself.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,

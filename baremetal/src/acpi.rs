@@ -6,7 +6,10 @@ use alloc::vec::Vec;
 pub struct Machine {
     /// APIC ids of the CPUs that can run.
     pub cpus: Vec<u32>,
-    pub io_apics: Vec<u64>,
+    /// I/O APICs: registers' address and first interrupt line.
+    pub io_apics: Vec<(u64, u32)>,
+    /// ISA interrupts wired differently: (IRQ, interrupt line, flags).
+    pub overrides: Vec<(u8, u32, u16)>,
 }
 
 unsafe fn read<T: Copy>(address: u64) -> T {
@@ -60,7 +63,8 @@ unsafe fn madt(table: u64, machine: &mut Machine) {
                     machine.cpus.push(id as u32);
                 }
             }
-            1 => machine.io_apics.push(read::<u32>(at + 4) as u64),
+            1 => machine.io_apics.push((read::<u32>(at + 4) as u64, read::<u32>(at + 8))),
+            2 => machine.overrides.push((read::<u8>(at + 3), read::<u32>(at + 4), read::<u16>(at + 8))),
             // Local x2APIC: APIC id, flags.
             9 => {
                 let id: u32 = read(at + 4);

@@ -2,6 +2,11 @@
 //! 48 basic colors, 16 custom colors and, after "Define Custom Colors >>",
 //! a hue/saturation spectrum, a luminance bar and HSL/RGB edit fields.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     win32::controls,
     win32::gdi::sys_color,
@@ -941,6 +946,10 @@ pub fn choose_color<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, c
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

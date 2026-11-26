@@ -114,7 +114,8 @@ pub fn ps2_init() -> bool {
     ps2_command(0xA8); // enable the mouse port
     ps2_command(0x20); // read the configuration byte
     let config = if ps2_wait_read() { unsafe { inb(PS2_DATA) } } else { 0 };
-    // Keep translation (scan code set 1), interrupts off: the kernel polls.
+    // Keep translation (scan code set 1), both ports on; interrupts as
+    // `ps2_route_interrupts` decides (off until then: the kernel polls).
     let config = (config | 0x40) & !0x03 & !0x20 & !0x10;
     ps2_command(0x60);
     ps2_wait_write();
@@ -131,13 +132,119 @@ pub enum Input {
     Mouse(u8),
 }
 
+/// The next byte from the keyboard or mouse: from what the interrupt
+/// handler collected, or straight from the controller while it does not
+/// interrupt.
 pub fn ps2_poll() -> Option<Input> {
+    use core::sync::atomic::Ordering;
+    if INTERRUPTS.load(Ordering::Acquire) {
+        let tail = TAIL.load(Ordering::Acquire);
+        if tail == HEAD.load(Ordering::Acquire) {
+            return None;
+        }
+        let entry = RING[tail % RING.len()].load(Ordering::Acquire);
+        TAIL.store(tail + 1, Ordering::Release);
+        let byte = entry as u8;
+        return Some(if entry & 0x100 != 0 { Input::Mouse(byte) } else { Input::Key(byte) });
+    }
     let status = unsafe { inb(PS2_STATUS) };
     if status & 1 == 0 {
         return None;
     }
     let byte = unsafe { inb(PS2_DATA) };
     Some(if status & 0x20 != 0 { Input::Mouse(byte) } else { Input::Key(byte) })
+}
+
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize};
+
+static INTERRUPTS: AtomicBool = AtomicBool::new(false);
+/// Bytes the interrupt handler read (bit 8: from the mouse); the handler
+/// adds at HEAD, the desktop takes from TAIL.
+static RING: [AtomicU16; 512] = [const { AtomicU16::new(0) }; 512];
+static HEAD: AtomicUsize = AtomicUsize::new(0);
+static TAIL: AtomicUsize = AtomicUsize::new(0);
+
+pub const KEYBOARD_VECTOR: u8 = 40;
+pub const MOUSE_VECTOR: u8 = 41;
+
+/// The keyboard or mouse interrupted: collect what it has.
+pub fn ps2_interrupt() {
+    use core::sync::atomic::Ordering;
+    for _ in 0..16 {
+        let status = unsafe { inb(PS2_STATUS) };
+        if status & 1 == 0 {
+            break;
+        }
+        let byte = unsafe { inb(PS2_DATA) } as u16;
+        let entry = byte | if status & 0x20 != 0 { 0x100 } else { 0 };
+        let head = HEAD.load(Ordering::Relaxed);
+        if head - TAIL.load(Ordering::Acquire) < RING.len() {
+            RING[head % RING.len()].store(entry, Ordering::Release);
+            HEAD.store(head + 1, Ordering::Release);
+        }
+    }
+}
+
+/// Wire the keyboard (IRQ 1) and mouse (IRQ 12) through the I/O APIC to
+/// this CPU, and let the controller interrupt.
+pub fn ps2_route_interrupts(machine: &crate::acpi::Machine) {
+    use core::sync::atomic::Ordering;
+    let mut routed = 0;
+    for (irq, vector) in [(1u8, KEYBOARD_VECTOR), (12u8, MOUSE_VECTOR)] {
+        // An override names the line and its polarity and trigger.
+        let (line, flags) = machine
+            .overrides
+            .iter()
+            .find(|(source, _, _)| *source == irq)
+            .map(|&(_, line, flags)| (line, flags))
+            .unwrap_or((irq as u32, 0));
+        let Some(&(base, first)) = machine.io_apics.iter().find(|(base, first)| {
+            line >= *first && line < first + io_apic_lines(*base)
+        }) else {
+            continue;
+        };
+        let mut low = vector as u32;
+        if flags & 0x3 == 0x3 {
+            low |= 1 << 13; // active low
+        }
+        if flags & 0xC == 0xC {
+            low |= 1 << 15; // level
+        }
+        let index = line - first;
+        let apic_id = crate::apic::apic_id();
+        io_apic_write(base, 0x11 + 2 * index, apic_id << 24);
+        io_apic_write(base, 0x10 + 2 * index, low);
+        routed += 1;
+    }
+    if routed == 2 {
+        INTERRUPTS.store(true, Ordering::Release);
+        ps2_command(0x20);
+        let config = if ps2_wait_read() { unsafe { inb(PS2_DATA) } } else { 0x40 };
+        ps2_command(0x60);
+        ps2_wait_write();
+        unsafe { outb(PS2_DATA, config | 0x03) };
+        crate::log!("OTW kernel: keyboard and mouse interrupt");
+    }
+}
+
+fn io_apic_lines(base: u64) -> u32 {
+    ((io_apic_read(base, 1) >> 16) & 0xFF) + 1
+}
+
+fn io_apic_read(base: u64, register: u32) -> u32 {
+    crate::arch::map_device(base, 0x20);
+    unsafe {
+        core::ptr::write_volatile(base as *mut u32, register);
+        core::ptr::read_volatile((base + 0x10) as *const u32)
+    }
+}
+
+fn io_apic_write(base: u64, register: u32, value: u32) {
+    crate::arch::map_device(base, 0x20);
+    unsafe {
+        core::ptr::write_volatile(base as *mut u32, register);
+        core::ptr::write_volatile((base + 0x10) as *mut u32, value);
+    }
 }
 
 // ── CMOS real-time clock ──
@@ -164,4 +271,24 @@ pub fn rtc_time() -> (u8, u8, u8) {
         h = ((h & 0x7F) + 12) % 24;
     }
     (h, m, s)
+}
+
+/// Seconds since 1970 from the CMOS clock (taken as UTC).
+pub fn rtc_unix_time() -> u64 {
+    while cmos(0x0A) & 0x80 != 0 {}
+    let status_b = cmos(0x0B);
+    let bcd = |v: u8| if status_b & 0x04 == 0 { (v & 0x0F) + (v >> 4) * 10 } else { v };
+    let (h, m, s) = rtc_time();
+    let day = bcd(cmos(0x07)) as i64;
+    let month = bcd(cmos(0x08)) as i64;
+    let year = 2000 + bcd(cmos(0x09)) as i64;
+    // Days from a civil date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    (days * 86_400 + h as i64 * 3600 + m as i64 * 60 + s as i64).max(0) as u64
 }

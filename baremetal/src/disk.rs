@@ -7,8 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-#[path = "../../src/fat32.rs"]
-pub mod fat32;
+pub use otw_vm::fat32;
 
 use crate::sync::SpinLock;
 

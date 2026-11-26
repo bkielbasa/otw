@@ -11,6 +11,11 @@
 //! knows the innermost process lock it holds (a program started inside
 //! another's call runs on its parent's host thread with a lock of its own).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{
     cell::RefCell,
     sync::{Arc, Condvar, Mutex},

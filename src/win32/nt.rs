@@ -8,6 +8,11 @@
 //! processes' memory, file mapping through the native API) report failure
 //! the way Windows does, so programs take their fallback paths.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::{HashMap, VecDeque};
 
 use crate::{
@@ -954,9 +959,12 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                     bytes.extend_from_slice(&0u32.to_le_bytes());
                 }
                 18 => {
-                    use std::os::unix::fs::MetadataExt;
+                    #[cfg(feature = "std")]
+                    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+                    #[cfg(not(feature = "std"))]
+                    let inode = metadata.len() ^ 0x5A5A;
                     bytes.extend_from_slice(&0x4F54_5700u64.to_le_bytes());
-                    bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+                    bytes.extend_from_slice(&inode.to_le_bytes());
                     bytes.extend_from_slice(&0u64.to_le_bytes());
                 }
                 _ => {

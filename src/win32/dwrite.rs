@@ -7,6 +7,11 @@
 //! textures, and GDI interop for LOGFONTs. Interfaces added after Windows
 //! 7 (IDWriteFactory1 and on) are not: programs fall back without them.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::HashMap;
 
 use crate::win32::{

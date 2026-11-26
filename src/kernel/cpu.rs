@@ -7,6 +7,11 @@
 //! writes EAX, pops the return address and arguments, and resumes at the
 //! original return address.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{cell::RefCell, collections::VecDeque, fmt, rc::Rc};
 
 use unicorn_engine::{
@@ -20,6 +25,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+pub use super::layout::{SENTINEL_BASE, STACK_BASE, STACK_SIZE, STACK_TOP, TIB_BASE};
 use super::{
     iat::THUNK_BASE,
     lock::BigLock,
@@ -29,22 +35,14 @@ use super::{
     syscall::SystemCalls,
 };
 
-pub const STACK_BASE: u32 = 0x0010_0000;
-pub const STACK_SIZE: u32 = 0x0010_0000;
-pub const STACK_TOP: u32 = STACK_BASE + STACK_SIZE - 0x100;
+
+
+
 /// The range of a 64-bit process's memory pool (see `AddressSpace`).
 const POOL_START: u64 = memory::POOL_BASE as u64;
 const POOL_END: u64 = memory::NTDLL_HANDLE as u64;
 /// The bottom of a 64-bit program's first stack.
 const X64_STACK_LOW: u32 = 0x0001_0000;
-
-/// Synthetic Win95 pages sit above genuine high-based DLLs. OLE32 loads at
-/// `0x7ff60000` with a `0x86000` image, ending at `0x7ffe6000`, so the TIB,
-/// loader state and GDT must stay above that range.
-///
-/// Minimal Win95-style thread information block. MSVC CRT startup code reads
-/// and writes `FS:[0]` to install its structured exception handler chain.
-pub const TIB_BASE: u32 = 0x7FFF_0000;
 pub const TIB_SIZE: u32 = 0x1000;
 /// A 64-bit thread's TEB (0x1838 bytes) and its process's PEB after it.
 pub const TEB64_SIZE: u32 = 0x3000;
@@ -68,9 +66,6 @@ const VXD_GATES: [u32; 5] = [
 ];
 
 const PAGE_SIZE: u32 = 0x1000;
-/// A single `ret` instruction used as the return address for synthetic
-/// DllMain calls. Unicorn stops before executing it.
-pub const SENTINEL_BASE: u32 = 0x6FFF_0000;
 /// Top-level emulation runs until EIP reaches this address; a program that
 /// yields jumps here, which ends the run like the sentinel ends callbacks.
 const YIELD_ADDRESS: u32 = SENTINEL_BASE + 0x100;
@@ -2949,6 +2944,10 @@ fn build<'a>(
 /// OTW_STATS=1: how long API calls take, by function (including the guest
 /// code they call back and their waits), printed now and then.
 mod api_stats {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use std::{cell::RefCell, collections::HashMap, time::{Duration, Instant}};
 
     thread_local! {

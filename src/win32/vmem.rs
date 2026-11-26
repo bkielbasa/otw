@@ -8,6 +8,11 @@
 //! A reservation is mapped in the CPU whole; commitment is bookkeeping (a
 //! reserved page is readable, where Windows would fault).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::BTreeMap;
 
 use crate::win32::{ApiContext, GuestMemory};

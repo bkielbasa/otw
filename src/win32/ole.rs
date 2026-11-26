@@ -5,6 +5,11 @@
 //! OLE servers and containers; embedding, linking, monikers and structured
 //! storage report `E_NOTIMPL`, which MFC turns into graceful failures.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::{ApiContext, ApiOutcome, GuestMemory},

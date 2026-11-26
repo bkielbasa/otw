@@ -8,6 +8,11 @@
 //! data has come (the writer, in another process, cannot reach this
 //! process's memory).
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::win32::{

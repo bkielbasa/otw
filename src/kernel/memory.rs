@@ -5,6 +5,11 @@
 //! exception handler, yielding to other processes. System calls receive one
 //! and return an [`ApiOutcome`].
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 /// Base of the guest heap used by LocalAlloc/GlobalAlloc/malloc.
 pub const HEAP_BASE: u32 = 0x0080_0000;
 /// Size of the guest heap (120 MiB, ending at 0x0800_0000).
@@ -46,7 +51,15 @@ impl SharedMemory {
     /// host lazily: untouched pages cost nothing).
     pub fn new(size: usize) -> Option<std::sync::Arc<Self>> {
         let size = (size.max(1) + 0xFFF) & !0xFFF;
+        #[cfg(not(feature = "std"))]
+        {
+            let layout = core::alloc::Layout::from_size_align(size, 0x1000).ok()?;
+            // SAFETY: a fresh zeroed allocation, owned by this value.
+            let pointer = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            return (!pointer.is_null()).then(|| std::sync::Arc::new(Self { pointer, size }));
+        }
         // SAFETY: an anonymous private mapping, owned by this value.
+        #[cfg(feature = "std")]
         let pointer = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -57,7 +70,8 @@ impl SharedMemory {
                 0,
             )
         };
-        (pointer != libc::MAP_FAILED).then(|| std::sync::Arc::new(Self { pointer: pointer as *mut u8, size }))
+        #[cfg(feature = "std")]
+        return (pointer != libc::MAP_FAILED).then(|| std::sync::Arc::new(Self { pointer: pointer as *mut u8, size }));
     }
 
     pub fn len(&self) -> usize {
@@ -87,10 +101,15 @@ impl SharedMemory {
     pub fn zero(&self, offset: usize, len: usize) {
         let end = (offset + len).min(self.size);
         let start = offset.min(end);
+        #[cfg(feature = "std")]
         let page_start = (start + 0xFFF) & !0xFFF;
+        #[cfg(feature = "std")]
         let page_end = end & !0xFFF;
         // SAFETY: inside the allocation.
         unsafe {
+            #[cfg(not(feature = "std"))]
+            std::ptr::write_bytes(self.pointer.add(start), 0, end - start);
+            #[cfg(feature = "std")]
             if page_end > page_start {
                 std::ptr::write_bytes(self.pointer.add(start), 0, page_start - start);
                 libc::madvise(self.pointer.add(page_start) as *mut libc::c_void, page_end - page_start, libc::MADV_DONTNEED);
@@ -104,8 +123,15 @@ impl SharedMemory {
 
 impl Drop for SharedMemory {
     fn drop(&mut self) {
-        // SAFETY: mapped in `new` with this size.
-        unsafe { libc::munmap(self.pointer as *mut libc::c_void, self.size) };
+        // SAFETY: mapped (allocated) in `new` with this size.
+        #[cfg(feature = "std")]
+        unsafe {
+            libc::munmap(self.pointer as *mut libc::c_void, self.size)
+        };
+        #[cfg(not(feature = "std"))]
+        unsafe {
+            alloc::alloc::dealloc(self.pointer, core::alloc::Layout::from_size_align_unchecked(self.size, 0x1000))
+        };
     }
 }
 
@@ -311,7 +337,7 @@ pub trait GuestMemory {
 
     /// The running thread's TIB (FS:0).
     fn current_tib(&self) -> u32 {
-        crate::kernel::cpu::TIB_BASE
+        crate::kernel::layout::TIB_BASE
     }
 
     /// Threads that are not on the CPU and have not ended.

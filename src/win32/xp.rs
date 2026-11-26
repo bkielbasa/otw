@@ -3,6 +3,11 @@
 //! unhandled-exception filter, pointer encoding, code-page information and
 //! console stubs.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::eh,
     win32::{ApiContext, ApiOutcome, GuestMemory},

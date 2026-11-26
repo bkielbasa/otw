@@ -8,6 +8,11 @@
 //! Both are excluded from default builds so the packaged static-pie binary
 //! does not link against X11 or OpenGL.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{cell::RefCell, fmt, rc::Rc, time::Duration};
 
 use glow::HasContext;
@@ -2399,6 +2404,10 @@ fn draw_text_in(
 
 #[cfg(all(test, feature = "display"))]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
     use crate::win32::GuestWindow;
 

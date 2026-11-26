@@ -3,6 +3,11 @@
 //! the `[Extensions]` file associations in `WIN.INI`. Existing files are
 //! never overwritten, so the user's changes survive.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::path::{Path, PathBuf};
 
 use super::volume::{join, parse_path, VolPath, Volume};
@@ -109,6 +114,10 @@ pub fn association(volume: &Volume, extension: &str) -> Option<VolPath> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

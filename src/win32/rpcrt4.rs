@@ -2,6 +2,11 @@
 //! call. Every object lives in its program's single apartment, so nothing is
 //! ever marshalled: proxies register successfully and are never created.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::win32::{ApiContext, ApiOutcome, GuestMemory};
 
 const S_OK: u32 = 0;

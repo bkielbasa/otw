@@ -10,6 +10,11 @@
 //! Every object lives in the program's single apartment: there are no
 //! local (out-of-process) servers and nothing is marshalled.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::{module, registry, shell, ApiContext, ApiOutcome, GuestMemory},

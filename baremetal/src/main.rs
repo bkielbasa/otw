@@ -25,6 +25,7 @@ mod pci;
 mod screen;
 mod smp;
 mod sync;
+mod system;
 mod uefi;
 
 use alloc::string::String;
@@ -73,9 +74,17 @@ pub struct System {
 }
 
 static BOOT_INFO: AtomicPtr<BootInfo> = AtomicPtr::new(null_mut());
+/// The time-stamp counter when the firmware started the kernel.
+static BOOT_TSC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since the firmware started the kernel.
+pub fn ms_since_start() -> u64 {
+    (arch::rdtsc() - BOOT_TSC.load(Ordering::SeqCst)) / apic::tsc_mhz().max(1) / 1000
+}
 
 #[no_mangle]
 pub extern "efiapi" fn efi_main(image: uefi::Handle, system: *mut uefi::SystemTable) -> uefi::Status {
+    BOOT_TSC.store(arch::rdtsc(), Ordering::SeqCst);
     io::serial_init();
     log!("OTW kernel: starting");
     let (info, regions, count) = unsafe { take_machine(image, system) };
@@ -104,6 +113,9 @@ extern "sysv64" fn kernel_main(regions: &Vec<Region>) -> ! {
     arch::load_cpu_tables();
     arch::load_idt();
     arch::build_page_tables(info.memory_end.max(4 << 30));
+    arch::load_page_attributes();
+    let framebuffer_size = (info.stride * info.height * 4) as u64;
+    arch::map_framebuffer(info.framebuffer as u64, framebuffer_size);
     // The firmware's boot services memory is free now (the kernel has its
     // own stack, tables and page tables).
     let mut reclaimed = 0;
@@ -130,32 +142,39 @@ extern "sysv64" fn kernel_main(regions: &Vec<Region>) -> ! {
     if info.trampoline != 0 && machine.cpus.len() > 1 {
         smp::start_others(&machine.cpus, info.trampoline);
     }
-    log!("OTW kernel: {} of {} CPUs running", apic::cpu_count(), machine.cpus.len().max(1));
+    log!("OTW kernel: {} of {} CPUs running ({} ms)", apic::cpu_count(), machine.cpus.len().max(1), ms_since_start());
+    // The keyboard and mouse interrupt (rather than being asked 100 times
+    // a second).
+    let ps2 = io::ps2_init();
+    if ps2 {
+        io::ps2_route_interrupts(&machine);
+    }
 
     let (disks, drive_c) = find_disks();
+    log!("OTW kernel: disks found ({} ms)", ms_since_start());
+    // With the disk-test feature: read a big file whole at boot, to see the
+    // disk work (and how fast).
     let mut notes = Vec::new();
-    if let Some(fs) = &drive_c {
-        // Read a big file whole, to see the disk work (and how fast).
-        let path = "Program Files/Mozilla Firefox/xul.dll";
-        let started = apic::now_us();
-        match fs.read_file(path) {
-            Ok(data) => {
+    if cfg!(feature = "disk-test") {
+        if let Some(fs) = &drive_c {
+            let started = apic::now_us();
+            if let Ok(data) = fs.read_file("Program Files/Mozilla Firefox/xul.dll") {
                 let us = (apic::now_us() - started).max(1);
-                let sum = data.iter().fold(0u32, |a, &b| a.wrapping_mul(31).wrapping_add(b as u32));
-                let note = alloc::format!(
-                    "Read        xul.dll, {} MiB in {} ms ({} MiB/s)",
-                    data.len() >> 20,
-                    us / 1000,
-                    data.len() as u64 / us
-                );
-                log!("OTW kernel: {note}, checksum {sum:#010x}");
-                notes.push(note);
+                notes.push(alloc::format!("read xul.dll, {} MiB in {} ms", data.len() >> 20, us / 1000));
             }
-            Err(error) => log!("OTW kernel: reading {path}: {error}"),
         }
     }
+    // OTW's library gets its clock, files and log from here on.
+    let kernel: &'static system::Kernel = alloc::boxed::Box::leak(alloc::boxed::Box::new(system::Kernel::new(drive_c.clone())));
+    otw_vm::platform::set_system(kernel);
+    log!(
+        "OTW kernel: {} MiB of memory free; {} CPUs; disks: {}",
+        HEAP.free_bytes() >> 20,
+        apic::cpu_count(),
+        disks.join(", ")
+    );
     let system = System { info, cpus: apic::cpu_count(), disks, drive_c, notes };
-    desktop::run(&system, &HEAP)
+    desktop::run(&system)
 }
 
 /// The disks on NVMe and AHCI controllers, and drive C: among their

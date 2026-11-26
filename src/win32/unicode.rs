@@ -12,6 +12,11 @@
 //! The ANSI code page is Latin-1 (the UI font's character set): characters
 //! outside it become `?`.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use crate::{
     kernel::pe::ImportName,
     win32::{dispatch_with_memory, read_cstr, ApiContext, ApiOutcome, GuestMemory},
@@ -1436,6 +1441,10 @@ pub(crate) fn pidl_path<M: GuestMemory + ?Sized>(memory: &mut M, pidl: u32) -> O
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
     use super::*;
 
     #[test]

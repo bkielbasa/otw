@@ -186,13 +186,3 @@ pub fn send_ipi(target: u32, command: u32) {
         }
     }
 }
-
-/// INIT, then two start-ups at the code in page `page` (below 1 MiB).
-pub fn start_cpu(target: u32, page: u64) {
-    send_ipi(target, 0x0000_4500); // INIT, level assert
-    delay_us(10_000);
-    for _ in 0..2 {
-        send_ipi(target, 0x0000_4600 | (page >> 12) as u32); // start-up
-        delay_us(200);
-    }
-}

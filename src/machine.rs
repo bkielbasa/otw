@@ -5,6 +5,11 @@
 //! a protected-mode flat kernel with a flat GDT. Both share flat physical
 //! memory, the VGA text buffer, COM1 output, and a debug-exit port.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::{cell::RefCell, fmt, rc::Rc};
 
 use unicorn_engine::{

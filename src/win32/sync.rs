@@ -9,6 +9,11 @@
 //! in turn, until its wait is over. A new thread first sends
 //! `DLL_THREAD_ATTACH` to the loaded DLLs, as Windows does.
 
+#[allow(unused_imports)]
+use crate::platform as std;
+#[allow(unused_imports)]
+use crate::platform::prelude::*;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::win32::{ApiContext, ApiOutcome, GuestMemory, ThreadRun};
