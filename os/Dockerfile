@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       linux-image-generic linux-firmware initramfs-tools systemd systemd-sysv systemd-resolved udev dbus kmod \
       xserver-xorg-core xserver-xorg-legacy xserver-xorg-input-libinput xinit x11-xserver-utils \
       libgl1 libegl1 libgl1-mesa-dri libxkbcommon-x11-0 libxcursor1 libxrandr2 libxi6 \
+      fonts-dejavu-core fonts-liberation fonts-noto-core \
       ca-certificates iproute2 sudo less \
  && rm -rf /var/lib/apt/lists/* \
  && kernel="$(ls /boot | sed -n 's/^vmlinuz-//p' | sort -V | tail -1)" \
