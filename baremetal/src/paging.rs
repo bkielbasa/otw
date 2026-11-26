@@ -157,6 +157,34 @@ pub fn map_device(physical: u64, size: u64) -> u64 {
 
 // ── Processes' address spaces ──
 
+static FLUSHES_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// A CPU emptied its translation cache.
+pub fn flush_done() {
+    FLUSHES_PENDING.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Make every other CPU forget cached translations, and wait until they
+/// have (before freed pages are given out again).
+fn shootdown() {
+    let count = crate::apic::cpu_count();
+    if count < 2 {
+        return;
+    }
+    let me = crate::apic::cpu_index();
+    FLUSHES_PENDING.fetch_add(count as u64 - 1, Ordering::SeqCst);
+    for index in (0..count).filter(|&i| i != me) {
+        if let Some(id) = crate::apic::apic_id_of(index) {
+            crate::apic::send_ipi(id, crate::arch::FLUSH_VECTOR as u32);
+        }
+    }
+    let deadline = crate::apic::now_us() + 100_000;
+    while FLUSHES_PENDING.load(Ordering::SeqCst) > 0 && crate::apic::now_us() < deadline {
+        core::hint::spin_loop();
+    }
+    FLUSHES_PENDING.store(0, Ordering::SeqCst);
+}
+
 /// A process's page tables: its lower half (4 KiB pages), the kernel's
 /// upper half.
 pub struct AddressSpace {
@@ -216,9 +244,20 @@ impl AddressSpace {
         true
     }
 
-    /// Unmap [address, address + size), freeing the frames.
+    /// Unmap [address, address + size), freeing the frames (after every
+    /// other CPU running this program has forgotten them).
     pub fn unmap(&self, address: u64, size: u64) {
+        let frames = self.unmap_pages(address, size);
+        shootdown();
         let layout = core::alloc::Layout::from_size_align(4096, 4096).unwrap();
+        for frame in frames {
+            unsafe { alloc::alloc::dealloc(to_virtual(frame) as *mut u8, layout) };
+        }
+    }
+
+    /// Clear the entries; returns the frames this space owned.
+    fn unmap_pages(&self, address: u64, size: u64) -> alloc::vec::Vec<u64> {
+        let mut frames = alloc::vec::Vec::new();
         let mut page = address & !0xFFF;
         let end = (address + size + 0xFFF) & !0xFFF;
         while page < end {
@@ -226,7 +265,7 @@ impl AddressSpace {
                 unsafe {
                     if *entry & PRESENT != 0 {
                         if *entry & SHARED == 0 {
-                            alloc::alloc::dealloc(to_virtual(*entry & ADDRESS) as *mut u8, layout);
+                            frames.push(*entry & ADDRESS);
                         }
                         *entry = 0;
                         asm!("invlpg [{}]", in(reg) page);
@@ -235,6 +274,7 @@ impl AddressSpace {
             }
             page += 4096;
         }
+        frames
     }
 
     /// Map [address, address + size) onto the physical frames from

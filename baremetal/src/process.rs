@@ -78,6 +78,38 @@ struct Thread {
     levels: Vec<u64>,
 }
 
+/// State each thread of a program has (kept by the task running it).
+struct PerTask<T: Default>(RefCell<alloc::collections::BTreeMap<u64, T>>);
+
+impl<T: Default> PerTask<T> {
+    fn new() -> Self {
+        Self(RefCell::new(alloc::collections::BTreeMap::new()))
+    }
+
+    fn borrow_mut(&self) -> core::cell::RefMut<'_, T> {
+        let id = crate::sched::current_id();
+        core::cell::RefMut::map(self.0.borrow_mut(), |m| m.entry(id).or_default())
+    }
+
+    fn borrow(&self) -> core::cell::Ref<'_, T> {
+        let id = crate::sched::current_id();
+        self.0.borrow_mut().entry(id).or_default();
+        core::cell::Ref::map(self.0.borrow(), |m| &m[&id])
+    }
+
+    fn take(&self) -> T {
+        core::mem::take(&mut *self.borrow_mut())
+    }
+
+    fn set(&self, value: T) {
+        *self.borrow_mut() = value;
+    }
+
+    fn forget(&self) {
+        self.0.borrow_mut().remove(&crate::sched::current_id());
+    }
+}
+
 /// The program's memory, threads and state.
 struct Runner {
     space: AddressSpace,
@@ -92,17 +124,25 @@ struct Runner {
     ended: RefCell<Option<Ended>>,
     api_calls: Cell<u64>,
     /// Exception handling's request to continue elsewhere.
-    resume: RefCell<Option<Resume>>,
-    resume_full: RefCell<Option<FullRegisters>>,
+    resume: PerTask<Option<Resume>>,
+    resume_full: PerTask<Option<FullRegisters>>,
     /// The stack pointers below which each running callback's frames lie
     /// (outermost first).
-    levels: RefCell<Vec<u64>>,
+    levels: PerTask<Vec<u64>>,
     /// The running threads (id, TIB), outermost first: a thread runs the
     /// others from inside its waits.
     running: RefCell<Vec<(u32, u64)>>,
     waiting: RefCell<Vec<Thread>>,
     next_thread: Cell<u32>,
-    signal: Cell<Option<Signal>>,
+    signal: PerTask<Option<Signal>>,
+    /// The subsystem's lock: one thread at a time in the subsystem; program
+    /// code runs without it.
+    lock: alloc::sync::Arc<otw_vm::kernel::lock::BigLock>,
+    /// Threads get tasks of their own (and so other CPUs).
+    parallel: bool,
+    /// The threads running as tasks of their own: task id → (thread id,
+    /// thread block).
+    workers: RefCell<alloc::collections::BTreeMap<u64, (u32, u64)>>,
     /// Each module's TLS template, copied for every thread.
     tls: RefCell<Vec<Vec<u8>>>,
     /// Memory shared between mappings (sections, and 64-bit memory above
@@ -198,7 +238,27 @@ impl Runner {
         let mut ended = self.ended.borrow_mut();
         if ended.is_none() {
             *ended = Some(how);
+            drop(ended);
+            self.kick_workers();
         }
+    }
+
+    /// Make threads running program code on other CPUs come back to the
+    /// kernel (and see that the process ends).
+    fn kick_workers(&self) {
+        if self.workers.borrow().is_empty() {
+            return;
+        }
+        let me = apic::cpu_index();
+        for index in (0..apic::cpu_count()).filter(|&i| i != me) {
+            if let Some(id) = apic::apic_id_of(index) {
+                apic::send_ipi(id, arch::WAKE_VECTOR as u32);
+            }
+        }
+    }
+
+    fn is_worker(&self) -> bool {
+        self.workers.borrow().contains_key(&crate::sched::current_id())
     }
 
     fn has_ended(&self) -> bool {
@@ -217,7 +277,19 @@ impl Runner {
             if self.has_ended() {
                 return Stop::Ended;
             }
+            // Program code runs without the subsystem's lock.
+            let depth = self.lock.release_all();
             user::run(regs);
+            let vector = regs.vector as u8;
+            if vector == arch::TIMER_VECTOR || vector == arch::WAKE_VECTOR {
+                // Another task wanted this CPU (or the program is ending).
+                if vector == arch::TIMER_VECTOR {
+                    crate::sched::yield_now();
+                }
+                self.lock.reacquire(depth);
+                continue;
+            }
+            self.lock.reacquire(depth);
             let stop = match regs.vector as u8 {
                 arch::SYSTEM_CALL_VECTOR => self.system_call(regs),
                 arch::CALLBACK_RETURN_VECTOR => Some(Stop::Returned(regs.rax)),
@@ -349,7 +421,7 @@ impl Runner {
         let kernel_entry = entry.dll == KERNEL_DLL;
         if kernel_entry && entry.name.as_str() == Some(THREAD_RETURN) {
             // A thread returned from its start routine.
-            if self.running.borrow().len() > 1 {
+            if self.running.borrow().len() > 1 || self.is_worker() {
                 return Some(Stop::ThreadExited(regs.rax as u32));
             }
             self.end(Ended::Exited(regs.rax as u32));
@@ -582,11 +654,18 @@ impl Runner {
         }
     }
 
+    /// The running task runs this program's code with thread block `tib`
+    /// (GS in 64-bit code, FS in 32-bit code).
     fn set_thread_block(&self, tib: u64) {
+        let task = crate::sched::current();
+        task.cr3 = self.space.root;
+        task.compat = !self.x64;
         if self.x64 {
-            write_msr(0xC000_0101, tib); // GS base
+            task.gs_base = tib;
+            write_msr(0xC000_0101, tib);
         } else {
-            write_msr(0xC000_0100, tib); // FS base
+            task.fs_base = tib;
+            write_msr(0xC000_0100, tib);
         }
     }
 
@@ -621,6 +700,13 @@ impl Runner {
             regs.rsp = esp;
         }
         self.install_tls(tib);
+        if self.parallel {
+            // A task of its own, on whichever CPU is free.
+            let runner = self as *const Runner as usize;
+            let task = crate::sched::spawn(move || worker_main(runner, id, regs, tib));
+            self.workers.borrow_mut().insert(task, (id, tib));
+            return Some(id);
+        }
         self.waiting.borrow_mut().push(Thread { id, regs, tib, levels: Vec::new() });
         Some(id)
     }
@@ -867,11 +953,25 @@ impl GuestMemory for NativeMemory<'_> {
     }
 
     fn current_thread(&self) -> u32 {
+        if let Some(&(id, _)) = self.runner.workers.borrow().get(&crate::sched::current_id()) {
+            return id;
+        }
         self.runner.running.borrow().last().map(|&(id, _)| id).unwrap_or(1)
     }
 
     fn current_tib(&self) -> u32 {
+        if let Some(&(_, tib)) = self.runner.workers.borrow().get(&crate::sched::current_id()) {
+            return tib as u32;
+        }
         self.runner.running.borrow().last().map(|&(_, tib)| tib as u32).unwrap_or(TIB_BASE)
+    }
+
+    fn is_worker(&self) -> bool {
+        self.runner.is_worker()
+    }
+
+    fn others_running(&self) -> bool {
+        !self.runner.workers.borrow().is_empty()
     }
 
     fn waiting_threads(&self) -> Vec<u32> {
@@ -893,7 +993,7 @@ impl GuestMemory for NativeMemory<'_> {
 
     fn end_thread(&mut self, code: u32) -> bool {
         let runner = self.runner;
-        if runner.running.borrow().len() < 2 || !runner.levels.borrow().is_empty() {
+        if (runner.running.borrow().len() < 2 && !runner.is_worker()) || !runner.levels.borrow().is_empty() {
             return false;
         }
         runner.signal.set(Some(Signal::Exit(code)));
@@ -963,6 +1063,35 @@ impl GuestMemory for NativeMemory<'_> {
     }
 }
 
+/// A thread of a program on a task of its own.
+fn worker_main(runner: usize, id: u32, mut regs: Box<UserRegs>, tib: u64) {
+    let runner = unsafe { &*(runner as *const Runner) };
+    let hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
+    runner.set_thread_block(tib);
+    // Created suspended: it waits to be resumed.
+    while runner.syscalls.thread_suspended(id) && !runner.has_ended() {
+        otw_vm::kernel::lock::unlocked(|| crate::sched::sleep_us(1000));
+    }
+    if otw_vm::platform::env::var_os("OTW_TRACE_THREADS").is_some() || id <= 6 {
+        log!("OTW kernel: thread {id} starts on CPU {}", apic::cpu_index());
+    }
+    let stop = if runner.has_ended() { Stop::Ended } else { runner.execute(&mut regs) };
+    if !runner.has_ended() {
+        let code = if let Stop::ThreadExited(code) = stop { code } else { 0 };
+        let mut memory = NativeMemory { runner, regs: &mut *regs };
+        runner.syscalls.thread_exited(&mut memory, id, code);
+    }
+    runner.levels.forget();
+    runner.resume.forget();
+    runner.resume_full.forget();
+    runner.signal.forget();
+    runner.workers.borrow_mut().remove(&crate::sched::current_id());
+    let task = crate::sched::current();
+    task.cr3 = 0;
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) crate::paging::page_table_root()) };
+    drop(hold);
+}
+
 fn exception_name(vector: u8) -> &'static str {
     match vector {
         0 => "division by zero",
@@ -1027,13 +1156,16 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         reserved: RefCell::new(Vec::new()),
         ended: RefCell::new(None),
         api_calls: Cell::new(0),
-        resume: RefCell::new(None),
-        resume_full: RefCell::new(None),
-        levels: RefCell::new(Vec::new()),
+        resume: PerTask::new(),
+        resume_full: PerTask::new(),
+        levels: PerTask::new(),
         running: RefCell::new(Vec::new()),
         waiting: RefCell::new(Vec::new()),
         next_thread: Cell::new(2),
-        signal: Cell::new(None),
+        signal: PerTask::new(),
+        lock: otw_vm::kernel::lock::BigLock::new(),
+        parallel: x64 && apic::cpu_count() > 1 && otw_vm::platform::env::var("OTW_PARALLEL_THREADS").map_or(true, |v| v != "0"),
+        workers: RefCell::new(alloc::collections::BTreeMap::new()),
         tls: RefCell::new(Vec::new()),
         recent: RefCell::new(alloc::collections::VecDeque::new()),
         shared: RefCell::new(alloc::collections::BTreeMap::new()),
@@ -1131,11 +1263,10 @@ pub fn run(path: &str, command_line: &str) -> Ended {
     );
 
     crate::desktop::program_started(&shared, path.rsplit('\\').next().unwrap_or(path));
+    // In the subsystem (until program code runs).
+    let hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
     // Its memory, its thread block.
     runner.space.activate();
-    if !x64 {
-        unsafe { core::arch::asm!("mov fs, {0:x}", in(reg) arch::USER_DATA as u64) };
-    }
     runner.running.borrow_mut().push((1, tib));
     runner.set_thread_block(tib);
     let ran = apic::now_us();
@@ -1161,7 +1292,21 @@ pub fn run(path: &str, command_line: &str) -> Ended {
     if let Stop::Returned(_) | Stop::Suspended | Stop::ThreadExited(_) = stop {
         runner.end(Ended::Exited(0));
     }
+    // Its other threads stop before its memory goes.
+    let waited = apic::now_us();
+    while !runner.workers.borrow().is_empty() {
+        runner.kick_workers();
+        otw_vm::kernel::lock::unlocked(|| crate::sched::sleep_us(1000));
+        if apic::now_us() - waited > 2_000_000 && (apic::now_us() - waited) % 1_000_000 < 1000 {
+            log!("OTW kernel: waiting for {} threads to stop", runner.workers.borrow().len());
+        }
+    }
+    drop(hold);
     // Back to the kernel's tables before the program's go.
+    let task = crate::sched::current();
+    task.cr3 = 0;
+    task.fs_base = 0;
+    task.gs_base = 0;
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) crate::paging::page_table_root()) };
     write_msr(0xC000_0101, 0);
     write_msr(0xC000_0100, 0);

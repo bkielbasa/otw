@@ -135,14 +135,15 @@ pub fn start_others(ids: &[u32], page: u64) {
 
 /// Where other CPUs begin in 64-bit mode.
 extern "sysv64" fn cpu_main(start: &Start) -> ! {
-    arch::load_cpu_tables();
+    let tss = arch::load_cpu_tables();
     arch::load_idt_on_this_cpu();
     arch::load_page_attributes();
     apic::enable_on_this_cpu();
     apic::register_this_cpu();
+    arch::register_tss(tss);
+    crate::sched::init_this_cpu(true);
+    apic::start_timer(1000);
     start.started.fetch_add(1, Ordering::SeqCst);
-    // Nothing to run yet: sleep until woken.
-    loop {
-        arch::wait_for_interrupt();
-    }
+    // Run tasks as they come.
+    crate::sched::idle_loop()
 }

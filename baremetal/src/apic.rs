@@ -99,6 +99,11 @@ pub fn register_this_cpu() -> usize {
     index
 }
 
+/// The APIC id of CPU `index`.
+pub fn apic_id_of(index: usize) -> Option<u32> {
+    (index < cpu_count().min(MAX_CPUS)).then(|| CPU_IDS[index].load(Ordering::Relaxed))
+}
+
 pub fn cpu_count() -> usize {
     CPUS.load(Ordering::SeqCst) as usize
 }

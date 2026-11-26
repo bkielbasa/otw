@@ -160,7 +160,12 @@ impl Condvar {
     fn pause<'a, T: ?Sized>(&self, guard: MutexGuard<'a, T>, us: u64) -> MutexGuard<'a, T> {
         let mutex = guard.mutex;
         drop(guard);
-        super::system().sleep_us(us);
+        // Short waits let other threads run; longer ones sleep.
+        if us <= 100 {
+            super::system().yield_now();
+        } else {
+            super::system().sleep_us(us);
+        }
         mutex.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

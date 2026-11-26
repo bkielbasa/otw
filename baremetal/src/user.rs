@@ -9,7 +9,6 @@
 //! the kernel stack, and the innermost gets the next exit.
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{self, Frame};
 
@@ -82,26 +81,23 @@ impl UserRegs {
     }
 }
 
-/// The kernel stack pointer of the innermost `run` (where `leave` goes
-/// back to).
-#[no_mangle]
-static OTW_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
-
-// otw_enter_user(regs: *mut UserRegs): saves the kernel's callee-saved
-// registers and the outer level, enters user mode with `regs`; returns
-// (through otw_leave_user) when the program needs the kernel.
+// otw_enter_user(regs: *mut UserRegs /* rdi */, slot: *mut u64 /* rsi */):
+// saves the kernel's callee-saved registers and the outer level (the
+// running task's innermost entry, kept in `slot`), enters user mode with
+// `regs`; returns (through otw_leave_user) when the program needs the
+// kernel.
 global_asm!(
     ".global otw_enter_user",
     "otw_enter_user:",
     "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
-    "push qword ptr [rip + OTW_KERNEL_RSP]",
+    "push rsi",
+    "push qword ptr [rsi]",
     "push rdi",
-    "mov [rip + OTW_KERNEL_RSP], rsp",
+    "mov [rsi], rsp",
     // Entries from user mode come in below this frame.
     "mov rdi, rsp",
-    "sub rsp, 8",
+    // (Nine pushes: the stack is aligned for the call.)
     "call {set_stack}",
-    "add rsp, 8",
     "mov rdi, [rsp]",
     "cli",
     "fxrstor64 [rdi + 192]",
@@ -133,9 +129,12 @@ global_asm!(
     "",
     ".global otw_leave_user",
     "otw_leave_user:",
-    "mov rsp, [rip + OTW_KERNEL_RSP]",
-    "pop rdi",
-    "pop qword ptr [rip + OTW_KERNEL_RSP]",
+    // rdi: the slot.
+    "mov rsp, [rdi]",
+    "pop rax",
+    "pop rax",
+    "pop rsi",
+    "mov [rsi], rax",
     "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
     "sti",
     "ret",
@@ -149,20 +148,36 @@ extern "sysv64" fn set_entry_stack(rsp: u64) {
 }
 
 extern "sysv64" {
-    fn otw_enter_user(regs: *mut UserRegs);
-    fn otw_leave_user() -> !;
+    fn otw_enter_user(regs: *mut UserRegs, slot: *mut u64);
+    fn otw_leave_user(slot: *mut u64) -> !;
 }
 
 /// Run program code from `regs` until it needs the kernel; `regs` then
 /// holds its state, `vector` saying why.
 pub fn run(regs: &mut UserRegs) {
-    unsafe { otw_enter_user(regs) };
+    let task = crate::sched::current();
+    // The task's program: its memory and thread block (it may have run
+    // on another CPU, or another program ran here).
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        if task.cr3 != 0 && task.cr3 != cr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) task.cr3);
+        }
+        if task.compat {
+            core::arch::asm!("mov fs, {0:x}", in(reg) arch::USER_DATA as u64);
+        }
+    }
+    arch::write_msr(0xC000_0100, task.fs_base);
+    arch::write_msr(0xC000_0101, task.gs_base);
+    unsafe { otw_enter_user(regs, &mut task.entry_rsp) };
 }
 
 /// From the interrupt entry: the program stopped. Save its state into the
 /// innermost `run`'s registers and return there.
 pub fn leave(frame: &Frame, fx: *const u8) -> ! {
-    let saved = OTW_KERNEL_RSP.load(Ordering::SeqCst);
+    let slot: *mut u64 = &mut crate::sched::current().entry_rsp;
+    let saved = unsafe { *slot };
     let regs = unsafe { &mut **(saved as *const *mut UserRegs) };
     regs.rax = frame.rax;
     regs.rbx = frame.rbx;
@@ -190,7 +205,7 @@ pub fn leave(frame: &Frame, fx: *const u8) -> ! {
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2) };
     regs.fault_address = cr2;
     unsafe { core::ptr::copy_nonoverlapping(fx, regs.fx.as_mut_ptr(), 512) };
-    unsafe { otw_leave_user() }
+    unsafe { otw_leave_user(slot) }
 }
 
 const _: () = {

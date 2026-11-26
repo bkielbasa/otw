@@ -18,7 +18,7 @@ use otw_vm::win32::user::{top_level_at, WS_CHILD};
 use otw_vm::win32::{RawInput, SharedState};
 
 use crate::io::{self, Input};
-use crate::{apic, arch, log, System};
+use crate::{apic, log, System};
 
 struct Input8042 {
     pointer: (i32, i32),
@@ -161,9 +161,9 @@ impl Desktop {
             self.screen.move_pointer(self.input.pointer);
         }
         if block {
-            // Sleep until the next interrupt (the timer, 100 times a
-            // second, or input).
-            arch::wait_for_interrupt();
+            // Sleep a millisecond (input interrupts; other tasks run), not
+            // holding a program's subsystem lock meanwhile.
+            otw_vm::kernel::lock::unlocked(|| crate::sched::sleep_us(1000));
         }
     }
 

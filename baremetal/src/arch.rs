@@ -43,7 +43,17 @@ pub struct CpuTables {
 }
 
 
-pub fn load_cpu_tables() {
+/// Each CPU's TSS rsp0 (where entries from user mode come in), by CPU
+/// index.
+static TSS_RSP0: [AtomicU64; crate::apic::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::apic::MAX_CPUS];
+
+/// Remember where this CPU's TSS keeps rsp0 (once its index is known).
+pub fn register_tss(slot: u64) {
+    TSS_RSP0[crate::apic::cpu_index().min(crate::apic::MAX_CPUS - 1)].store(slot, Ordering::SeqCst);
+}
+
+/// Load this CPU's GDT and TSS; returns where the TSS keeps rsp0.
+pub fn load_cpu_tables() -> u64 {
     let fault_stack = Box::leak(alloc::vec![0u8; 64 * 1024].into_boxed_slice());
     let tables = Box::leak(Box::new(CpuTables {
         gdt: [
@@ -71,9 +81,7 @@ pub fn load_cpu_tables() {
     let limit = core::mem::size_of::<Tss>() as u64 - 1;
     tables.gdt[5] = (limit & 0xFFFF) | (tss & 0xFF_FFFF) << 16 | 0x89 << 40 | (limit >> 16 & 0xF) << 48 | (tss >> 24 & 0xFF) << 56;
     tables.gdt[6] = tss >> 32;
-    let rsp0 = core::ptr::addr_of_mut!(tables.tss.rsp) as *mut u64;
-    // The first CPU's (the one that runs programs, for now).
-    let _ = TSS_RSP0.compare_exchange(0, rsp0 as u64, Ordering::SeqCst, Ordering::SeqCst);
+    let rsp0 = core::ptr::addr_of_mut!(tables.tss.rsp) as *mut u64 as u64;
     let pointer = TablePointer { limit: (core::mem::size_of_val(&tables.gdt) - 1) as u16, base: tables.gdt.as_ptr() as u64 };
     unsafe {
         asm!(
@@ -97,6 +105,7 @@ pub fn load_cpu_tables() {
             tss = in(reg) TSS_SELECTOR as u64,
         );
     }
+    rsp0
 }
 
 // ── Interrupts ──
@@ -211,6 +220,8 @@ pub const TIMER_VECTOR: u8 = 32;
 /// Interrupts that wake a CPU from `hlt` (another CPU has work for it).
 pub const WAKE_VECTOR: u8 = 33;
 pub const SPURIOUS_VECTOR: u8 = 255;
+/// Forget cached page translations (another CPU unmapped memory).
+pub const FLUSH_VECTOR: u8 = 34;
 
 pub fn load_idt() {
     let handlers: [(u8, unsafe extern "C" fn()); 55] = [
@@ -255,9 +266,6 @@ pub fn load_idt_on_this_cpu() {
 /// Timer interrupts so far, on the first CPU.
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Where this CPU's TSS keeps rsp0 (the first CPU's; others when they
-/// run programs).
-static TSS_RSP0: AtomicU64 = AtomicU64::new(0);
 
 /// Program code calls the system (an import's thunk): `int 0x80`.
 pub const SYSTEM_CALL_VECTOR: u8 = 0x80;
@@ -266,7 +274,7 @@ pub const CALLBACK_RETURN_VECTOR: u8 = 0x81;
 
 /// Entries from user mode come in on this stack.
 pub fn set_user_entry_stack(rsp0: u64) {
-    let slot = TSS_RSP0.load(Ordering::Relaxed) as *mut u64;
+    let slot = TSS_RSP0[crate::apic::cpu_index().min(crate::apic::MAX_CPUS - 1)].load(Ordering::Relaxed) as *mut u64;
     unsafe { core::ptr::write_unaligned(slot, rsp0) };
 }
 
@@ -279,6 +287,15 @@ extern "sysv64" fn interrupt(frame: &mut Frame, fx: *const u8) {
         if vector == SYSTEM_CALL_VECTOR as u64 || vector == CALLBACK_RETURN_VECTOR as u64 || vector < 32 {
             crate::user::leave(frame, fx);
         }
+        // Another task waits for this CPU, or this program is told to
+        // stop: back to the kernel (after acknowledging the interrupt).
+        if vector == WAKE_VECTOR as u64 || (vector == TIMER_VECTOR as u64 && crate::sched::others_ready()) {
+            if vector == TIMER_VECTOR as u64 && crate::apic::cpu_index() == 0 {
+                TICKS.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::apic::end_of_interrupt();
+            crate::user::leave(frame, fx);
+        }
     }
     match frame.vector {
         v if v == TIMER_VECTOR as u64 => {
@@ -288,6 +305,13 @@ extern "sysv64" fn interrupt(frame: &mut Frame, fx: *const u8) {
             crate::apic::end_of_interrupt();
         }
         v if v == WAKE_VECTOR as u64 => crate::apic::end_of_interrupt(),
+        v if v == FLUSH_VECTOR as u64 => {
+            // Another CPU unmapped program memory: forget what this CPU's
+            // translation cache holds.
+            unsafe { asm!("mov {0}, cr3", "mov cr3, {0}", out(reg) _) };
+            crate::paging::flush_done();
+            crate::apic::end_of_interrupt();
+        }
         v if v == crate::io::KEYBOARD_VECTOR as u64 || v == crate::io::MOUSE_VECTOR as u64 => {
             crate::io::ps2_interrupt();
             crate::apic::end_of_interrupt();

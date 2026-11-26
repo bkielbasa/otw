@@ -24,6 +24,7 @@ mod nvme;
 mod paging;
 mod pci;
 mod process;
+mod sched;
 mod screen;
 mod smp;
 mod sync;
@@ -196,7 +197,7 @@ extern "sysv64" fn kernel_main(regions: *const Region, count: usize, info: *cons
 
 extern "sysv64" fn kernel_main2(regions: &Vec<Region>) -> ! {
     let info = unsafe { *BOOT_INFO.load(Ordering::SeqCst) };
-    arch::load_cpu_tables();
+    let tss = arch::load_cpu_tables();
     arch::load_idt();
     arch::load_page_attributes();
     // The firmware's boot services memory is free now (the kernel has its
@@ -213,7 +214,9 @@ extern "sysv64" fn kernel_main2(regions: &Vec<Region>) -> ! {
     );
 
     apic::init_boot_cpu();
-    apic::start_timer(100);
+    arch::register_tss(tss);
+    sched::init_this_cpu(false);
+    apic::start_timer(1000);
     arch::enable_interrupts();
     log!(
         "OTW kernel: APIC ({}), clock {} MHz",

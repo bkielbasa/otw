@@ -3,7 +3,6 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use core::cell::UnsafeCell;
 use core::time::Duration;
 
 use super::io;
@@ -88,10 +87,10 @@ pub fn available_parallelism() -> io::Result<core::num::NonZeroUsize> {
     Ok(core::num::NonZeroUsize::new(1).unwrap())
 }
 
-/// A `thread_local!` value. There is one thread so far, so one value.
+/// A `thread_local!` value: one per thread (`System::thread_id`).
 pub struct LocalKey<T: 'static> {
     init: fn() -> T,
-    value: UnsafeCell<Option<T>>,
+    values: super::sync::Mutex<alloc::collections::BTreeMap<u64, Box<T>>>,
 }
 
 unsafe impl<T> Sync for LocalKey<T> {}
@@ -102,15 +101,28 @@ pub struct AccessError;
 impl<T: 'static> LocalKey<T> {
     #[doc(hidden)]
     pub const fn new(init: fn() -> T) -> Self {
-        Self { init, value: UnsafeCell::new(None) }
+        Self { init, values: super::sync::Mutex::new(alloc::collections::BTreeMap::new()) }
     }
 
     pub fn with<R>(&'static self, f: impl FnOnce(&T) -> R) -> R {
-        let slot = unsafe { &mut *self.value.get() };
-        if slot.is_none() {
-            *slot = Some((self.init)());
-        }
-        f(slot.as_ref().unwrap())
+        let id = super::system().thread_id();
+        let value: *const T = {
+            let values = self.values.lock().unwrap_or_else(super::sync::PoisonError::into_inner);
+            match values.get(&id) {
+                Some(value) => &**value,
+                None => {
+                    drop(values);
+                    // Initialising may use other thread locals: not under
+                    // the lock.
+                    let made = Box::new((self.init)());
+                    let mut values = self.values.lock().unwrap_or_else(super::sync::PoisonError::into_inner);
+                    &**values.entry(id).or_insert(made)
+                }
+            }
+        };
+        // The box lives as long as the key (values are never removed), and
+        // only this thread uses it.
+        f(unsafe { &*value })
     }
 
     pub fn try_with<R>(&'static self, f: impl FnOnce(&T) -> R) -> Result<R, AccessError> {

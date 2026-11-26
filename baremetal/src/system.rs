@@ -11,7 +11,7 @@ use otw_vm::fat32::Fat32FileSystem;
 use otw_vm::platform::{FileInfo, System};
 
 use crate::sync::SpinLock;
-use crate::{apic, arch, io, log};
+use crate::{apic, io, log};
 
 pub const DRIVE_C: &str = "/C";
 
@@ -110,17 +110,16 @@ impl System for Kernel {
     }
 
     fn sleep_us(&self, us: u64) {
-        let end = apic::now_us() + us;
-        loop {
-            // The timer interrupt (100 Hz) ends each wait.
-            arch::wait_for_interrupt();
-            if apic::now_us() >= end {
-                break;
-            }
-        }
+        crate::sched::sleep_us(us);
     }
 
-    fn yield_now(&self) {}
+    fn yield_now(&self) {
+        crate::sched::yield_now();
+    }
+
+    fn thread_id(&self) -> u64 {
+        crate::sched::current_id()
+    }
 
     fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let path = on_drive(path)?;
