@@ -1327,6 +1327,12 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         self.run.is_some_and(|run| run.borrow().worker)
     }
 
+    fn sync_memory(&mut self) {
+        if let Some(run) = self.run {
+            sync_space(self.uc, run);
+        }
+    }
+
     fn others_running(&self) -> bool {
         self.run.is_some_and(|run| {
             let state = run.borrow();

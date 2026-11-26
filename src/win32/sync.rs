@@ -776,6 +776,7 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             }
         }
         let generation = crate::win32::kobj::generation();
+        memory.sync_memory();
         refresh_processes(ctx);
         crate::win32::ipc::poll(ctx, memory);
         let me = ctx.shared.borrow().pid;

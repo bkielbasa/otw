@@ -201,6 +201,11 @@ pub trait GuestMemory {
         false
     }
 
+    /// Apply the address-space changes other CPUs made (a thread that
+    /// waits keeps up with them, so unmapped ranges can be given out
+    /// again).
+    fn sync_memory(&mut self) {}
+
     /// Other threads of the process run on CPUs of their own (a wait can
     /// be ended by them).
     fn others_running(&self) -> bool {

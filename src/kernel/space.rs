@@ -28,7 +28,9 @@ pub struct Mapping {
 #[derive(Clone)]
 enum Change {
     Map { start: u64, mapping: Mapping },
-    Unmap { start: u64, size: u64 },
+    /// Unmapped; the memory it held stays alive until every CPU has
+    /// unmapped it too.
+    Unmap { start: u64, size: u64, _keep: Vec<Arc<SharedMemory>> },
 }
 
 #[derive(Default)]
@@ -42,6 +44,11 @@ struct Inner {
     /// Each CPU's position: the number of the next change it applies.
     cpus: std::collections::HashMap<u32, usize>,
     next_cpu: u32,
+    /// Ranges unmapped that some CPU may still have mapped: (start, size,
+    /// number of the unmap change). They are not given out again until
+    /// every CPU has applied the unmap (a CPU that had not would go on
+    /// using the old memory there).
+    quarantine: Vec<(u64, u64, usize)>,
 }
 
 impl Inner {
@@ -56,6 +63,14 @@ impl Inner {
             self.log.pop_front();
             self.base += 1;
         }
+        let base = self.base;
+        self.quarantine.retain(|&(_, _, change)| change >= base);
+    }
+
+    /// Whether `[start, start + size)` is mapped or quarantined.
+    fn taken(&self, start: u64, size: u64) -> bool {
+        self.mappings.range(..start + size).next_back().is_some_and(|(&s, m)| s + m.size > start)
+            || self.quarantine.iter().any(|&(s, n, _)| s < start + size && start < s + n)
     }
 
     fn push(&mut self, cpu: u32, change: Change) {
@@ -86,13 +101,16 @@ impl AddressSpace {
 
     /// The mapped ranges, as (first, last) addresses inclusive.
     pub fn ranges(&self) -> Vec<(u64, u64)> {
-        self.lock().mappings.iter().map(|(&start, m)| (start, start + m.size - 1)).collect()
+        let inner = self.lock();
+        let mut ranges: Vec<(u64, u64)> = inner.mappings.iter().map(|(&start, m)| (start, start + m.size - 1)).collect();
+        ranges.extend(inner.quarantine.iter().map(|&(s, n, _)| (s, s + n - 1)));
+        ranges.sort_unstable();
+        ranges
     }
 
     /// Whether any of `[start, start + size)` is mapped.
     pub fn overlaps(&self, start: u64, size: u64) -> bool {
-        let inner = self.lock();
-        inner.mappings.range(..start + size).next_back().is_some_and(|(&s, m)| s + m.size > start)
+        self.lock().taken(start, size)
     }
 
     /// Map fresh zeroed memory at `start` in this CPU and the record.
@@ -107,7 +125,7 @@ impl AddressSpace {
     pub fn map_memory(&self, uc: &mut Unicorn<'_, ()>, cursor: &mut Cursor, start: u64, size: u64, memory: Arc<SharedMemory>, offset: usize) -> bool {
         self.sync(uc, cursor);
         let mut inner = self.lock();
-        if inner.mappings.range(..start + size).next_back().is_some_and(|(&s, m)| s + m.size > start) {
+        if inner.taken(start, size) {
             return false;
         }
         let pointer = memory.pointer(offset) as *mut std::ffi::c_void;
@@ -136,6 +154,7 @@ impl AddressSpace {
         if cut.is_empty() {
             return false;
         }
+        let keep: Vec<Arc<SharedMemory>> = cut.iter().map(|(_, m)| m.memory.clone()).collect();
         for (s, m) in cut {
             inner.mappings.remove(&s);
             if s < start {
@@ -147,7 +166,9 @@ impl AddressSpace {
             }
         }
         let _ = uc.mem_unmap(start, size);
-        inner.push(cursor.0, Change::Unmap { start, size });
+        let index = inner.end();
+        inner.quarantine.push((start, size, index));
+        inner.push(cursor.0, Change::Unmap { start, size, _keep: keep });
         true
     }
 
@@ -166,7 +187,7 @@ impl AddressSpace {
                     // SAFETY: the record keeps the memory alive while mapped.
                     let _ = unsafe { uc.mem_map_ptr(*start, mapping.size, Prot::ALL, pointer) };
                 }
-                Change::Unmap { start, size } => {
+                Change::Unmap { start, size, .. } => {
                     let _ = uc.mem_unmap(*start, *size);
                 }
             }

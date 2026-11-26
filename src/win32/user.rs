@@ -3553,6 +3553,7 @@ pub fn fetch_message<M: GuestMemory + ?Sized>(
             }
         }
         let started = std::time::Instant::now();
+        memory.sync_memory();
         memory.pump(true);
         // The X11 pump can return at once; never spin while idle. Wake up in
         // time for the next timer.
