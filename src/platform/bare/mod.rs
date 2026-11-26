@@ -52,6 +52,56 @@ pub trait System: Send + Sync {
     fn thread_id(&self) -> u64 {
         0
     }
+    /// The network, if the machine has one.
+    fn network(&self) -> Option<&dyn Network> {
+        None
+    }
+}
+
+/// Why a network operation did not succeed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetError {
+    /// Not yet: try again later (no data, no room, not connected yet).
+    WouldBlock,
+    Refused,
+    Reset,
+    NotConnected,
+    TimedOut,
+    Unreachable,
+    AddrInUse,
+    NotFound,
+    Invalid,
+}
+
+/// A socket the system keeps.
+pub type SocketId = u64;
+
+/// TCP/IP as the kernel provides it. Nothing here waits: what is not
+/// ready yet is `WouldBlock` (the library waits, see `net`), except
+/// `resolve`, which asks the name servers and waits for an answer.
+pub trait Network: Send + Sync {
+    /// The addresses of a host name.
+    fn resolve(&self, host: &str) -> Result<Vec<core::net::IpAddr>, NetError>;
+    /// Start connecting a stream; `connected` says when it is done.
+    fn tcp_connect(&self, to: core::net::SocketAddr) -> Result<SocketId, NetError>;
+    /// Whether a connecting stream got through (`WouldBlock` while it is
+    /// still on its way).
+    fn tcp_connected(&self, socket: SocketId) -> Result<(), NetError>;
+    fn tcp_listen(&self, at: core::net::SocketAddr) -> Result<SocketId, NetError>;
+    fn tcp_accept(&self, listener: SocketId) -> Result<(SocketId, core::net::SocketAddr), NetError>;
+    fn udp_bind(&self, at: core::net::SocketAddr) -> Result<SocketId, NetError>;
+    /// Send (to `to`, for a datagram socket not connected).
+    fn send(&self, socket: SocketId, data: &[u8], to: Option<core::net::SocketAddr>) -> Result<usize, NetError>;
+    /// Receive (0 bytes from a stream: the other end closed it); with
+    /// `peek`, the data stays.
+    fn recv(&self, socket: SocketId, buffer: &mut [u8], peek: bool) -> Result<(usize, Option<core::net::SocketAddr>), NetError>;
+    fn local_addr(&self, socket: SocketId) -> Result<core::net::SocketAddr, NetError>;
+    fn peer_addr(&self, socket: SocketId) -> Result<core::net::SocketAddr, NetError>;
+    /// Set a datagram socket's peer.
+    fn udp_connect(&self, socket: SocketId, to: core::net::SocketAddr) -> Result<(), NetError>;
+    /// No more sending.
+    fn shutdown(&self, socket: SocketId);
+    fn close(&self, socket: SocketId);
 }
 
 struct NoSystem;

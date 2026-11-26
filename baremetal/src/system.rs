@@ -129,6 +129,10 @@ impl System for Kernel {
         crate::sched::current_id()
     }
 
+    fn network(&self) -> Option<&dyn otw_vm::platform::Network> {
+        crate::net::available().then_some(&crate::net::Net as &dyn otw_vm::platform::Network)
+    }
+
     fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let path = on_drive(path)?;
         if let Some(entry) = self.files.lock().get(&key(&path)) {

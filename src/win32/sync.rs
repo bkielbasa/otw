@@ -829,8 +829,15 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             let pid = ctx.shared.borrow().pid;
             let owner = if wait.section != 0 { memory.read_u32(wait.section + 12).unwrap_or(0) } else { 0 };
             eprintln!(
-                "[waits] process {pid:#x} thread {thread} has waited 20 s for {:?} (address {:#x}, section {:#x} owned by {owner}, messages {})",
-                wait.handles, wait.address, wait.section, wait.messages
+                "[waits] process {pid:#x} thread {thread} has waited 20 s for {:?} (address {:#x} = {:?} waiting while {:?}, wakes {:?} from {}, section {:#x} owned by {owner}, messages {})",
+                wait.handles,
+                wait.address,
+                memory.read_bytes(wait.address, wait.compare.len()),
+                wait.compare,
+                ctx.shared.borrow().sync.wakes.get(&wait.wake_key).copied(),
+                wait.wake_count,
+                wait.section,
+                wait.messages
             );
             for (other, w) in &ctx.shared.borrow().sync.waits {
                 eprintln!(

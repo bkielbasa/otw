@@ -55,11 +55,25 @@ impl fmt::Write for Serial {
     }
 }
 
+static LOG_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Write a line to the log, whole (CPUs take turns; one that waits long,
+/// as an interrupt handler on the CPU writing would, goes ahead).
+pub fn log_line(args: fmt::Arguments<'_>) {
+    use core::sync::atomic::Ordering;
+    let mut spins = 0u32;
+    while LOG_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() && spins < 20_000_000 {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    let _ = fmt::Write::write_fmt(&mut Serial, format_args!("{args}\n"));
+    LOG_BUSY.store(false, Ordering::Release);
+}
+
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        let _ = writeln!($crate::io::Serial, $($arg)*);
+        $crate::io::log_line(format_args!($($arg)*));
     }};
 }
 

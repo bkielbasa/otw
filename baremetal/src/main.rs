@@ -20,6 +20,7 @@ mod desktop;
 mod disk;
 mod heap;
 mod io;
+mod net;
 mod nvme;
 mod paging;
 mod pci;
@@ -31,6 +32,7 @@ mod sync;
 mod system;
 mod uefi;
 mod user;
+mod virtio_net;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -238,6 +240,9 @@ extern "sysv64" fn kernel_main2(regions: &Vec<Region>) -> ! {
 
     let (disks, drive_c) = find_disks();
     log!("OTW kernel: disks found ({} ms)", ms_since_start());
+    if !net::init(&pci::scan()) {
+        log!("OTW kernel: no network card this kernel drives");
+    }
     // With the disk-test feature: read a big file whole at boot, to see the
     // disk work (and how fast).
     let mut notes = Vec::new();

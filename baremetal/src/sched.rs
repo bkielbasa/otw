@@ -221,6 +221,15 @@ fn switch_to(next: *mut Task, state: State) {
         (*next).state = State::Running;
         CURRENT[index].store(next, Ordering::SeqCst);
         crate::arch::disable_interrupts();
+        // The next task's address space (the kernel's for a task without a
+        // program): a CPU must not stay in a program's tables, which go
+        // when the program ends.
+        let wanted = if (*next).cr3 != 0 { (*next).cr3 } else { crate::paging::page_table_root() };
+        let current: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) current);
+        if current & !0xFFF != wanted {
+            core::arch::asm!("mov cr3, {}", in(reg) wanted);
+        }
         otw_switch(&mut (*me).rsp, (*next).rsp);
     }
     // Back on this task (possibly on another CPU).

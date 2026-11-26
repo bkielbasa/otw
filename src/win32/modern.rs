@@ -31,7 +31,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "FlsAlloc" | "FlsGetValue" | "FlsFree" | "InitializeSListHead" | "AcquireSRWLockExclusive" | "AcquireSRWLockShared" | "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared" | "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" | "InitializeSRWLock" | "InitializeConditionVariable" | "WakeAllConditionVariable" | "WakeConditionVariable" | "InitOnceInitialize" | "SubmitThreadpoolWork" | "CloseThreadpoolWork" | "CancelIo" | "UnregisterApplicationRestart" | "IsCharLowerW" | "IsCharAlphaNumericW" | "IsCharAlphaW" | "IsCharUpperW" | "AddClipboardFormatListener" | "RemoveClipboardFormatListener" | "FlashWindowEx" | "PathIsRelativeW" | "PathGetDriveNumberW" | "PathIsNetworkPathW" | "PathStripPathW" | "PathRemoveExtensionW" | "CloseThemeData" | "ImageNtHeader" | "IsNetworkAlive" | "_TrackMouseEvent" | "BufferedPaintStopAllAnimations" | "ImageList_DragShowNolock" | "BCryptDestroyHash" | "CryptMsgClose" | "DwmIsCompositionEnabled" | "GetSidSubAuthorityCount" | "CryptDestroyHash" => 1,
         "FlsSetValue" | "RegisterApplicationRestart" | "GetAncestor" | "SetDCBrushColor" | "WaitForThreadpoolWorkCallbacks" | "FreeLibraryWhenCallbackReturns" | "PathMatchSpecW" | "PathCanonicalizeW" | "OpenThemeData" | "DragQueryPoint" | "Shell_NotifyIconW" | "IsDestinationReachableW" | "ImmSetCompositionFontW" | "DwmGetColorizationColor" | "CertCloseStore" | "Process32FirstW" | "Process32NextW" | "ChangeWindowMessageFilter" | "CryptReleaseContext" | "GetSidSubAuthority" | "BCryptCloseAlgorithmProvider" | "ImageList_DragMove" | "EndBufferedPaint" | "BufferedPaintRenderAnimation" | "EnableThemeDialogTexture" => 2,
         "InitOnceComplete" | "SetWindowTheme" | "ColorAdjustLuma" | "ColorHLSToRGB" | "GetScrollBarInfo" | "WinVerifyTrust" | "GetLongPathNameW" | "CreateThreadpoolWork" | "CheckTokenMembership" | "DrawThemeParentBackground" | "SleepConditionVariableCS" | "ImageList_DragEnter" => 3,
-        "ColorRGBToHLS" | "PathCompactPathExW" | "GetLocaleInfoEx" | "GetLocaleInfoW" | "SetLayeredWindowAttributes" | "ChangeWindowMessageFilterEx" | "NotifyWinEvent" | "GetFinalPathNameByHandleW" | "FindFirstStreamW" | "QueryFullProcessImageNameW" | "GetFileInformationByHandleEx" | "InitOnceBeginInitialize" | "InitOnceExecuteOnce" | "SleepConditionVariableSRW" | "PathCreateFromUrlW" | "SHOpenFolderAndSelectItems" | "DwmSetWindowAttribute" | "BCryptOpenAlgorithmProvider" | "BCryptHashData" | "CryptHashData" | "ConvertStringSecurityDescriptorToSecurityDescriptorW" | "LoadIconMetric" | "TaskDialogIndirect" | "InternetCrackUrlW" | "BCryptFinishHash" | "ImageList_BeginDrag" | "CertGetCertificateContextProperty" | "GetApplicationRestartSettings" => 4,
+        "ColorRGBToHLS" | "PathCompactPathExW" | "GetLocaleInfoEx" | "GetLocaleInfoW" | "SetLayeredWindowAttributes" | "ChangeWindowMessageFilterEx" | "NotifyWinEvent" | "GetFinalPathNameByHandleW" | "FindFirstStreamW" | "QueryFullProcessImageNameW" | "GetFileInformationByHandleEx" | "InitOnceBeginInitialize" | "InitOnceExecuteOnce" | "SleepConditionVariableSRW" | "PathCreateFromUrlW" | "SHOpenFolderAndSelectItems" | "DwmSetWindowAttribute" | "DwmGetWindowAttribute" | "BCryptOpenAlgorithmProvider" | "BCryptHashData" | "CryptHashData" | "ConvertStringSecurityDescriptorToSecurityDescriptorW" | "LoadIconMetric" | "TaskDialogIndirect" | "InternetCrackUrlW" | "BCryptFinishHash" | "ImageList_BeginDrag" | "CertGetCertificateContextProperty" | "GetApplicationRestartSettings" => 4,
         "CompareStringOrdinal" | "GetProductInfo" | "mouse_event" | "CryptAcquireContextW" | "CryptCreateHash" | "CryptGetHashParam" | "GetThemeColor" | "LoadIconWithScaleDown" | "SHParseDisplayName" | "CryptMsgGetParam" | "CertNameToStrW" | "BeginBufferedPaint" => 5,
         "CopyFileExW" | "ReplaceFileW" | "GetTimeFormatEx" | "AssocQueryStringW" | "DrawThemeBackground" | "GetThemeFont" | "GetThemeTransitionDuration" | "ImmSetCompositionStringW" | "CertGetNameStringW" | "CertFindCertificateInStore" | "GetThemeBackgroundContentRect" | "BCryptGetProperty" => 6,
         "GetDateFormatEx" | "GetThemePartSize" | "GetTextExtentExPointW" | "GetTextExtentExPointA" | "RegGetValueW" | "BCryptCreateHash" => 7,
@@ -498,6 +498,18 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         | "DrawThemeTextEx" | "GetThemePartSize" | "GetThemeTransitionDuration" | "DrawThemeParentBackground" => ok(E_FAIL),
         "BeginBufferedAnimation" | "BeginBufferedPaint" | "BufferedPaintRenderAnimation" | "EndBufferedPaint" => ok(0),
         "DwmGetColorizationColor" | "DwmSetWindowAttribute" => ok(E_FAIL),
+        // (window, attribute, buffer, size): nothing set (not cloaked, no
+        // special colours); the frame bounds are the window's rectangle.
+        // (Firefox takes a window it reads as cloaked for hidden, and then
+        // stops drawing it.)
+        "DwmGetWindowAttribute" => {
+            let _ = memory.write_bytes(args[2], &vec![0u8; args[3].min(256) as usize]);
+            const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+            if args[1] == DWMWA_EXTENDED_FRAME_BOUNDS && args[3] >= 16 {
+                call(ctx, memory, "USER32.dll", "GetWindowRect", &[args[0], args[2]]);
+            }
+            ok(S_OK)
+        }
         // Composition is on for 64-bit programs (Windows 8 and later
         // cannot turn it off), whose frame pacing waits on DwmFlush.
         "DwmIsCompositionEnabled" => {

@@ -47,14 +47,35 @@ const MAX_DEPTH: usize = 48;
 /// The programs running (for the status report): their runners.
 static RUNNERS: otw_vm::platform::sync::Mutex<Vec<usize>> = otw_vm::platform::sync::Mutex::new(Vec::new());
 
-/// Log what each running program is doing (every few seconds, from the
-/// desktop): system calls so far and the last few.
+/// Log what each running program is doing (every ten seconds, from the
+/// desktop; with OTW_TRACE_STATUS=1): calls by name since the last report,
+/// each thread's last calls, and the latest.
 pub fn report() {
+    if otw_vm::platform::env::var("OTW_TRACE_STATUS").map_or(true, |v| v == "0") {
+        return;
+    }
     let runners = RUNNERS.lock().unwrap().clone();
     for runner in runners {
         let runner = unsafe { &*(runner as *const Runner) };
         let _hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
         let recent: Vec<String> = runner.recent.borrow().iter().rev().take(6).cloned().collect();
+        let mut counts: Vec<(String, u64)> = core::mem::take(&mut *runner.counts.borrow_mut()).into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = counts.iter().map(|(n, c)| alloc::format!("{n} {c}")).collect();
+        log!("OTW kernel: [calls] {}", top.join(", "));
+        let now = crate::apic::now_us();
+        let threads: Vec<String> = runner
+            .last_call
+            .0
+            .borrow()
+            .iter()
+            .filter(|(_, (names, _, _))| names.back().is_some_and(|n| n != "ThreadReturn"))
+            .map(|(task, (names, at, calls))| {
+                let names: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+                alloc::format!("{task}:{}@{}ms/{calls}", names.join(">"), (now - at) / 1000)
+            })
+            .collect();
+        log!("OTW kernel: [threads] {}", threads.join(" "));
         log!(
             "OTW kernel: [status] {} calls, {} threads on CPUs; last: {}",
             runner.api_calls.get(),
@@ -145,6 +166,12 @@ struct Runner {
     reserved: RefCell<Vec<(u64, u64)>>,
     ended: RefCell<Option<Ended>>,
     api_calls: Cell<u64>,
+    /// Collect the calls for the status report (OTW_TRACE_STATUS).
+    trace_status: bool,
+    /// Each thread's last call, when it was made, and its calls so far.
+    last_call: PerTask<(alloc::collections::VecDeque<String>, u64, u64)>,
+    /// Calls by name since the last status report.
+    counts: RefCell<alloc::collections::BTreeMap<String, u64>>,
     /// Exception handling's request to continue elsewhere.
     resume: PerTask<Option<Resume>>,
     resume_full: PerTask<Option<FullRegisters>>,
@@ -330,6 +357,14 @@ impl Runner {
 
     /// A CPU fault: give it to the program's exception handlers.
     fn raise_fault(&self, regs: &mut UserRegs, vector: u8) -> Option<Stop> {
+        // `int 0x29` (__fastfail): the program ends itself at once, no
+        // handler asked (its gate is closed to user mode, so it arrives as a
+        // protection fault naming it).
+        if vector == 13 && regs.error == (0x29 << 3 | 2) {
+            log!("OTW kernel: the program failed fast (reason {}) at {:#x}", regs.rcx, regs.rip);
+            self.end(Ended::Exited(0xC000_0409));
+            return Some(Stop::Ended);
+        }
         let (code, params): (u32, Vec<u64>) = match vector {
             0 => (eh::STATUS_INTEGER_DIVIDE_BY_ZERO, Vec::new()),
             3 => (0x8000_0003, Vec::new()),
@@ -450,7 +485,21 @@ impl Runner {
             if recent.len() >= 40 {
                 recent.pop_front();
             }
-            recent.push_back(self.syscalls.describe(&entry.dll, &entry.name));
+            let described = self.syscalls.describe(&entry.dll, &entry.name);
+            if self.trace_status {
+                let short: String = described.rsplit('!').next().unwrap_or("").into();
+                *self.counts.borrow_mut().entry(short.clone()).or_default() += 1;
+                let mut last = self.last_call.borrow_mut();
+                if last.0.back() != Some(&short) {
+                    if last.0.len() >= 8 {
+                        last.0.pop_front();
+                    }
+                    last.0.push_back(short);
+                }
+                last.1 = crate::apic::now_us();
+                last.2 += 1;
+            }
+            recent.push_back(described);
         }
         let x64 = self.x64;
         let esp = regs.rsp;
@@ -1343,6 +1392,9 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         reserved: RefCell::new(Vec::new()),
         ended: RefCell::new(None),
         api_calls: Cell::new(0),
+        counts: RefCell::new(alloc::collections::BTreeMap::new()),
+        last_call: PerTask::new(),
+        trace_status: otw_vm::platform::env::var("OTW_TRACE_STATUS").is_ok_and(|v| v != "0"),
         resume: PerTask::new(),
         resume_full: PerTask::new(),
         levels: PerTask::new(),

@@ -6856,6 +6856,13 @@ pub fn system_metric(index: u32, sw: i32, sh: i32) -> i32 {
         62 => sh - TASKBAR_HEIGHT + 8,
         68 | 69 => 4,
         71 | 72 => 13,
+        // The virtual screen (all monitors: the one): Firefox takes the
+        // part of it no window covers for where its windows show, and with
+        // none stops drawing them as hidden.
+        78 => sw,
+        79 => sh,
+        // Monitors; all of the same colour format.
+        80 | 81 => 1,
         _ => 0,
     }
 }

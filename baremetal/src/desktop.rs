@@ -172,6 +172,17 @@ impl Desktop {
         let now_s = apic::now_us() / 10_000_000;
         if LAST_REPORT.swap(now_s, Ordering::Relaxed) != now_s {
             crate::process::report();
+            if otw_vm::platform::env::var("OTW_TRACE_STATUS").is_ok_and(|v| v != "0") {
+                each_program(|shared, name| {
+                    for w in shared.gui.windows.iter().filter(|w| w.style & WS_CHILD == 0) {
+                        log!(
+                            "OTW kernel: [window] {name} {:#x} {:?} {:?} visible {} min {} at {},{} {}x{} style {:#x} ex {:#x} owner {:#x} parent {:#x}",
+                            w.hwnd, w.class, w.title, w.visible, w.minimized, w.x, w.y, w.width, w.height, w.style, w.ex_style, w.owner, w.parent
+                        );
+                    }
+                    false
+                });
+            }
         }
         for (title, text) in core::mem::take(&mut *NOTICES.lock().unwrap()) {
             self.shell.show_message(&title, &text);
