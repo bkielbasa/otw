@@ -44,6 +44,26 @@ const CALLBACK_RETURN: u64 = SENTINEL_BASE as u64;
 /// Callbacks within callbacks, at most.
 const MAX_DEPTH: usize = 48;
 
+/// The programs running (for the status report): their runners.
+static RUNNERS: otw_vm::platform::sync::Mutex<Vec<usize>> = otw_vm::platform::sync::Mutex::new(Vec::new());
+
+/// Log what each running program is doing (every few seconds, from the
+/// desktop): system calls so far and the last few.
+pub fn report() {
+    let runners = RUNNERS.lock().unwrap().clone();
+    for runner in runners {
+        let runner = unsafe { &*(runner as *const Runner) };
+        let _hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
+        let recent: Vec<String> = runner.recent.borrow().iter().rev().take(6).cloned().collect();
+        log!(
+            "OTW kernel: [status] {} calls, {} threads on CPUs; last: {}",
+            runner.api_calls.get(),
+            runner.workers.borrow().len(),
+            recent.join(", ")
+        );
+    }
+}
+
 /// How a program run ended.
 pub enum Ended {
     Exited(u32),
@@ -116,6 +136,8 @@ struct Runner {
     x64: bool,
     entries: Vec<IatEntry>,
     syscalls: Rc<dyn SystemCalls>,
+    /// The loaded modules (to name code addresses when a program fails).
+    modules: Rc<RefCell<Vec<otw_vm::win32::LoadedModule>>>,
     dispatcher: u64,
     thread_return: u64,
     /// Address ranges the program may use; their pages are made when first
@@ -328,8 +350,18 @@ impl Runner {
             log!("[eh] {address:#x}: reserved {}, unmapped earlier {gone:x?}, shared {shared:x?}", self.reserved_at(address));
             // What the program was doing: return addresses on its stack,
             // strings its registers point at (a crash reason), its code.
-            let stack: Vec<u64> = (0..24).filter_map(|i| self.read_u64(regs.rsp + i * 8)).filter(|v| (0x1000_0000..0x8000_0000).contains(v)).collect();
-            log!("[eh] stack {stack:x?}");
+            let stack: Vec<u64> = (0..24).filter_map(|i| self.read_u64(regs.rsp + i * 8)).filter(|&v| v >= 0x1_0000).collect();
+            let modules = self.modules.borrow();
+            let name = |v: u64| -> String {
+                modules
+                    .iter()
+                    .find(|m| v >= m.image_base as u64 && v < m.image_base as u64 + m.size as u64)
+                    .map(|m| alloc::format!("{}+{:#x}", m.name, v - m.image_base as u64))
+                    .unwrap_or_else(|| alloc::format!("{v:#x}"))
+            };
+            let named: Vec<String> = stack.iter().map(|&v| name(v)).collect();
+            log!("[eh] at {}; stack {}", name(at), named.join(" "));
+            drop(modules);
             for (name, v) in [("rax", regs.rax), ("rcx", regs.rcx), ("rsi", regs.rsi), ("r8", regs.r8), ("r9", regs.r9)] {
                 if let Some(bytes) = self.read(v, 96) {
                     let text: String = bytes.iter().take_while(|&&b| b != 0).map(|&b| if (32..127).contains(&b) { b as char } else { '.' }).collect();
@@ -1305,6 +1337,7 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         x64,
         entries: vm.iat().entries.clone(),
         syscalls: Rc::new(vm.api_context().clone()),
+        modules: vm.api_context().modules.clone(),
         dispatcher: image.entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER).unwrap_or(0) as u64,
         thread_return: image.entry_point(KERNEL_DLL, THREAD_RETURN).unwrap_or(0) as u64,
         reserved: RefCell::new(Vec::new()),
@@ -1381,6 +1414,7 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
     if x64 {
         runner.reserve(memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64);
         runner.reserve(memory::NTDLL_HANDLE as u64, memory::NTDLL_SIZE as u64);
+        runner.write(memory::NTDLL_HANDLE as u64, &memory::ntdll_headers());
     }
     // The first thread's information block (FS in 32-bit code, GS in
     // 64-bit), and its TLS.
@@ -1417,6 +1451,7 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         (apic::now_us() - started) / 1000
     );
 
+    RUNNERS.lock().unwrap().push(&runner as *const Runner as usize);
     let on_desktop = crate::desktop::program_started(shared, &runner.lock, path.rsplit('\\').next().unwrap_or(path));
     // In the subsystem (until program code runs).
     let hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
@@ -1457,6 +1492,7 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         }
     }
     drop(hold);
+    RUNNERS.lock().unwrap().retain(|&r| r != &runner as *const Runner as usize);
     crate::desktop::program_ended(on_desktop);
     // Back to the kernel's tables before the program's go.
     let task = crate::sched::current();

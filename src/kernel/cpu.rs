@@ -2679,22 +2679,7 @@ fn build<'a>(
     if x64 {
         map_in(&mut uc, &state, memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64)
             .map_err(|error| RunError::Unicorn("mapping the 64-bit heap", error))?;
-        // NTDLL's headers, for programs that read their own module list.
-        let mut headers = vec![0u8; 0x1000];
-        headers[0..2].copy_from_slice(b"MZ");
-        headers[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        headers[0x80..0x84].copy_from_slice(b"PE\0\0");
-        headers[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
-        headers[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
-        headers[0x96..0x98].copy_from_slice(&0x2022u16.to_le_bytes());
-        let o = 0x98;
-        headers[o..o + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
-        headers[o + 24..o + 32].copy_from_slice(&(memory::NTDLL_HANDLE as u64).to_le_bytes());
-        headers[o + 32..o + 36].copy_from_slice(&0x1000u32.to_le_bytes());
-        headers[o + 36..o + 40].copy_from_slice(&0x200u32.to_le_bytes());
-        headers[o + 56..o + 60].copy_from_slice(&memory::NTDLL_SIZE.to_le_bytes());
-        headers[o + 60..o + 64].copy_from_slice(&0x200u32.to_le_bytes());
-        headers[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
+        let headers = memory::ntdll_headers();
         // The rest of its image is for the subsystem's exports and their
         // stubs (see `win32::nt::ntdll_exports`).
         map_in(&mut uc, &state, memory::NTDLL_HANDLE as u64, memory::NTDLL_SIZE as u64)

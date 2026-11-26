@@ -21,6 +21,27 @@ pub const NTDLL_HANDLE: u32 = 0xFFF0_0000;
 /// The size of NTDLL's image.
 pub const NTDLL_SIZE: u32 = 0x1_0000;
 
+/// NTDLL's headers, for programs that read their own module list or look
+/// functions up in its export table (filled by `win32::nt::ntdll_exports`).
+pub fn ntdll_headers() -> Vec<u8> {
+    let mut headers = vec![0u8; 0x1000];
+    headers[0..2].copy_from_slice(b"MZ");
+    headers[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    headers[0x80..0x84].copy_from_slice(b"PE\0\0");
+    headers[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+    headers[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+    headers[0x96..0x98].copy_from_slice(&0x2022u16.to_le_bytes());
+    let o = 0x98;
+    headers[o..o + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+    headers[o + 24..o + 32].copy_from_slice(&(NTDLL_HANDLE as u64).to_le_bytes());
+    headers[o + 32..o + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+    headers[o + 36..o + 40].copy_from_slice(&0x200u32.to_le_bytes());
+    headers[o + 56..o + 60].copy_from_slice(&NTDLL_SIZE.to_le_bytes());
+    headers[o + 60..o + 64].copy_from_slice(&0x200u32.to_le_bytes());
+    headers[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
+    headers
+}
+
 /// Where a 64-bit process's memory backed by memory of its own (views of
 /// sections) goes: below its pool, so its CPUs keep the pool whole.
 pub const SEPARATE_BASE: u32 = 0x2000_0000;

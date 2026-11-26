@@ -168,6 +168,11 @@ impl Desktop {
             self.dirty |= self.handle(byte);
         }
         self.dirty |= self.shell.clock_changed();
+        static LAST_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let now_s = apic::now_us() / 10_000_000;
+        if LAST_REPORT.swap(now_s, Ordering::Relaxed) != now_s {
+            crate::process::report();
+        }
         for (title, text) in core::mem::take(&mut *NOTICES.lock().unwrap()) {
             self.shell.show_message(&title, &text);
             self.dirty = true;
