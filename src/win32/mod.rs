@@ -260,6 +260,10 @@ pub struct GuestWindow {
     pub erase: bool,
     /// Non-client area must be redrawn.
     pub nc_dirty: bool,
+    /// The non-client insets (left, top, right, bottom) the program chose
+    /// in WM_NCCALCSIZE, when not the standard frame: a program that draws
+    /// its own title bar (Firefox) makes its client area cover the caption.
+    pub nc_override: Option<(i32, i32, i32, i32)>,
     pub props: Vec<(String, u32)>,
     /// Horizontal and vertical scroll bar state: (min, max, pos, page).
     pub scroll: [(i32, i32, i32, u32); 2],

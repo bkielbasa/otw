@@ -184,7 +184,64 @@ pub fn frame_width(style: u32, ex_style: u32) -> i32 {
 
 /// Non-client insets (left, top, right, bottom) of a window.
 pub fn nc_insets(window: &GuestWindow) -> (i32, i32, i32, i32) {
+    if let Some(insets) = window.nc_override {
+        return insets;
+    }
     nc_insets_for(scroll_style(window), window.ex_style, has_menu_bar(window))
+}
+
+/// Ask a 64-bit program's window for its client area (WM_NCCALCSIZE with
+/// the window rectangle): a program may claim the caption for itself.
+/// The standard frame is what DefWindowProc gives.
+pub fn calc_nc_size<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
+    if !ctx.shared.borrow().x64 {
+        return;
+    }
+    let Some((width, height, style)) = ctx.shared.borrow().gui.window(hwnd).map(|w| (w.width, w.height, w.style)) else {
+        return;
+    };
+    if style & WS_CHILD != 0 {
+        return;
+    }
+    // NCCALCSIZE_PARAMS: three RECTs and a WINDOWPOS pointer, then the
+    // WINDOWPOS (hwnd, insert after, x, y, cx, cy, flags).
+    let params = scratch(ctx, 128);
+    let pos = params + 56;
+    let mut bytes = Vec::new();
+    for _ in 0..3 {
+        for value in [0, 0, width, height] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes.extend_from_slice(&(pos as u64).to_le_bytes());
+    bytes.extend_from_slice(&(hwnd as u64).to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    for value in [0, 0, width, height, 0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.resize(128, 0);
+    let _ = memory.write_bytes(params, &bytes);
+    send(ctx, memory, hwnd, WM_NCCALCSIZE, 1, params);
+    let rect: Vec<i32> = memory
+        .read_bytes(params, 16)
+        .unwrap_or_default()
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    free_scratch(ctx, params);
+    if rect.len() != 4 {
+        return;
+    }
+    let insets = (rect[0], rect[1], width - rect[2], height - rect[3]);
+    let mut shared = ctx.shared.borrow_mut();
+    if let Some(window) = shared.gui.window_mut(hwnd) {
+        let standard = nc_insets_for(scroll_style(window), window.ex_style, has_menu_bar(window));
+        let chosen = (insets != standard).then_some(insets);
+        if window.nc_override != chosen {
+            window.nc_override = chosen;
+            window.nc_dirty = true;
+        }
+    }
 }
 
 /// A window's style as far as its own scroll bars go: a combo box passes
@@ -460,6 +517,14 @@ pub fn caption_buttons(window: &GuestWindow) -> (Option<Rect>, Option<Rect>, Opt
 pub fn nc_hit_test(window: &GuestWindow, x: i32, y: i32) -> i32 {
     if x < 0 || y < 0 || x >= window.width || y >= window.height {
         return HTNOWHERE;
+    }
+    if let Some((l, t, r, b)) = window.nc_override {
+        // The program drew its own frame: outside its client area is
+        // border, or caption above it.
+        if x >= l && y >= t && x < window.width - r && y < window.height - b {
+            return HTCLIENT;
+        }
+        return if y < t && x >= l && x < window.width - r { HTCAPTION } else { HTBORDER };
     }
     let frame = frame_width(window.style, window.ex_style);
     if window.style & WS_THICKFRAME != 0 && !window.maximized {
@@ -772,6 +837,10 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
         .and_then(|class| shared.gui.small_icon(class.icon))
         .filter(|icon| icon.width == 16 && icon.height == 16)
         .cloned();
+    if window.nc_override.is_some() {
+        // The program draws its own frame.
+        return;
+    }
     with_painter(shared, hwnd, false, |p| {
         let (w, h) = (window.width, window.height);
         let frame = frame_width(window.style, window.ex_style);
@@ -1738,6 +1807,7 @@ pub fn create_window<M: GuestMemory + ?Sized>(
         free_scratch(ctx, cs);
         return 0;
     }
+    calc_nc_size(ctx, memory, hwnd);
     if send(ctx, memory, hwnd, WM_CREATE, 0, cs) as i32 == -1 {
         destroy_window(ctx, memory, hwnd);
         free_scratch(ctx, cs);
@@ -2456,6 +2526,9 @@ pub fn set_window_pos<M: GuestMemory + ?Sized>(
         final_flags |= SWP_NOSIZE;
     }
     write_wp(memory, new, final_flags);
+    if sized || flags & SWP_FRAMECHANGED != 0 {
+        calc_nc_size(ctx, memory, hwnd);
+    }
     if moved || sized || flags & SWP_FRAMECHANGED != 0 {
         send(ctx, memory, hwnd, WM_WINDOWPOSCHANGED, 0, wp);
     }
@@ -2499,7 +2572,25 @@ pub fn def_window_proc<M: GuestMemory + ?Sized>(
             }
             1
         }
-        WM_NCCALCSIZE => 0,
+        WM_NCCALCSIZE => {
+            // The standard frame: the proposed window rectangle less the
+            // borders, caption and menu bar.
+            if wparam != 0 && lparam != 0 {
+                let standard = {
+                    let shared = ctx.shared.borrow();
+                    shared.gui.window(hwnd).map(|w| nc_insets_for(scroll_style(w), w.ex_style, has_menu_bar(w)))
+                };
+                if let (Some((l, t, r, b)), Some(rect)) = (standard, memory.read_bytes(lparam, 16)) {
+                    let v: Vec<i32> = rect.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let mut out = Vec::new();
+                    for value in [v[0] + l, v[1] + t, v[2] - r, v[3] - b] {
+                        out.extend_from_slice(&value.to_le_bytes());
+                    }
+                    let _ = memory.write_bytes(lparam, &out);
+                }
+            }
+            0
+        }
         WM_NCHITTEST => {
             let shared = ctx.shared.borrow();
             let Some(window) = shared.gui.window(hwnd) else {
