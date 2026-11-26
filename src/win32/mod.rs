@@ -818,6 +818,8 @@ pub struct SharedState {
     /// Started to run alongside its parent: headless input scripts and
     /// idle exits are the first program's.
     pub alongside: bool,
+    /// The environment for the program being started (CreateProcess).
+    pub pending_environment: Option<Vec<String>>,
     /// Pipes, sections and completion ports of this process.
     pub ipc: ipc::State,
     /// The program asked Windows to restart (ExitWindowsEx).
@@ -876,6 +878,7 @@ impl Default for SharedState {
             launcher: LauncherSlot::default(),
             pid: 1,
             alongside: false,
+            pending_environment: None,
             ipc: ipc::State::default(),
             restart_requested: false,
             image_lists: HashMap::new(),

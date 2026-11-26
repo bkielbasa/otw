@@ -212,7 +212,7 @@ struct Fault {
     eip: u32,
     /// ExceptionInformation: for access violations, 0 = read / 1 = write
     /// and the inaccessible address.
-    params: [u32; 2],
+    params: [u64; 2],
     param_count: u32,
 }
 
@@ -419,7 +419,7 @@ fn deliver_fault(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>) ->
         let base = rsp.wrapping_sub(0x200 + context64::RECORD_SIZE + context64::CONTEXT_SIZE) & !0xF;
         let record = base + 0x30;
         let context = (record + context64::RECORD_SIZE + 15) & !15;
-        let params: Vec<u64> = fault.params.iter().take(fault.param_count as usize).map(|&p| p as u64).collect();
+        let params: Vec<u64> = fault.params.iter().take(fault.param_count as usize).copied().collect();
         let delivered = uc
             .mem_write(record as u64, &context64::record(fault.code, 0, fault.eip as u64, &params))
             .and_then(|()| uc.mem_write(context as u64, &context64::encode(&full)))
@@ -475,8 +475,8 @@ fn deliver_fault(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>) ->
     put(12, fault.code);
     put(12 + 12, fault.eip);
     put(12 + 16, fault.param_count);
-    put(12 + 20, fault.params[0]);
-    put(12 + 24, fault.params[1]);
+    put(12 + 20, fault.params[0] as u32);
+    put(12 + 24, fault.params[1] as u32);
     let c = 12 + RECORD_SIZE;
     put(c, 0x0001_0007); // CONTEXT_FULL
     for (offset, register) in [
@@ -2313,7 +2313,7 @@ fn build<'a>(
             | HookType::MEM_WRITE_PROT
             | HookType::MEM_FETCH_PROT,
         0,
-        u32::MAX as u64,
+        u64::MAX,
         move |uc, access, address, size, _value| {
             if trace_code {
                 eprintln!("last instructions before invalid memory access {access:?} at {address:#010x}, size {size}:");
@@ -2328,7 +2328,7 @@ fn build<'a>(
             invalid_state.borrow_mut().fault = Some(Fault {
                 code: crate::kernel::eh::STATUS_ACCESS_VIOLATION,
                 eip,
-                params: [write as u32, address as u32],
+                params: [write as u64, address],
                 param_count: 2,
             });
             false

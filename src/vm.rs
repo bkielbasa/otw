@@ -3,7 +3,7 @@
 //! system calls behind its other imports.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
@@ -329,7 +329,6 @@ pub struct NestedLauncher {
     /// Where the child's windows are shown.
     display: Option<Rc<dyn ProgramDisplay>>,
     exits: RefCell<HashMap<u32, u32>>,
-    next_pid: Cell<u32>,
     me: RefCell<std::rc::Weak<NestedLauncher>>,
 }
 
@@ -339,7 +338,6 @@ impl NestedLauncher {
             pump,
             display,
             exits: RefCell::new(HashMap::new()),
-            next_pid: Cell::new(0x100),
             me: RefCell::new(std::rc::Weak::new()),
         });
         *launcher.me.borrow_mut() = Rc::downgrade(&launcher);
@@ -361,9 +359,13 @@ impl Launcher for NestedLauncher {
             child.gui.screen = parent_state.gui.screen;
             child.gui.script = parent_state.gui.script.take();
             child.gui.script_wait = std::mem::take(&mut parent_state.gui.script_wait);
+            child.gui.script_until = parent_state.gui.script_until.take();
         }
         if let Some(me) = self.me.borrow().upgrade() {
             me.install(&shared);
+        }
+        if let Some(environment) = parent.shared.borrow_mut().pending_environment.take() {
+            win32::env::set_all(&mut shared.borrow_mut().env, &environment);
         }
         let vm = match Vm::from_drive(path, command_line, shared.clone()) {
             Ok(vm) => vm,
@@ -375,8 +377,9 @@ impl Launcher for NestedLauncher {
         if !directory.is_empty() {
             shared.borrow_mut().current_dir = directory.to_vec();
         }
-        let pid = self.next_pid.get();
-        self.next_pid.set(pid + 1);
+        let parent_pid = parent.shared.borrow().pid;
+        let pid = win32::kobj::with(|k| k.new_pid(parent_pid, false));
+        shared.borrow_mut().pid = pid;
         let name = String::from_utf8_lossy(path.rsplit(|&b| b == b'\\').next().unwrap_or(path)).into_owned();
         if let Some(session) = &self.display {
             session.attach(pid, &name, shared.clone());
@@ -394,6 +397,7 @@ impl Launcher for NestedLauncher {
         win32::registry::flush();
         // The rest of the script goes back to the parent.
         parent.shared.borrow_mut().gui.script = shared.borrow_mut().gui.script.take();
+        parent.shared.borrow_mut().gui.script_until = shared.borrow_mut().gui.script_until.take();
         let code = match result {
             Ok(result) => result.exit_code,
             Err(error) => {
@@ -405,6 +409,11 @@ impl Launcher for NestedLauncher {
             eprintln!("[process] {name} (process {pid}) exited with {code:#x}");
         }
         self.exits.borrow_mut().insert(pid, code);
+        win32::kobj::with(|k| {
+            if let Some(process) = k.processes.get_mut(&pid) {
+                process.exit.get_or_insert(code);
+            }
+        });
         Ok(pid)
     }
 
@@ -413,14 +422,31 @@ impl Launcher for NestedLauncher {
     }
 
     fn start_with(&self, parent: &ApiContext, path: &[u8], command_line: &[u8], directory: &[u8], options: win32::LaunchOptions) -> Result<u32, String> {
-        // 64-bit programs a 64-bit program starts run alongside it (the
-        // content processes of a browser talk to theirs while both run);
-        // others run to the end inside the call.
+        // A 64-bit program a 64-bit program starts with handles to share
+        // runs alongside it (the content processes of a browser talk to
+        // theirs through pipes while both run); others run to the end
+        // inside the call, in the parent's place on the screen (a program
+        // that restarts itself, a helper it waits for).
         let child64 = win32::crt::host_path(path)
             .and_then(|host| fs::read(host).ok())
             .and_then(|bytes| PeImage::parse(bytes).ok())
             .is_some_and(|image| image.is64);
-        if !(child64 && parent.shared.borrow().x64) {
+        let parent_pid = parent.shared.borrow().pid;
+        let shares = options.inherit
+            && match &options.handles {
+                Some(handles) => handles.iter().any(|&h| win32::kobj::with(|k| k.owns(parent_pid, h))),
+                None => win32::kobj::with(|k| !k.inheritable(parent_pid).is_empty()),
+            };
+        if !(child64 && parent.shared.borrow().x64 && shares) {
+            if std::env::var_os("OTW_TRACE_THREADS").is_some() {
+                for entry in options.environment.iter().flatten().filter(|e| e.starts_with("MOZ_") || e.starts_with("XRE_")) {
+                    eprintln!("[process]   {entry}");
+                }
+            }
+            if let Some(environment) = options.environment {
+                // The child starts from the environment it was given.
+                parent.shared.borrow_mut().pending_environment = Some(environment);
+            }
             return self.start(parent, path, command_line, directory);
         }
         start_alongside(parent, path, command_line, directory, options)

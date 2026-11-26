@@ -72,7 +72,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         | "_atoi64" | "atof" | "_wtoi" | "tolower" | "toupper" | "towlower" | "towupper" | "isalnum" | "isalpha"
         | "isdigit" | "islower" | "isupper" | "isprint" | "isspace" | "isxdigit" | "iswdigit" | "iswspace"
         | "iswalpha" | "srand" | "rand_s" | "abs" | "llabs" | "_time64" | "_gmtime64" | "_localtime64" | "_mktime64"
-        | "asctime" | "_ftime64" | "getenv" | "_wgetenv" | "_putenv" | "_free_locale" | "_close" | "_isatty"
+        | "asctime" | "_ftime64" | "getenv" | "_wgetenv" | "_putenv" | "_wputenv" | "_free_locale" | "_close" | "_isatty"
         | "_dup" | "_get_osfhandle" | "puts" | "putchar" | "fclose" | "fflush" | "fgetc" | "fgetwc" | "feof"
         | "ferror" | "rewind" | "_fileno" | "_lock_file" | "_unlock_file" | "perror" | "remove" | "_wremove"
         | "_wrmdir" | "_chdir" | "_wchdir" | "_mkdir" | "raise" | "fesetround" | "_wcslwr" | "nan" | "nanf"
@@ -2508,7 +2508,22 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             }
             ok(0)
         }
-        "_putenv" | "_putenv_s" | "_wputenv_s" => ok(0),
+        "_putenv" | "_wputenv" => {
+            // "NAME=value"; an empty value removes the variable.
+            let text = String::from_utf8_lossy(&path_arg(memory, arg(0), name == "_wputenv")).into_owned();
+            let Some((key, value)) = text.split_once('=') else {
+                return ok(u32::MAX as u64);
+            };
+            crate::win32::env::set(ctx, key, (!value.is_empty()).then_some(value));
+            ok(0)
+        }
+        "_putenv_s" | "_wputenv_s" => {
+            let wide = name == "_wputenv_s";
+            let key = String::from_utf8_lossy(&path_arg(memory, arg(0), wide)).into_owned();
+            let value = String::from_utf8_lossy(&path_arg(memory, arg(1), wide)).into_owned();
+            crate::win32::env::set(ctx, &key, (!value.is_empty()).then_some(value.as_str()));
+            ok(0)
+        }
         // ── Time ──
         "_time64" => {
             let (secs, _) = now();

@@ -89,6 +89,8 @@ pub struct SyncState {
     slice_start: Option<std::time::Instant>,
     /// The main thread is letting others run.
     preempting: bool,
+    /// The last error of each thread off the CPU.
+    last_errors: HashMap<u32, u32>,
 }
 
 pub fn arg_count(name: &str) -> Option<usize> {
@@ -308,9 +310,17 @@ pub fn run_ready_threads<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut
             continue;
         }
         // Each thread keeps its own last error.
-        let last_error = ctx.shared.borrow().last_error;
+        let last_error = {
+            let mut shared = ctx.shared.borrow_mut();
+            let own = shared.sync.last_errors.get(&thread).copied().unwrap_or(0);
+            std::mem::replace(&mut shared.last_error, own)
+        };
         let outcome = memory.run_thread(thread);
-        ctx.shared.borrow_mut().last_error = last_error;
+        {
+            let mut shared = ctx.shared.borrow_mut();
+            let own = std::mem::replace(&mut shared.last_error, last_error);
+            shared.sync.last_errors.insert(thread, own);
+        }
         if std::env::var_os("OTW_TRACE_THREADS").is_some() {
             let wait = ctx.shared.borrow().sync.waits.get(&thread).cloned();
             eprintln!("[thread] {thread} ran: {outcome:?}, now waits for {wait:?}");
@@ -371,6 +381,11 @@ pub fn preempt(ctx: &ApiContext, memory: &mut dyn GuestMemory) -> bool {
     }
     if memory.suspend_thread() {
         return true;
+    }
+    if !memory.callback_levels().is_empty() {
+        // Not from inside a callback the subsystem made (a window
+        // procedure it is running), only from the thread's own code.
+        return false;
     }
     ctx.shared.borrow_mut().sync.preempting = true;
     run_ready_threads(ctx, memory);
