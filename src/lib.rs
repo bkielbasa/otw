@@ -71,7 +71,6 @@ pub mod session;
 /// The desktop shell: Start menu, folder windows, launching programs.
 pub mod shell;
 /// A runnable program: a kernel process bound to the Win32 subsystem.
-#[cfg(feature = "std")]
 pub mod vm;
 /// The Win32 environment subsystem: the API DLLs programs call.
 pub mod win32;

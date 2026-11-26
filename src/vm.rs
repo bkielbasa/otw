@@ -7,24 +7,29 @@ use crate::platform as std;
 #[allow(unused_imports)]
 use crate::platform::prelude::*;
 
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
     rc::Rc,
 };
 
+#[cfg(feature = "std")]
+use crate::kernel::cpu::{self, RunError, RunResult};
 use crate::{
     kernel::{
-        cpu::{self, RunError, RunResult},
         iat::Iat,
         image::{Image, ImageError},
         loader::MappedModule,
         pe::PeImage,
     },
-    win32::{self, ApiContext, Launcher, LauncherSlot, SharedState, Win32Imports},
+    win32::{self, ApiContext, SharedState, Win32Imports},
 };
+#[cfg(feature = "std")]
+use crate::win32::{Launcher, LauncherSlot};
 
 const DEFAULT_COMMAND_LINE: &str = "NOTEPAD.EXE";
 
@@ -137,6 +142,7 @@ impl Vm {
         self.image.write_u32(va, value)
     }
 
+    #[cfg(feature = "std")]
     /// Execute the program until it calls `ExitProcess` or the CPU reports
     /// an error.
     pub fn run(&self) -> Result<RunResult, RunError> {
@@ -145,6 +151,7 @@ impl Vm {
         result
     }
 
+    #[cfg(feature = "std")]
     /// Execute with a host callback that pumps window-system events into the
     /// guest message queue before blocking message APIs.
     pub fn run_with_pump<'a>(
@@ -154,6 +161,7 @@ impl Vm {
         cpu::run(&self.image, Rc::new(self.api_ctx.clone()), Some(pump))
     }
 
+    #[cfg(feature = "std")]
     /// Load the program as a process that shares the CPU with others: it
     /// yields whenever it waits for messages. Drive it with
     /// [`cpu::Process::resume`].
@@ -317,6 +325,7 @@ impl Vm {
     }
 }
 
+#[cfg(feature = "std")]
 /// Where programs started by others show their windows (a desktop
 /// session).
 pub trait ProgramDisplay {
@@ -324,6 +333,7 @@ pub trait ProgramDisplay {
     fn detach(&self, pid: u32);
 }
 
+#[cfg(feature = "std")]
 /// Starts the programs a program creates by running each to the end inside
 /// the `CreateProcess` call, as a modal child (installers wait for theirs
 /// anyway). The child takes over what is left of the scripted input, and
@@ -337,6 +347,7 @@ pub struct NestedLauncher {
     me: RefCell<std::rc::Weak<NestedLauncher>>,
 }
 
+#[cfg(feature = "std")]
 impl NestedLauncher {
     pub fn new(pump: Option<Rc<dyn Fn(bool)>>, display: Option<Rc<dyn ProgramDisplay>>) -> Rc<Self> {
         let launcher = Rc::new(Self {
@@ -355,6 +366,7 @@ impl NestedLauncher {
     }
 }
 
+#[cfg(feature = "std")]
 impl Launcher for NestedLauncher {
     fn start(&self, parent: &ApiContext, path: &[u8], command_line: &[u8], directory: &[u8]) -> Result<u32, String> {
         let shared = Rc::new(RefCell::new(SharedState::default()));
@@ -458,6 +470,7 @@ impl Launcher for NestedLauncher {
     }
 }
 
+#[cfg(feature = "std")]
 /// Start a program on a host thread of its own, to run alongside the
 /// others: it shares only the kernel objects in [`win32::kobj`] with them
 /// (and the drive). Returns its process ID.

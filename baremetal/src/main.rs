@@ -23,11 +23,13 @@ mod io;
 mod nvme;
 mod paging;
 mod pci;
+mod process;
 mod screen;
 mod smp;
 mod sync;
 mod system;
 mod uefi;
+mod user;
 
 use alloc::string::String;
 use alloc::sync::Arc;

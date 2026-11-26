@@ -52,10 +52,18 @@ pub fn run(system: &System) -> ! {
         }
         if let Some(request) = shell.take_launch() {
             log!("OTW kernel: asked to run {}", request.path);
-            shell.program_exited(Some(format!(
-                "{} cannot run yet: OTW on bare metal does not run programs so far.",
-                request.name
-            )));
+            let ended = crate::process::run(&request.path, &request.name);
+            shell.program_exited(None);
+            match ended {
+                crate::process::Ended::Exited(code) => {
+                    log!("OTW kernel: {} exited with {code}", request.name);
+                    shell.show_message(&request.name, &format!("{} ran and exited with code {code}.", request.name));
+                }
+                crate::process::Ended::Failed(why) => {
+                    log!("OTW kernel: {} failed: {why}", request.name);
+                    shell.show_message("Program Error", &format!("{}: {why}", request.name));
+                }
+            }
             dirty = true;
         }
         dirty |= shell.clock_changed();

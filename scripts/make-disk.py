@@ -150,18 +150,25 @@ def directory_entries(entries):
     return bytes(out)
 
 
-def fill(fat, directory, cluster=None, parent=0):
-    """Write `directory`'s tree; returns the cluster of its records."""
-    names = sorted(os.listdir(directory), key=str.lower)
-    children = []
-    for name in names:
-        path = os.path.join(directory, name)
-        if os.path.islink(path):
-            continue
-        if os.path.isdir(path):
-            children.append((name, 0x10, path, 0))
-        elif os.path.isfile(path):
-            children.append((name, 0x20, path, os.path.getsize(path)))
+def fill(fat, directories, cluster=None, parent=0):
+    """Write the merged tree of `directories` (later ones win); returns the
+    cluster of its records."""
+    if isinstance(directories, str):
+        directories = directories.split("+")
+    found = {}
+    for directory in directories:
+        for name in os.listdir(directory):
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                continue
+            key = name.lower()
+            if os.path.isdir(path):
+                previous = found.get(key)
+                paths = previous[2] if previous and previous[1] == 0x10 else []
+                found[key] = (name, 0x10, paths + [path], 0)
+            elif os.path.isfile(path):
+                found[key] = (name, 0x20, path, os.path.getsize(path))
+    children = [found[k] for k in sorted(found)]
     # Room for this directory's records: allocate before the children so
     # its cluster number is known to them ("..").
     estimate = 32 * (3 + sum(1 + (len(n.encode("utf-16-le")) // 2 + 13) // 13 for n, *_ in children))
@@ -186,9 +193,9 @@ def fill(fat, directory, cluster=None, parent=0):
     return cluster
 
 
-def tree_bytes(directory):
+def tree_bytes(directories):
     total = 0
-    for root, dirs, files in os.walk(directory):
+    for root, dirs, files in (w for d in directories.split("+") for w in os.walk(d)):
         total += 4096 * (len(files) + len(dirs) + 1)
         for f in files:
             path = os.path.join(root, f)

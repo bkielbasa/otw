@@ -572,6 +572,11 @@ impl Shell {
         };
     }
 
+    /// Show a message box from the system (e.g. how a program ended).
+    pub fn show_message(&mut self, title: &str, text: &str) {
+        self.message(title, text);
+    }
+
     /// The running program exited: take the focus back and show any files
     /// it saved.
     pub fn program_exited(&mut self, error: Option<String>) {

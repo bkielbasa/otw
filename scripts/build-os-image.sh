@@ -20,9 +20,16 @@ mkdir -p "$ESP/EFI/BOOT"
 cp "$ROOT/baremetal/target/x86_64-unknown-uefi/release/otw-kernel.efi" "$ESP/EFI/BOOT/BOOTX64.EFI"
 
 partitions=("esp:OTW:40:$ESP")
+# OTW's own test programs, in C:\OTW.
+EXTRA="$OUT/extra"
+rm -rf "$EXTRA"
+mkdir -p "$EXTRA/OTW"
+cp "$ROOT"/binaries/guests/*.EXE "$EXTRA/OTW/"
 DRIVE_C="${OTW_DRIVE_C-$HOME/.otw/C}"
 if [[ -n "$DRIVE_C" && -d "$DRIVE_C" ]]; then
-  partitions+=("data:OTW-C:auto:$DRIVE_C")
+  partitions+=("data:OTW-C:auto:$DRIVE_C+$EXTRA")
+else
+  partitions+=("data:OTW-C:auto:$EXTRA")
 fi
 echo "==> making the disk"
 python3 -I "$ROOT/scripts/make-disk.py" "$OUT/otw.img" "${partitions[@]}"

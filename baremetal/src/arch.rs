@@ -11,7 +11,10 @@ use crate::log;
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
+pub const USER_DATA: u16 = 0x18 | 3;
+pub const USER_CODE64: u16 = 0x20 | 3;
 const TSS_SELECTOR: u16 = 0x28;
+pub const USER_CODE32: u16 = 0x38 | 3;
 
 #[repr(C, packed)]
 struct Tss {
@@ -35,9 +38,10 @@ struct TablePointer {
 /// double fault) one of their own.
 #[repr(C, align(16))]
 pub struct CpuTables {
-    gdt: [u64; 7],
+    gdt: [u64; 8],
     tss: Tss,
 }
+
 
 pub fn load_cpu_tables() {
     let fault_stack = Box::leak(alloc::vec![0u8; 64 * 1024].into_boxed_slice());
@@ -50,6 +54,7 @@ pub fn load_cpu_tables() {
             0x00AF_FA00_0000_FFFF, // user code, 64-bit
             0,
             0,
+            0x00CF_FA00_0000_FFFF, // user code, 32-bit
         ],
         tss: Tss {
             reserved0: 0,
@@ -66,6 +71,9 @@ pub fn load_cpu_tables() {
     let limit = core::mem::size_of::<Tss>() as u64 - 1;
     tables.gdt[5] = (limit & 0xFFFF) | (tss & 0xFF_FFFF) << 16 | 0x89 << 40 | (limit >> 16 & 0xF) << 48 | (tss >> 24 & 0xFF) << 56;
     tables.gdt[6] = tss >> 32;
+    let rsp0 = core::ptr::addr_of_mut!(tables.tss.rsp) as *mut u64;
+    // The first CPU's (the one that runs programs, for now).
+    let _ = TSS_RSP0.compare_exchange(0, rsp0 as u64, Ordering::SeqCst, Ordering::SeqCst);
     let pointer = TablePointer { limit: (core::mem::size_of_val(&tables.gdt) - 1) as u16, base: tables.gdt.as_ptr() as u64 };
     unsafe {
         asm!(
@@ -158,11 +166,16 @@ global_asm!(
     "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "push rbp",
     "push r8", "push r9", "push r10", "push r11", "push r12", "push r13", "push r14", "push r15",
     "mov rdi, rsp",
-    // Align the stack for the call; keep the old pointer.
+    // Keep the old pointer; make room for the floating point and vector
+    // registers (the handler may use them) and save them there.
     "mov rbx, rsp",
-    "and rsp, -16",
+    "sub rsp, 512",
+    "and rsp, -64",
+    "fxsave64 [rsp]",
+    "mov rsi, rsp",
     "cld",
     "call {handler}",
+    "fxrstor64 [rsp]",
     "mov rsp, rbx",
     "pop r15", "pop r14", "pop r13", "pop r12", "pop r11", "pop r10", "pop r9", "pop r8",
     "pop rbp", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx", "pop rax",
@@ -176,7 +189,7 @@ stubs!(
     0 0, 1 0, 2 0, 3 0, 4 0, 5 0, 6 0, 7 0, 8 1, 9 0, 10 1, 11 1, 12 1, 13 1, 14 1, 15 0,
     16 0, 17 1, 18 0, 19 0, 20 0, 21 1, 22 0, 23 0, 24 0, 25 0, 26 0, 27 0, 28 0, 29 1, 30 1, 31 0,
     32 0, 33 0, 34 0, 35 0, 36 0, 37 0, 38 0, 39 0, 40 0, 41 0, 42 0, 43 0, 44 0, 45 0, 46 0, 47 0,
-    48 0, 49 0, 50 0, 51 0, 255 0,
+    48 0, 49 0, 50 0, 51 0, 128 0, 129 0, 255 0,
 );
 
 extern "C" {
@@ -190,7 +203,7 @@ extern "C" {
     fn otw_vector_35(); fn otw_vector_36(); fn otw_vector_37(); fn otw_vector_38(); fn otw_vector_39();
     fn otw_vector_40(); fn otw_vector_41(); fn otw_vector_42(); fn otw_vector_43(); fn otw_vector_44();
     fn otw_vector_45(); fn otw_vector_46(); fn otw_vector_47(); fn otw_vector_48(); fn otw_vector_49();
-    fn otw_vector_50(); fn otw_vector_51(); fn otw_vector_255();
+    fn otw_vector_50(); fn otw_vector_51(); fn otw_vector_128(); fn otw_vector_129(); fn otw_vector_255();
 }
 
 /// The vector of the local APIC timer.
@@ -200,7 +213,7 @@ pub const WAKE_VECTOR: u8 = 33;
 pub const SPURIOUS_VECTOR: u8 = 255;
 
 pub fn load_idt() {
-    let handlers: [(u8, unsafe extern "C" fn()); 53] = [
+    let handlers: [(u8, unsafe extern "C" fn()); 55] = [
         (0, otw_vector_0), (1, otw_vector_1), (2, otw_vector_2), (3, otw_vector_3), (4, otw_vector_4),
         (5, otw_vector_5), (6, otw_vector_6), (7, otw_vector_7), (8, otw_vector_8), (9, otw_vector_9),
         (10, otw_vector_10), (11, otw_vector_11), (12, otw_vector_12), (13, otw_vector_13), (14, otw_vector_14),
@@ -211,7 +224,7 @@ pub fn load_idt() {
         (35, otw_vector_35), (36, otw_vector_36), (37, otw_vector_37), (38, otw_vector_38), (39, otw_vector_39),
         (40, otw_vector_40), (41, otw_vector_41), (42, otw_vector_42), (43, otw_vector_43), (44, otw_vector_44),
         (45, otw_vector_45), (46, otw_vector_46), (47, otw_vector_47), (48, otw_vector_48), (49, otw_vector_49),
-        (50, otw_vector_50), (51, otw_vector_51), (255, otw_vector_255),
+        (50, otw_vector_50), (51, otw_vector_51), (128, otw_vector_128), (129, otw_vector_129), (255, otw_vector_255),
     ];
     unsafe {
         let idt = &mut *core::ptr::addr_of_mut!(IDT);
@@ -222,7 +235,8 @@ pub fn load_idt() {
                 selector: KERNEL_CODE,
                 // A double fault runs on its own stack (IST 1).
                 ist: if vector == 8 { 1 } else { 0 },
-                kind: 0x8E,
+                // Programs may raise the system call vectors themselves.
+                kind: if vector == SYSTEM_CALL_VECTOR || vector == CALLBACK_RETURN_VECTOR { 0xEE } else { 0x8E },
                 offset_middle: (address >> 16) as u16,
                 offset_high: (address >> 32) as u32,
                 reserved: 0,
@@ -240,7 +254,31 @@ pub fn load_idt_on_this_cpu() {
 /// Timer interrupts so far, on the first CPU.
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 
-extern "sysv64" fn interrupt(frame: &mut Frame) {
+/// Where this CPU's TSS keeps rsp0 (the first CPU's; others when they
+/// run programs).
+static TSS_RSP0: AtomicU64 = AtomicU64::new(0);
+
+/// Program code calls the system (an import's thunk): `int 0x80`.
+pub const SYSTEM_CALL_VECTOR: u8 = 0x80;
+/// A callback into program code returned: `int 0x81` at its return address.
+pub const CALLBACK_RETURN_VECTOR: u8 = 0x81;
+
+/// Entries from user mode come in on this stack.
+pub fn set_user_entry_stack(rsp0: u64) {
+    let slot = TSS_RSP0.load(Ordering::Relaxed) as *mut u64;
+    unsafe { core::ptr::write_unaligned(slot, rsp0) };
+}
+
+extern "sysv64" fn interrupt(frame: &mut Frame, fx: *const u8) {
+    if frame.cs & 3 == 3 {
+        // From a program: a system call, a callback's return, or a fault
+        // go to the kernel code that ran it; interrupts are handled here
+        // and the program goes on.
+        let vector = frame.vector;
+        if vector == SYSTEM_CALL_VECTOR as u64 || vector == CALLBACK_RETURN_VECTOR as u64 || vector < 32 {
+            crate::user::leave(frame, fx);
+        }
+    }
     match frame.vector {
         v if v == TIMER_VECTOR as u64 => {
             if crate::apic::cpu_index() == 0 {
