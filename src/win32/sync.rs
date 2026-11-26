@@ -531,8 +531,10 @@ pub fn thread_suspended(ctx: &ApiContext, thread: u32) -> bool {
 
 /// Note the exit codes of started programs that have ended.
 fn refresh_processes(ctx: &ApiContext) {
-    let launcher = ctx.shared.borrow().launcher.0.clone();
-    let mut shared = ctx.shared.borrow_mut();
+    let Some(launcher) = ctx.shared.try_borrow().ok().map(|s| s.launcher.0.clone()) else { return };
+    // (A caller further up may be looking at the state: the next look
+    // catches up.)
+    let Ok(mut shared) = ctx.shared.try_borrow_mut() else { return };
     for object in shared.sync.objects.values_mut() {
         if let Object::Process { pid, exit } = object {
             if exit.is_none() {

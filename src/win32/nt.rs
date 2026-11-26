@@ -890,17 +890,27 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         "ProcessPrng" | "SystemFunction036" => {
             // Random bytes from the host.
             let mut bytes = vec![0u8; arg(1) as usize];
-            let mut state = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
-                ^ (p(0) as u64).rotate_left(29);
-            if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+            let opened = std::fs::File::open("/dev/urandom").ok().and_then(|mut file| {
                 use std::io::Read;
-                let _ = file.read_exact(&mut bytes);
-            } else {
-                for byte in &mut bytes {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    *byte = state as u8;
+                file.read_exact(&mut bytes).ok()
+            });
+            if opened.is_none() {
+                // No system source (bare metal): the time-stamp counter,
+                // the clock and a count of calls, mixed (SplitMix64). Never
+                // the same bytes twice: NSS fails when its source repeats.
+                static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut state = unsafe { core::arch::x86_64::_rdtsc() }
+                    ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+                    ^ calls.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+                    ^ (p(0) as u64).rotate_left(29);
+                for chunk in bytes.chunks_mut(8) {
+                    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    let mut z = state ^ unsafe { core::arch::x86_64::_rdtsc() }.rotate_left(17);
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^= z >> 31;
+                    chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
                 }
             }
             let _ = memory.write_bytes(p(0), &bytes);

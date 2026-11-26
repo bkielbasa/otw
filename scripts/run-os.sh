@@ -27,7 +27,7 @@ case "${VM_DISK:-nvme}" in
 esac
 # KVM where this user may use it; emulated (slower) otherwise.
 if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-  cpu_args=(-machine q35,accel=kvm -cpu host)
+  cpu_args=(-machine q35,accel=kvm -cpu "${VM_CPU:-host}")
 else
   echo "no access to /dev/kvm: emulating the CPU (slow)" >&2
   cpu_args=(-machine q35,accel=tcg -cpu max)

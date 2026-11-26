@@ -59,6 +59,13 @@ pub struct Desktop {
     shell: Shell,
     input: Input8042,
     frame: Surface,
+    /// The desktop under the programs' windows, painted when the shell
+    /// changes (painting it takes tens of milliseconds) and copied into
+    /// each frame.
+    background: Surface,
+    background_stale: bool,
+    /// The task list the background was painted with.
+    background_tasks: Vec<(String, bool)>,
     screen: ScreenCopy,
     stats: FrameStats,
     dirty: bool,
@@ -92,6 +99,9 @@ pub fn run(system: &System) -> ! {
             extended: false,
         },
         frame: Surface::new(width as i32, height as i32, 24),
+        background: Surface::new(width as i32, height as i32, 24),
+        background_stale: true,
+        background_tasks: Vec::new(),
         screen: ScreenCopy::new(info),
         stats: FrameStats::default(),
         dirty: true,
@@ -164,6 +174,7 @@ pub fn pump(block: bool) {
 impl Desktop {
     fn step(&mut self, block: bool) {
         let pointer_before = self.input.pointer;
+        let dirty_before = self.dirty;
         while let Some(byte) = io::ps2_poll() {
             self.dirty |= self.handle(byte);
         }
@@ -196,6 +207,11 @@ impl Desktop {
             self.dirty = true;
         }
         self.had_programs = running;
+        // What the shell changed (rather than the programs) repaints the
+        // background.
+        if self.dirty && !dirty_before {
+            self.background_stale = true;
+        }
         // Programs draw into their windows at any time: with any running,
         // the screen follows (at most 30 times a second; only changed rows
         // reach it).
@@ -237,8 +253,16 @@ impl Desktop {
     fn draw(&mut self) {
         let started = apic::now_us();
         let tasks = self.tasks();
-        self.frame.pixels.fill(0);
-        self.shell.paint(&mut self.frame, Layer::Background, &tasks);
+        let t1 = apic::now_us();
+        let task_list: Vec<(String, bool)> = tasks.iter().map(|t| (t.label.clone(), t.active)).collect();
+        if self.background_stale || task_list != self.background_tasks {
+            self.background.pixels.fill(0);
+            self.shell.paint(&mut self.background, Layer::Background, &tasks);
+            self.background_stale = false;
+            self.background_tasks = task_list;
+        }
+        self.frame.pixels.copy_from_slice(&self.background.pixels);
+        let t2 = apic::now_us();
         let frame = &mut self.frame;
         each_program(|shared, _| {
             for window in &shared.gui.windows {
@@ -251,9 +275,13 @@ impl Desktop {
             }
             false
         });
+        let t3 = apic::now_us();
         self.shell.paint(&mut self.frame, Layer::Foreground, &tasks);
         self.shell.paint(&mut self.frame, Layer::Top, &tasks);
         let painted = apic::now_us();
+        if self.stats.frames % 200 == 1 {
+            log!("OTW kernel: [paint] tasks {} us, background {} us, windows {} us, top {} us", t1 - started, t2 - t1, t3 - t2, painted - t3);
+        }
         let rows = self.screen.show(&self.frame, self.input.pointer);
         if self.stats.frames == 0 {
             log!("OTW kernel: desktop on the screen ({} ms since start)", crate::ms_since_start());

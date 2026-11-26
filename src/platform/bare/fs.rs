@@ -217,6 +217,8 @@ struct OpenFile {
     position: u64,
     writable: bool,
     dirty: bool,
+    /// A directory, opened to ask about it (no data).
+    directory: bool,
 }
 
 impl core::fmt::Debug for File {
@@ -250,7 +252,7 @@ impl File {
         Ok(Metadata {
             info: super::FileInfo {
                 name: file.path.file_name().map(|n| n.to_string_lossy().into()).unwrap_or_default(),
-                directory: false,
+                directory: file.directory,
                 size: file.data.len() as u64,
                 modified: system().unix_time(),
             },
@@ -276,6 +278,7 @@ impl File {
             position: file.position,
             writable: false,
             dirty: false,
+            directory: file.directory,
         })))
     }
     pub fn set_permissions(&self, _: Permissions) -> io::Result<()> {
@@ -397,6 +400,21 @@ impl OpenOptions {
     }
     pub fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
         let path = path.as_ref().to_path_buf();
+        // A directory opens (to ask about it, as Windows programs do), but
+        // has nothing to read or write.
+        if system().info(path.as_str()).is_some_and(|i| i.directory) {
+            if self.create_new {
+                return Err(Error::from(ErrorKind::AlreadyExists));
+            }
+            return Ok(File(super::sync::Mutex::new(OpenFile {
+                path,
+                data: Vec::new(),
+                position: 0,
+                writable: false,
+                dirty: false,
+                directory: true,
+            })));
+        }
         let existing = system().read_file(path.as_str());
         if self.create_new && existing.is_some() {
             return Err(Error::from(ErrorKind::AlreadyExists));
@@ -409,7 +427,7 @@ impl OpenOptions {
             None => return Err(not_found()),
         };
         let position = if self.append { data.len() as u64 } else { 0 };
-        let mut file = OpenFile { path, data, position, writable, dirty: dirty && writable };
+        let mut file = OpenFile { path, data, position, writable, dirty: dirty && writable, directory: false };
         file.flush()?;
         Ok(File(super::sync::Mutex::new(file)))
     }

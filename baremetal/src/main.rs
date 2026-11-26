@@ -226,6 +226,12 @@ extern "sysv64" fn kernel_main2(regions: &Vec<Region>) -> ! {
         apic::tsc_mhz()
     );
 
+    {
+        let cr4: u64;
+        unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4) };
+        let xcr0 = if cr4 & (1 << 18) != 0 { unsafe { core::arch::x86_64::_xgetbv(0) } } else { 0 };
+        log!("OTW kernel: CR4 {cr4:#x}, XCR0 {xcr0:#x}");
+    }
     let machine = acpi::parse(info.rsdp);
     if info.trampoline != 0 && machine.cpus.len() > 1 {
         smp::start_others(&machine.cpus, info.trampoline);
