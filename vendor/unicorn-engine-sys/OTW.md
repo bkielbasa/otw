@@ -12,4 +12,9 @@ shared host memory:
   falls back to the unlocked helper instead of an atomic-step exit Unicorn does
   not implement.
 
+- `qemu/accel/tcg/atomic_template.h`: the exchange helpers (`xchg`, and so
+  every `xchg` with memory) and the min/max read-modify-write helpers use host
+  atomics; Unicorn had a plain load and store, so two CPUs could both take a
+  lock built on `xchg`, or one CPU's store could be lost under another's.
+
 Licensed as the original (GPL-2.0 with LGPL parts; see COPYING).

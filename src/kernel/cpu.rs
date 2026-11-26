@@ -144,6 +144,9 @@ pub(crate) struct ProcessShared {
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Threads get CPUs (and host threads) of their own.
     parallel: bool,
+    /// Threads started on CPUs of their own that have not ended (counted
+    /// from when they are started, before their CPU exists).
+    live_workers: AtomicU32,
 }
 
 impl ProcessShared {
@@ -159,6 +162,7 @@ impl ProcessShared {
             engines: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
             parallel,
+            live_workers: AtomicU32::new(0),
         })
     }
 
@@ -1376,7 +1380,7 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
     fn others_running(&self) -> bool {
         self.run.is_some_and(|run| {
             let state = run.borrow();
-            state.worker || !state.process.engines.lock().map(|e| e.is_empty()).unwrap_or(true)
+            state.worker || state.process.live_workers.load(Ordering::SeqCst) > 0
         })
     }
 
@@ -1936,6 +1940,7 @@ fn spawn_worker(run: &Rc<RefCell<RunState<'_>>>, id: u32, entry: u32, param: u32
     let name = format!("{} t{id}", std::thread::current().name().unwrap_or("main"));
     let boxed = SendBox(recipe);
     let worker_process = process.clone();
+    process.live_workers.fetch_add(1, Ordering::SeqCst);
     let spawned = std::thread::Builder::new().name(name).stack_size(64 << 20).spawn(move || {
         let recipe = boxed.into_inner();
         run_worker(worker_process, recipe, [id, entry, param, rsp, teb, dispatcher, thread_return]);
@@ -1945,7 +1950,10 @@ fn spawn_worker(run: &Rc<RefCell<RunState<'_>>>, id: u32, entry: u32, param: u32
             process.workers.lock().unwrap_or_else(|p| p.into_inner()).push(handle);
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            process.live_workers.fetch_sub(1, Ordering::SeqCst);
+            false
+        }
     }
 }
 
@@ -2022,6 +2030,7 @@ fn run_worker(process: Arc<ProcessShared>, recipe: Rc<Recipe>, [id, entry, param
         eprintln!("[thread] {id} could not run: {error}");
     }
     drop(recipe);
+    process.live_workers.fetch_sub(1, Ordering::SeqCst);
     drop(hold);
 }
 

@@ -117,8 +117,8 @@ ABI_TYPE ATOMIC_NAME(xchg)(CPUArchState *env, target_ulong addr,
     DATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;
     DATA_TYPE ret;
 
-    ret = *haddr;
-    *haddr = val;
+    /* OTW: atomically (Unicorn had a plain load and store here). */
+    ret = __atomic_exchange_n(haddr, (DATA_TYPE)val, __ATOMIC_SEQ_CST);
     ATOMIC_MMU_CLEANUP;
 
     return ret;
@@ -175,13 +175,12 @@ ABI_TYPE ATOMIC_NAME(X)(CPUArchState *env, target_ulong addr,       \
     ATOMIC_MMU_DECLS;                                               \
     XDATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;                          \
     XDATA_TYPE cmp, old, new, val = xval;                           \
-    cmp = *haddr;                                                   \
+    /* OTW: compare-and-swap (Unicorn had a plain load and store). */\
+    cmp = __atomic_load_n(haddr, __ATOMIC_RELAXED);                 \
     do {                                                            \
         old = cmp; new = FN(old, val);                              \
-        cmp = *haddr;                                               \
-        if (cmp == old)                                          \
-            *haddr = new;                                           \
-    } while (cmp != old);                                           \
+    } while (!__atomic_compare_exchange_n(haddr, &cmp, new, false,  \
+                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));              \
     ATOMIC_MMU_CLEANUP;                                             \
     return RET;                                                     \
 }
@@ -260,8 +259,8 @@ ABI_TYPE ATOMIC_NAME(xchg)(CPUArchState *env, target_ulong addr,
     ATOMIC_MMU_DECLS;
     DATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;
     ABI_TYPE ret;
-    ret = *haddr;
-    *haddr = BSWAP(val);
+    /* OTW: atomically (Unicorn had a plain load and store here). */
+    ret = __atomic_exchange_n(haddr, (DATA_TYPE)BSWAP(val), __ATOMIC_SEQ_CST);
     ATOMIC_MMU_CLEANUP;
     return BSWAP(ret);
 }
@@ -315,13 +314,12 @@ ABI_TYPE ATOMIC_NAME(X)(CPUArchState *env, target_ulong addr,       \
     ATOMIC_MMU_DECLS;                                               \
     XDATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;                          \
     XDATA_TYPE ldo, ldn, old, new, val = xval;                      \
-    ldn = *haddr;                                                   \
+    /* OTW: compare-and-swap (Unicorn had a plain load and store). */\
+    ldn = __atomic_load_n(haddr, __ATOMIC_RELAXED);                 \
     do {                                                            \
         ldo = ldn; old = BSWAP(ldo); new = FN(old, val);            \
-        ldn = *haddr;                                               \
-        if (ldn == ldo)                                             \
-            *haddr = BSWAP(new);                                    \
-    } while (ldo != ldn);                                           \
+    } while (!__atomic_compare_exchange_n(haddr, &ldn, BSWAP(new),  \
+                 false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));       \
     ATOMIC_MMU_CLEANUP;                                             \
     return RET;                                                     \
 }
