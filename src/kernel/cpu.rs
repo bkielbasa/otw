@@ -11,12 +11,19 @@ use std::{cell::RefCell, collections::VecDeque, fmt, rc::Rc};
 
 use unicorn_engine::{
     uc_error,
-    unicorn_const::{Arch, HookType, MemType, Mode, Prot, SECOND_SCALE},
+    unicorn_const::{Arch, HookType, MemType, Mode, SECOND_SCALE},
     RegisterX86 as Reg, Unicorn,
+};
+
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, Mutex,
 };
 
 use super::{
     iat::THUNK_BASE,
+    lock::BigLock,
+    space::{AddressSpace, Cursor},
     image::{Image, EXCEPTION_DISPATCHER, KERNEL_DLL, THREAD_RETURN},
     memory::{self, GuestMemory, ThreadRun, HEAP_BASE, HEAP_SIZE},
     syscall::SystemCalls,
@@ -111,8 +118,88 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-#[derive(Default)]
+/// What the threads of a process share, each on its CPU: the address
+/// space, the subsystem lock, the threads' TEBs and TLS templates, and
+/// whether the process is ending.
+pub(crate) struct ProcessShared {
+    lock: Arc<BigLock>,
+    space: Arc<AddressSpace>,
+    /// Each thread's TEB (TIB).
+    tibs: Mutex<Vec<(u32, u32)>>,
+    next_thread: AtomicU32,
+    /// Static thread-local storage templates (`__declspec(thread)`), one
+    /// per module with a TLS directory, in index order.
+    tls_templates: Mutex<Vec<Vec<u8>>>,
+    /// The process ends (ExitProcess on some thread, or its first thread
+    /// finished): threads on CPUs of their own stop.
+    ending: AtomicBool,
+    /// The exit code a thread other than the first asked for.
+    exit_request: Mutex<Option<u32>>,
+    /// The CPUs of threads running on host threads of their own (raw
+    /// engine handles, to stop them), and the host threads.
+    engines: Mutex<Vec<usize>>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Threads get CPUs (and host threads) of their own.
+    parallel: bool,
+}
+
+impl ProcessShared {
+    fn new(parallel: bool) -> Arc<Self> {
+        Arc::new(Self {
+            lock: BigLock::new(),
+            space: AddressSpace::new(),
+            tibs: Mutex::new(Vec::new()),
+            next_thread: AtomicU32::new(2),
+            tls_templates: Mutex::new(Vec::new()),
+            ending: AtomicBool::new(false),
+            exit_request: Mutex::new(None),
+            engines: Mutex::new(Vec::new()),
+            workers: Mutex::new(Vec::new()),
+            parallel,
+        })
+    }
+
+    fn tibs(&self) -> std::sync::MutexGuard<'_, Vec<(u32, u32)>> {
+        self.tibs.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn templates(&self) -> Vec<Vec<u8>> {
+        self.tls_templates.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn tib_of(&self, id: u32) -> Option<u32> {
+        self.tibs().iter().find(|(t, _)| *t == id).map(|(_, b)| *b)
+    }
+
+    /// End the process: stop the other CPUs and wait for their host
+    /// threads (without the lock, which they need to finish).
+    fn end(&self) {
+        self.ending.store(true, Ordering::SeqCst);
+        unsafe extern "C" {
+            fn uc_emu_stop(uc: *mut std::ffi::c_void) -> i32;
+        }
+        for &engine in self.engines.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            // SAFETY: an engine removes itself from the list before it is
+            // closed, under this mutex; uc_emu_stop may be called from
+            // another thread.
+            unsafe { uc_emu_stop(engine as *mut std::ffi::c_void) };
+        }
+        let workers: Vec<_> = std::mem::take(&mut *self.workers.lock().unwrap_or_else(|p| p.into_inner()));
+        super::lock::unlocked(|| {
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+    }
+}
+
 struct RunState<'a> {
+    /// What the process's threads share.
+    process: Arc<ProcessShared>,
+    /// This CPU's place in the address space's change log.
+    cursor: Option<Cursor>,
+    /// This CPU runs one thread on a host thread of its own.
+    worker: bool,
     exit_code: Option<u32>,
     api_calls: usize,
     error: Option<String>,
@@ -147,23 +234,79 @@ struct RunState<'a> {
     /// Threads on the CPU, the first thread first: each runs nested inside
     /// a wait of the one before it.
     running: Vec<u32>,
-    /// Each thread's TIB.
-    tibs: Vec<(u32, u32)>,
-    next_thread: u32,
     /// The running thread is to come off the CPU after its current call.
     thread_signal: Option<ThreadSignal>,
     /// The thunk start routines return to.
     thread_return: u32,
     /// A 64-bit process: the x64 calling convention, GS-based TEBs.
     x64: bool,
-    /// Static thread-local storage templates (`__declspec(thread)`), one
-    /// per module with a TLS directory, in index order.
-    tls_templates: Vec<Vec<u8>>,
     /// Memory mapped with `map_shared`: its bytes, size and low alias, by
     /// address.
-    shared_buffers: std::collections::HashMap<u64, (Box<[u8]>, Option<u32>)>,
+    shared_buffers: std::collections::HashMap<u64, (u64, Option<u32>)>,
     /// Views of sections, by address: the section's memory and the size.
-    section_views: std::collections::HashMap<u32, (std::sync::Arc<memory::SharedMemory>, u64)>,
+    section_views: std::collections::HashMap<u32, u64>,
+}
+
+impl<'a> RunState<'a> {
+    fn new(process: Arc<ProcessShared>) -> Self {
+        Self {
+            process,
+            cursor: None,
+            worker: false,
+            exit_code: None,
+            api_calls: 0,
+            error: None,
+            pump: None,
+            callback_depth: 0,
+            levels: Vec::new(),
+            resume: None,
+            resume_full: None,
+            fault: None,
+            dispatcher: 0,
+            can_yield: false,
+            yielding: false,
+            yielded: false,
+            yield_eip: 0,
+            threads: Vec::new(),
+            running: Vec::new(),
+            thread_signal: None,
+            thread_return: 0,
+            x64: false,
+            shared_buffers: std::collections::HashMap::new(),
+            section_views: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Map `size` fresh bytes at `va` in this CPU and the process's address
+/// space.
+fn map_in(uc: &mut Unicorn<'_, ()>, state: &RefCell<RunState<'_>>, va: u64, size: u64) -> Result<(), uc_error> {
+    let (space, mut cursor) = {
+        let state = state.borrow();
+        (state.process.space.clone(), state.cursor.ok_or(uc_error::ARG)?)
+    };
+    if space.map(uc, &mut cursor, va, size) { Ok(()) } else { Err(uc_error::MAP) }
+}
+
+/// Unmap `[va, va + size)` in this CPU and the address space.
+fn unmap_in(uc: &mut Unicorn<'_, ()>, state: &RefCell<RunState<'_>>, va: u64, size: u64) -> bool {
+    let (space, mut cursor) = {
+        let state = state.borrow();
+        let Some(cursor) = state.cursor else { return false };
+        (state.process.space.clone(), cursor)
+    };
+    space.unmap(uc, &mut cursor, va, size)
+}
+
+/// Apply the address-space changes other CPUs made.
+fn sync_space(uc: &mut Unicorn<'_, ()>, state: &RefCell<RunState<'_>>) {
+    let (space, cursor) = {
+        let state = state.borrow();
+        (state.process.space.clone(), state.cursor)
+    };
+    if let Some(mut cursor) = cursor {
+        space.sync(uc, &mut cursor);
+    }
 }
 
 /// A thread off the CPU.
@@ -297,14 +440,14 @@ fn tls_templates(process: &Image, uc: &mut Unicorn<'_, ()>) -> Vec<Vec<u8>> {
 /// Give a thread its copies of the TLS templates: the TEB's
 /// ThreadLocalStoragePointer (x64 TEB+0x58, x86 TIB+0x2C) points to an
 /// array of one block per module.
-fn install_tls(uc: &mut Unicorn<'_, ()>, templates: &[Vec<u8>], teb: u32, x64: bool) -> Result<(), uc_error> {
+fn install_tls<'u, 'a>(uc: &mut Unicorn<'u, ()>, state: &Rc<RefCell<RunState<'a>>>, templates: &[Vec<u8>], teb: u32, x64: bool) -> Result<(), uc_error> {
     if templates.is_empty() {
         return Ok(());
     }
     let width = if x64 { 8 } else { 4 };
     let array_size = (templates.len() as u32 * width + 15) & !15;
     let total = array_size + templates.iter().map(|t| (t.len() as u32 + 15) & !15).sum::<u32>();
-    let mut memory = UnicornGuestMemory { uc, run: None };
+    let mut memory = UnicornGuestMemory { uc, run: Some(state) };
     let block = memory.map_region(0x1000_0000, total.max(1)).ok_or(uc_error::NOMEM)?;
     let mut cursor = block + array_size;
     for (index, template) in templates.iter().enumerate() {
@@ -379,7 +522,7 @@ fn hide_sse42(uc: &mut Unicorn<'_, ()>) -> Result<(), uc_error> {
 /// The running thread's TIB.
 fn current_tib(state: &RunState<'_>) -> u32 {
     let id = state.running.last().copied().unwrap_or(1);
-    state.tibs.iter().find(|(t, _)| *t == id).map(|(_, b)| *b).unwrap_or(TIB_BASE)
+    state.process.tib_of(id).unwrap_or(TIB_BASE)
 }
 
 /// EXCEPTION_RECORD and CONTEXT for the faulting instruction onto the
@@ -652,6 +795,31 @@ const SAVED_REGISTERS_64: [Reg; 18] = [
 const MAX_CALLBACK_DEPTH: usize = 48;
 
 impl UnicornGuestMemory<'_, '_, '_, '_> {
+    /// A free range of `size` bytes from `preferred` up (or from 256 MiB
+    /// at 64 KiB granularity), below the address space's limit.
+    fn find_free(&self, preferred: u32, size: u64) -> Option<u64> {
+        const GRANULE: u64 = 0x1_0000;
+        let run = self.run?;
+        let limit: u64 = if run.borrow().x64 { 0xFFFF_0000 } else { 0xC000_0000 };
+        let regions = run.borrow().process.space.ranges();
+        let free = |start: u64| {
+            start >= GRANULE
+                && start + size <= limit
+                && regions.iter().all(|&(begin, end)| start + size <= begin || start > end)
+        };
+        let mut start = (preferred as u64) & !(PAGE_SIZE as u64 - 1);
+        if !free(start) {
+            start = ((preferred as u64).max(0x1000_0000) + GRANULE - 1) & !(GRANULE - 1);
+            while start + size <= limit && !free(start) {
+                start += GRANULE;
+            }
+            if !free(start) {
+                return None;
+            }
+        }
+        Some(start)
+    }
+
     /// Run guest code synchronously: arguments as the process's calling
     /// convention passes them, a sentinel return address, every register
     /// restored afterwards. Returns RAX (EAX in a 32-bit process).
@@ -744,13 +912,14 @@ impl UnicornGuestMemory<'_, '_, '_, '_> {
     /// parameter in RCX, returning to the thread-end thunk.
     fn create_thread64(&mut self, entry: u32, param: u32, stack: u32, top: u32, teb: u32) -> Option<u32> {
         let run = self.run?;
-        let id = run.borrow().next_thread;
+        let process = run.borrow().process.clone();
+        let id = process.next_thread.fetch_add(1, Ordering::SeqCst);
         let thread_return = run.borrow().thread_return;
         let mut current = self.uc.context_alloc().ok()?;
         self.uc.context_save(&mut current).ok()?;
         init_teb64(self.uc, teb, top, stack, id).ok()?;
-        let templates = run.borrow().tls_templates.clone();
-        install_tls(self.uc, &templates, teb, true).ok()?;
+        let templates = process.templates();
+        install_tls(self.uc, run, &templates, teb, true).ok()?;
         let rsp = ((top - 0x40) & !0xF) - 8;
         self.uc.mem_write(rsp as u64, &(thread_return as u64).to_le_bytes()).ok()?;
         for register in SAVED_REGISTERS_64 {
@@ -762,9 +931,8 @@ impl UnicornGuestMemory<'_, '_, '_, '_> {
         let mut context = self.uc.context_alloc().ok()?;
         self.uc.context_save(&mut context).ok()?;
         self.uc.context_restore(&current).ok()?;
+        process.tibs().push((id, teb));
         let mut state = run.borrow_mut();
-        state.next_thread += 1;
-        state.tibs.push((id, teb));
         state.threads.push(ThreadSlot {
             id,
             context,
@@ -818,42 +986,22 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
 
 
     fn map_region(&mut self, preferred: u32, size: u32) -> Option<u32> {
-        const GRANULE: u64 = 0x1_0000;
-        // A 64-bit process may use the whole 4 GiB below which OTW keeps it.
-        let limit: u64 = if self.run.is_some_and(|run| run.borrow().x64) { 0xFFFF_0000 } else { 0xC000_0000 };
         let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
-        let regions: Vec<(u64, u64)> = self
-            .uc
-            .mem_regions()
-            .ok()?
-            .iter()
-            .map(|region| (region.begin, region.end))
-            .collect();
-        let free = |start: u64| {
-            start >= GRANULE
-                && start + size <= limit
-                && regions.iter().all(|&(begin, end)| start + size <= begin || start > end)
-        };
-        let mut start = (preferred as u64) & !(PAGE_SIZE as u64 - 1);
-        if !free(start) {
-            start = ((preferred as u64).max(0x1000_0000) + GRANULE - 1) & !(GRANULE - 1);
-            while start + size <= limit && !free(start) {
-                start += GRANULE;
-            }
-            if !free(start) {
-                return None;
-            }
-        }
-        self.uc.mem_map(start, size, Prot::ALL).ok()?;
+        let start = self.find_free(preferred, size)?;
+        map_in(self.uc, self.run?, start, size).ok()?;
         Some(start as u32)
     }
 
     fn add_tls(&mut self, template: &[u8]) -> Option<u32> {
         let run = self.run?;
         let (index, tibs, x64) = {
-            let mut state = run.borrow_mut();
-            state.tls_templates.push(template.to_vec());
-            (state.tls_templates.len() as u32 - 1, state.tibs.clone(), state.x64)
+            let state = run.borrow();
+            let mut templates = state.process.tls_templates.lock().unwrap_or_else(|p| p.into_inner());
+            templates.push(template.to_vec());
+            let count = templates.len() as u32;
+            drop(templates);
+            let tibs = state.process.tibs().clone();
+            (count - 1, tibs, state.x64)
         };
         let width = if x64 { 8 } else { 4 };
         for (_, tib) in tibs {
@@ -878,15 +1026,13 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
         let start = va as u64 & !(PAGE_SIZE as u64 - 1);
         let limit: u64 = if self.run.is_some_and(|run| run.borrow().x64) { 0xFFFF_0000 } else { 0xC000_0000 };
-        if start == 0 || start + size > limit {
+        let Some(run) = self.run else {
+            return false;
+        };
+        if start == 0 || start + size > limit || run.borrow().process.space.overlaps(start, size) {
             return false;
         }
-        let overlaps = self
-            .uc
-            .mem_regions()
-            .map(|regions| regions.iter().any(|r| start <= r.end && start + size > r.begin))
-            .unwrap_or(true);
-        !overlaps && self.uc.mem_map(start, size, Prot::ALL).is_ok()
+        map_in(self.uc, run, start, size).is_ok()
     }
 
     fn map_shared(&mut self, va: u64, size: u64, alias: Option<u32>) -> bool {
@@ -894,19 +1040,25 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             return false;
         };
         let size = (size + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
-        let mut buffer = vec![0u8; size as usize].into_boxed_slice();
-        let pointer = buffer.as_mut_ptr() as *mut std::ffi::c_void;
-        // SAFETY: the buffer is kept in the run state until the range is
-        // unmapped, and a boxed slice's storage does not move.
-        if unsafe { self.uc.mem_map_ptr(va, size, Prot::ALL, pointer) }.is_err() {
+        let Some(memory) = memory::SharedMemory::new(size as usize) else {
+            return false;
+        };
+        let (space, cursor) = {
+            let state = run.borrow();
+            (state.process.space.clone(), state.cursor)
+        };
+        let Some(mut cursor) = cursor else {
+            return false;
+        };
+        if !space.map_memory(self.uc, &mut cursor, va, size, memory.clone(), 0) {
             return false;
         }
+        // The low alias replaces the reserved low range with the same bytes.
         let alias = alias.filter(|&low| {
-            let _ = self.uc.mem_unmap(low as u64, size);
-            // SAFETY: as above.
-            unsafe { self.uc.mem_map_ptr(low as u64, size, Prot::ALL, pointer) }.is_ok()
+            space.unmap(self.uc, &mut cursor, low as u64, size);
+            space.map_memory(self.uc, &mut cursor, low as u64, size, memory.clone(), 0)
         });
-        run.borrow_mut().shared_buffers.insert(va, (buffer, alias));
+        run.borrow_mut().shared_buffers.insert(va, (size, alias));
         true
     }
 
@@ -914,15 +1066,13 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         let Some(run) = self.run else {
             return false;
         };
-        let Some((buffer, alias)) = run.borrow_mut().shared_buffers.remove(&va) else {
+        let Some((size, alias)) = run.borrow_mut().shared_buffers.remove(&va) else {
             return false;
         };
-        let size = buffer.len() as u64;
-        let _ = self.uc.mem_unmap(va, size);
+        unmap_in(self.uc, run, va, size);
         if let Some(low) = alias {
-            let _ = self.uc.mem_unmap(low as u64, size);
+            unmap_in(self.uc, run, low as u64, size);
         }
-        drop(buffer);
         true
     }
 
@@ -932,38 +1082,42 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         if offset as u64 + size > section.len() as u64 {
             return None;
         }
-        // Find room, then put the section's bytes there.
-        let va = self.map_region(preferred, size as u32)?;
-        let _ = self.uc.mem_unmap(va as u64, size);
-        let pointer = section.pointer(offset) as *mut std::ffi::c_void;
-        // SAFETY: the run state keeps the section alive until the view is
-        // unmapped.
-        if unsafe { self.uc.mem_map_ptr(va as u64, size, Prot::ALL, pointer) }.is_err() {
+        let va = self.find_free(preferred, size)?;
+        let (space, cursor) = {
+            let state = run.borrow();
+            (state.process.space.clone(), state.cursor)
+        };
+        let mut cursor = cursor?;
+        if !space.map_memory(self.uc, &mut cursor, va, size, section, offset) {
             return None;
         }
-        run.borrow_mut().section_views.insert(va, (section, size));
-        Some(va)
+        run.borrow_mut().section_views.insert(va as u32, size);
+        Some(va as u32)
     }
 
     fn unmap_section(&mut self, va: u32) -> bool {
         let Some(run) = self.run else {
             return false;
         };
-        let Some((section, size)) = run.borrow_mut().section_views.remove(&va) else {
+        let Some(size) = run.borrow_mut().section_views.remove(&va) else {
             return false;
         };
-        let _ = self.uc.mem_unmap(va as u64, size);
-        drop(section);
-        true
+        unmap_in(self.uc, run, va as u64, size)
     }
 
     fn unmap(&mut self, va: u32, size: u32) -> bool {
         let size = (size as u64 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
-        self.uc.mem_unmap(va as u64, size).is_ok()
+        match self.run {
+            Some(run) => unmap_in(self.uc, run, va as u64, size),
+            None => false,
+        }
     }
 
     fn mapped(&mut self) -> Vec<(u64, u64)> {
-        self.uc.mem_regions().map(|regions| regions.iter().map(|r| (r.begin, r.end)).collect()).unwrap_or_default()
+        match self.run {
+            Some(run) => run.borrow().process.space.ranges(),
+            None => Vec::new(),
+        }
     }
 
     fn create_thread(&mut self, entry: u32, param: u32, stack_size: u32) -> Option<u32> {
@@ -982,8 +1136,8 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             page[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
         self.uc.mem_write(tib as u64, &page).ok()?;
-        let templates = run.borrow().tls_templates.clone();
-        install_tls(self.uc, &templates, tib, false).ok()?;
+        let templates = run.borrow().process.templates();
+        install_tls(self.uc, run, &templates, tib, false).ok()?;
         // The start routine returns to the thread-end thunk.
         let esp = top - 0x10;
         let thread_return = run.borrow().thread_return;
@@ -1014,14 +1168,14 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         let current_tib = {
             let state = run.borrow();
             let id = *state.running.last()?;
-            state.tibs.iter().find(|(t, _)| *t == id).map(|(_, b)| *b)?
+            state.process.tib_of(id)?
         };
         let _ = self.uc.mem_write((GDT_BASE + FS_SELECTOR) as u64, &fs_descriptor(current_tib));
         self.uc.context_restore(&current).ok()?;
+        let process = run.borrow().process.clone();
+        let id = process.next_thread.fetch_add(1, Ordering::SeqCst);
+        process.tibs().push((id, tib));
         let mut state = run.borrow_mut();
-        let id = state.next_thread;
-        state.next_thread += 1;
-        state.tibs.push((id, tib));
         state.threads.push(ThreadSlot {
             id,
             context,
@@ -1067,13 +1221,13 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
         let (outer_levels, outer_depth, outer_tib) = {
             let mut state = run.borrow_mut();
             let outer_id = *state.running.last().unwrap_or(&1);
-            let outer_tib = state.tibs.iter().find(|(t, _)| *t == outer_id).map(|(_, b)| *b).unwrap_or(TIB_BASE);
+            let outer_tib = state.process.tib_of(outer_id).unwrap_or(TIB_BASE);
             let levels = std::mem::replace(&mut state.levels, slot.levels);
             let depth = std::mem::replace(&mut state.callback_depth, slot.callback_depth);
             state.running.push(id);
             (levels, depth, outer_tib)
         };
-        let tib = run.borrow().tibs.iter().find(|(t, _)| *t == id).map(|(_, b)| *b).unwrap_or(TIB_BASE);
+        let tib = run.borrow().process.tib_of(id).unwrap_or(TIB_BASE);
         let _ = self.uc.mem_write((GDT_BASE + FS_SELECTOR) as u64, &fs_descriptor(tib));
         let _ = self.uc.context_restore(&slot.context);
         let begin = slot
@@ -1115,7 +1269,7 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             state.callback_depth = outer_depth;
             state.running.pop();
             if matches!(outcome, ThreadRun::Exited(_)) {
-                state.tibs.retain(|(t, _)| *t != id);
+                state.process.tibs().retain(|(t, _)| *t != id);
             }
         }
         let _ = self.uc.mem_write((GDT_BASE + FS_SELECTOR) as u64, &fs_descriptor(outer_tib));
@@ -1303,8 +1457,8 @@ fn abort(state: &Rc<RefCell<RunState<'_>>>, uc: &mut Unicorn<'_, ()>, message: S
 /// Initialise the Win95 globals that the real loader passes to KERNEL32's
 /// private boot entry point. The values are synthetic, but every API called
 /// by the guest remains genuine KERNEL32 machine code.
-fn init_win95_state(process: &Image, uc: &mut Unicorn<'_, ()>) -> Result<(), RunError> {
-    uc.mem_map(WIN95_STATE_BASE as u64, WIN95_STATE_SIZE as u64, Prot::ALL)
+fn init_win95_state<'a>(process: &Image, uc: &mut Unicorn<'a, ()>, state: &Rc<RefCell<RunState<'a>>>) -> Result<(), RunError> {
+    map_in(uc, state, WIN95_STATE_BASE as u64, WIN95_STATE_SIZE as u64)
         .map_err(|error| RunError::Unicorn("mapping Win95 loader state", error))?;
     let state = vec![0u8; WIN95_STATE_SIZE as usize];
     uc.mem_write(WIN95_STATE_BASE as u64, &state)
@@ -1508,6 +1662,19 @@ pub struct Process<'a> {
     started: bool,
 }
 
+impl Drop for Process<'_> {
+    fn drop(&mut self) {
+        let process = self.state.borrow().process.clone();
+        // The other threads stop; the space forgets this CPU; the host
+        // thread gives up the process's lock.
+        process.end();
+        if let Some(cursor) = self.state.borrow().cursor {
+            process.space.detach(cursor);
+        }
+        process.lock.release_all();
+    }
+}
+
 impl<'a> Process<'a> {
     /// Map the program, install the API hooks and run DLL initialisation.
     pub fn new(
@@ -1627,6 +1794,19 @@ fn build<'a>(
     let mut uc = Unicorn::new(Arch::X86, if x64 { Mode::MODE_64 } else { Mode::MODE_32 })
         .map_err(|error| RunError::Unicorn("creating the CPU", error))?;
     hide_sse42(&mut uc).map_err(|error| RunError::Unicorn("hooking CPUID", error))?;
+    // 64-bit programs' threads each get a CPU and a host thread of their
+    // own (OTW_SERIAL_THREADS=1 keeps them taking turns on one).
+    let parallel = x64 && std::env::var_os("OTW_SERIAL_THREADS").is_none();
+    let process_shared = ProcessShared::new(parallel);
+    // The first thread holds the subsystem lock except while it runs
+    // guest code.
+    process_shared.lock.acquire();
+    let state = Rc::new(RefCell::new(RunState::new(process_shared.clone())));
+    {
+        let cursor = process_shared.space.attach(&mut uc);
+        state.borrow_mut().cursor = Some(cursor);
+        state.borrow_mut().x64 = x64;
+    }
 
     for module in &process.modules {
         let image_start = align_down(module.image.image_base, PAGE_SIZE);
@@ -1637,17 +1817,14 @@ fn build<'a>(
                 .wrapping_add(module.memory.len() as u32),
             PAGE_SIZE,
         );
-        uc.mem_map(
-            image_start as u64,
-            (image_end - image_start) as u64,
-            Prot::ALL,
-        )
+        map_in(&mut uc, &state, image_start as u64,
+            (image_end - image_start) as u64)
         .map_err(|error| RunError::Unicorn("mapping guest image", error))?;
         uc.mem_write(module.image.image_base as u64, &module.memory)
             .map_err(|error| RunError::Unicorn("writing guest image", error))?;
     }
 
-    uc.mem_map(SENTINEL_BASE as u64, PAGE_SIZE as u64, Prot::ALL)
+    map_in(&mut uc, &state, SENTINEL_BASE as u64, PAGE_SIZE as u64)
         .map_err(|error| RunError::Unicorn("mapping DllMain sentinel", error))?;
     uc.mem_write(SENTINEL_BASE as u64, &[0xC3])
         .map_err(|error| RunError::Unicorn("writing DllMain sentinel", error))?;
@@ -1659,7 +1836,7 @@ fn build<'a>(
     // A 64-bit program's first thread gets nearly 2 MiB of stack (current
     // programs check for at least 1 MiB), from 64 KiB up.
     let stack_low = if x64 { X64_STACK_LOW } else { STACK_BASE };
-    uc.mem_map(stack_low as u64, (STACK_BASE + STACK_SIZE - stack_low) as u64, Prot::ALL)
+    map_in(&mut uc, &state, stack_low as u64, (STACK_BASE + STACK_SIZE - stack_low) as u64)
         .map_err(|error| RunError::Unicorn("mapping guest stack", error))?;
 
     // The heap's range, except where a program image already lies in it.
@@ -1676,13 +1853,13 @@ fn build<'a>(
     let mut cursor = HEAP_BASE;
     for (start, end) in images.into_iter().chain([(HEAP_BASE + HEAP_SIZE, HEAP_BASE + HEAP_SIZE)]) {
         if start > cursor {
-            uc.mem_map(cursor as u64, (start - cursor) as u64, Prot::ALL)
+            map_in(&mut uc, &state, cursor as u64, (start - cursor) as u64)
                 .map_err(|error| RunError::Unicorn("mapping guest heap", error))?;
         }
         cursor = cursor.max(end);
     }
     if x64 {
-        uc.mem_map(memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64, Prot::ALL)
+        map_in(&mut uc, &state, memory::HEAP64_EXTRA_BASE as u64, memory::HEAP64_EXTRA_SIZE as u64)
             .map_err(|error| RunError::Unicorn("mapping the 64-bit heap", error))?;
         // NTDLL's headers, for programs that read their own module list.
         let mut headers = vec![0u8; 0x1000];
@@ -1702,12 +1879,12 @@ fn build<'a>(
         headers[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
         // The rest of its image is for the subsystem's exports and their
         // stubs (see `win32::nt::ntdll_exports`).
-        uc.mem_map(memory::NTDLL_HANDLE as u64, memory::NTDLL_SIZE as u64, Prot::ALL)
+        map_in(&mut uc, &state, memory::NTDLL_HANDLE as u64, memory::NTDLL_SIZE as u64)
             .and_then(|()| uc.mem_write(memory::NTDLL_HANDLE as u64, &headers))
             .map_err(|error| RunError::Unicorn("mapping NTDLL's headers", error))?;
     }
 
-    uc.mem_map(TIB_BASE as u64, if x64 { TEB64_SIZE } else { TIB_SIZE } as u64, Prot::ALL)
+    map_in(&mut uc, &state, TIB_BASE as u64, if x64 { TEB64_SIZE } else { TIB_SIZE } as u64)
         .map_err(|error| RunError::Unicorn("mapping guest TIB", error))?;
     if x64 {
         init_teb64(&mut uc, TIB_BASE, STACK_TOP, X64_STACK_LOW, 1)?;
@@ -1739,7 +1916,7 @@ fn build<'a>(
 
         // Unicorn 2.1.5 ignores FS_BASE writes in 32-bit mode, so install a small
         // GDT and load FS with a selector whose descriptor bases it at TIB_BASE.
-        uc.mem_map(GDT_BASE as u64, GDT_SIZE as u64, Prot::ALL)
+        map_in(&mut uc, &state, GDT_BASE as u64, GDT_SIZE as u64)
             .map_err(|error| RunError::Unicorn("mapping guest GDT", error))?;
         let mut gdt = vec![0u8; 40];
         // Flat 32-bit code and data selectors, the TIB selector, and a selector
@@ -1784,7 +1961,7 @@ fn build<'a>(
         PAGE_SIZE,
     );
     let thunk_size = thunk_end - THUNK_BASE;
-    uc.mem_map(THUNK_BASE as u64, thunk_size as u64, Prot::ALL)
+    map_in(&mut uc, &state, THUNK_BASE as u64, thunk_size as u64)
         .map_err(|error| RunError::Unicorn("mapping IAT thunks", error))?;
     uc.mem_write(THUNK_BASE as u64, &vec![0xC3; thunk_size as usize])
         .map_err(|error| RunError::Unicorn("writing IAT thunks", error))?;
@@ -1807,7 +1984,7 @@ fn build<'a>(
             bindings.push((entry.slot_va, at));
         }
         if !code.is_empty() {
-            uc.mem_map(thunk_end as u64, align_up(code.len() as u32, PAGE_SIZE) as u64, Prot::ALL)
+            map_in(&mut uc, &state, thunk_end as u64, align_up(code.len() as u32, PAGE_SIZE) as u64)
                 .and_then(|()| uc.mem_write(thunk_end as u64, &code))
                 .map_err(|error| RunError::Unicorn("writing native leaf functions", error))?;
             for (slot, at) in bindings {
@@ -1818,7 +1995,7 @@ fn build<'a>(
     }
 
     if !x64 {
-        init_win95_state(process, &mut uc)?;
+        init_win95_state(process, &mut uc, &state)?;
     }
 
     let thread_return = process.entry_point(KERNEL_DLL, THREAD_RETURN).unwrap_or(0);
@@ -1842,23 +2019,20 @@ fn build<'a>(
     uc.reg_write(Reg::FPCW, 0x027F)
         .map_err(|error| RunError::Unicorn("initialising the FPU control word", error))?;
 
-    let mut initial_state = RunState::default();
-    initial_state.pump = pump;
-    initial_state.dispatcher = process
-        .entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER)
-        .unwrap_or(0);
-    initial_state.thread_return = thread_return;
-    initial_state.x64 = x64;
-    initial_state.tls_templates = tls_templates(process, &mut uc);
     {
-        let teb = TIB_BASE;
-        install_tls(&mut uc, &initial_state.tls_templates, teb, x64)
-            .map_err(|error| RunError::Unicorn("setting up thread-local storage", error))?;
+        let mut initial_state = state.borrow_mut();
+        initial_state.pump = pump;
+        initial_state.dispatcher = process
+            .entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER)
+            .unwrap_or(0);
+        initial_state.thread_return = thread_return;
+        initial_state.running = vec![1];
     }
-    initial_state.running = vec![1];
-    initial_state.tibs = vec![(1, TIB_BASE)];
-    initial_state.next_thread = 2;
-    let state = Rc::new(RefCell::new(initial_state));
+    let templates = tls_templates(process, &mut uc);
+    *process_shared.tls_templates.lock().unwrap_or_else(|p| p.into_inner()) = templates.clone();
+    install_tls(&mut uc, &state, &templates, TIB_BASE, x64)
+        .map_err(|error| RunError::Unicorn("setting up thread-local storage", error))?;
+    process_shared.tibs().push((1, TIB_BASE));
 
     let thunk_state = state.clone();
     let thunk_iat = iat.clone();

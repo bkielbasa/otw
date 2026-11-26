@@ -49,6 +49,15 @@ pub trait SystemCalls {
     fn native_x64(&self, _dll: &str, _name: &ImportName) -> Option<&'static [u8]> {
         None
     }
+
+    /// Whether thread `id` was created suspended and not yet resumed (a
+    /// thread with a CPU of its own waits before it starts).
+    fn thread_suspended(&self, _id: u32) -> bool {
+        false
+    }
+
+    /// Thread `id`, which ran on a CPU of its own, ended.
+    fn thread_exited(&self, _memory: &mut dyn GuestMemory, _id: u32, _code: u32) {}
 }
 
 /// The arguments of a call: one 64-bit value per argument from 64-bit

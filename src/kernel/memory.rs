@@ -86,10 +86,10 @@ pub fn set_idle_wait(wait: fn(std::time::Duration)) {
 
 /// Wait up to `timeout` with nothing to do.
 pub fn idle_wait(timeout: std::time::Duration) {
-    match IDLE_WAIT.get() {
+    super::lock::unlocked(|| match IDLE_WAIT.get() {
         Some(wait) => wait(timeout),
         None => std::thread::sleep(timeout),
-    }
+    })
 }
 
 /// What became of a thread given the CPU.
@@ -191,6 +191,13 @@ pub trait GuestMemory {
 
     /// Unmap a view mapped with `map_section`.
     fn unmap_section(&mut self, _va: u32) -> bool {
+        false
+    }
+
+    /// The thread runs on a host thread of its own, with a CPU of its own
+    /// (it never comes off the CPU for others, and does not take the
+    /// first thread's place: input scripts, the host's events).
+    fn is_worker(&self) -> bool {
         false
     }
 
