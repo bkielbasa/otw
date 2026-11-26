@@ -64,9 +64,8 @@ pub fn init_boot_cpu() {
     let x2 = arch::cpuid(1, 0)[2] & (1 << 21) != 0;
     X2APIC.store(x2, Ordering::Relaxed);
     let base = read_msr(0x1B) & 0x000F_FFFF_FFFF_F000;
-    XAPIC_BASE.store(base, Ordering::Relaxed);
     if !x2 {
-        arch::map_device(base, 4096);
+        XAPIC_BASE.store(arch::map_device(base, 4096), Ordering::Relaxed);
     }
     // The old interrupt controllers (8259): all masked.
     unsafe {

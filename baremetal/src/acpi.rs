@@ -13,7 +13,7 @@ pub struct Machine {
 }
 
 unsafe fn read<T: Copy>(address: u64) -> T {
-    core::ptr::read_unaligned(address as *const T)
+    core::ptr::read_unaligned(crate::paging::to_virtual(address) as *const T)
 }
 
 /// Find the tables from the root pointer (RSDP) the firmware gave.

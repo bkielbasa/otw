@@ -156,8 +156,9 @@ impl DmaBuffer {
         Self { pointer, size: size.max(4096) }
     }
 
+    /// Where the device finds it (physical).
     pub fn address(&self) -> u64 {
-        self.pointer as u64
+        crate::paging::to_physical(self.pointer as u64)
     }
 
     pub fn slice(&self) -> &[u8] {

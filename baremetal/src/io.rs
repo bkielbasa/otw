@@ -232,7 +232,7 @@ fn io_apic_lines(base: u64) -> u32 {
 }
 
 fn io_apic_read(base: u64, register: u32) -> u32 {
-    crate::arch::map_device(base, 0x20);
+    let base = crate::arch::map_device(base, 0x20);
     unsafe {
         core::ptr::write_volatile(base as *mut u32, register);
         core::ptr::read_volatile((base + 0x10) as *const u32)
@@ -240,7 +240,7 @@ fn io_apic_read(base: u64, register: u32) -> u32 {
 }
 
 fn io_apic_write(base: u64, register: u32, value: u32) {
-    crate::arch::map_device(base, 0x20);
+    let base = crate::arch::map_device(base, 0x20);
     unsafe {
         core::ptr::write_volatile(base as *mut u32, register);
         core::ptr::write_volatile((base + 0x10) as *mut u32, value);

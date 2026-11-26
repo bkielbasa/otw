@@ -115,7 +115,7 @@ pub fn probe(device: &pci::Device) -> Option<Nvme> {
     if base == 0 {
         return None;
     }
-    arch::map_device(base, size.max(0x4000));
+    let base = arch::map_device(base, size.max(0x4000));
     let read64 = |offset: u64| unsafe { read_volatile((base + offset) as *const u64) };
     let capabilities = read64(0);
     let stride = (capabilities >> 32) & 0xF;

@@ -103,7 +103,7 @@ pub fn start_others(ids: &[u32], page: u64) {
     let start = Box::leak(Box::new(Start { started: AtomicUsize::new(0) }));
     let code = trampoline(page as u32);
     unsafe {
-        let t = page as *mut u8;
+        let t = crate::paging::to_virtual(page) as *mut u8;
         core::ptr::copy_nonoverlapping(code.as_ptr(), t, code.len());
         let field = |offset: usize, value: u64| core::ptr::write_unaligned(t.add(offset) as *mut u64, value);
         core::ptr::write_unaligned(t.add(CR3) as *mut u32, arch::page_table_root() as u32);

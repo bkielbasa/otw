@@ -21,6 +21,7 @@ mod disk;
 mod heap;
 mod io;
 mod nvme;
+mod paging;
 mod pci;
 mod screen;
 mod smp;
@@ -82,17 +83,100 @@ pub fn ms_since_start() -> u64 {
     (arch::rdtsc() - BOOT_TSC.load(Ordering::SeqCst)) / apic::tsc_mhz().max(1) / 1000
 }
 
+/// Page tables are made in this much memory before there is a heap.
+const BOOT_TABLES: u64 = 16 << 20;
+
 #[no_mangle]
 pub extern "efiapi" fn efi_main(image: uefi::Handle, system: *mut uefi::SystemTable) -> uefi::Status {
     BOOT_TSC.store(arch::rdtsc(), Ordering::SeqCst);
     io::serial_init();
     log!("OTW kernel: starting");
-    let (info, regions, count) = unsafe { take_machine(image, system) };
+    let (info, mut regions, count) = unsafe { take_machine(image, system) };
+    // Memory for the first page tables: the start of a big free region.
+    let tables = regions[..count]
+        .iter_mut()
+        .find(|r| r.kind == 7 && r.start >= 0x10_0000 && r.size >= 2 * BOOT_TABLES && r.start + BOOT_TABLES < 1 << 32)
+        .map(|r| {
+            let start = r.start;
+            r.start += BOOT_TABLES;
+            r.size -= BOOT_TABLES;
+            start
+        })
+        .unwrap_or_else(|| fatal("no memory for page tables"));
+    paging::take_over(info.memory_end.max(4 << 30), tables, BOOT_TABLES);
+    // Into the direct map: fix the kernel's absolute addresses, then move
+    // the stack and continue there.
+    unsafe { relocate(paging::DIRECT_BASE) };
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
+    let stack = ((rsp + paging::DIRECT_BASE - 4096) & !15) - 8;
+    let main = kernel_main as *const () as u64;
+    let main = if main < paging::DIRECT_BASE { main + paging::DIRECT_BASE } else { main };
+    let regions_high = regions.as_ptr() as u64 + paging::DIRECT_BASE;
+    let info_high = &info as *const BootInfo as u64 + paging::DIRECT_BASE;
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {stack}",
+            "jmp {main}",
+            stack = in(reg) stack,
+            main = in(reg) main,
+            in("rdi") regions_high,
+            in("rsi") count,
+            in("rdx") info_high,
+            options(noreturn)
+        )
+    }
+}
+
+extern "C" {
+    /// The start of this image in memory (from the linker).
+    static __ImageBase: u8;
+}
+
+/// Add `delta` to every absolute address in the image (its base relocation
+/// table), so that it runs `delta` higher.
+unsafe fn relocate(delta: u64) {
+    let base = core::ptr::addr_of!(__ImageBase) as u64;
+    let u32_at = |a: u64| core::ptr::read_unaligned(a as *const u32);
+    let pe = base + u32_at(base + 0x3C) as u64;
+    let optional = pe + 24;
+    // PE32+: the data directories start at 112; base relocations are 5th.
+    let (rva, size) = (u32_at(optional + 112 + 40) as u64, u32_at(optional + 112 + 44) as u64);
+    let mut block = base + rva;
+    let end = block + size;
+    let mut count = 0;
+    while block + 8 <= end {
+        let page = u32_at(block) as u64;
+        let length = u32_at(block + 4) as u64;
+        if length < 8 {
+            break;
+        }
+        for i in 0..(length - 8) / 2 {
+            let entry = core::ptr::read_unaligned((block + 8 + i * 2) as *const u16);
+            if entry >> 12 == 10 {
+                let at = (base + page + (entry & 0xFFF) as u64) as *mut u64;
+                core::ptr::write_unaligned(at, core::ptr::read_unaligned(at).wrapping_add(delta));
+                count += 1;
+            }
+        }
+        block += length;
+    }
+    log!("OTW kernel: moved into the direct map ({count} addresses fixed)");
+}
+
+/// Now in the direct map: make the heap, and leave the firmware's stack.
+extern "sysv64" fn kernel_main(regions: *const Region, count: usize, info: *const BootInfo) -> ! {
+    paging::set_direct();
+    let regions = unsafe { core::slice::from_raw_parts(regions, count) };
+    for r in regions.iter().filter(|r| r.kind == 7 && r.start >= 0x10_0000) {
+        unsafe { HEAP.add_region(paging::to_virtual(r.start) as usize, r.size as usize) };
+    }
+    paging::end_boot_tables();
+    let mut info = unsafe { *info };
+    info.framebuffer = paging::map_framebuffer(info.framebuffer as u64, (info.stride * info.height * 4) as u64) as *mut u32;
     let info = alloc::boxed::Box::leak(alloc::boxed::Box::new(info));
     BOOT_INFO.store(info, Ordering::SeqCst);
-    // The firmware's stack is boot services memory, about to be reused:
-    // move to one of the kernel's own.
-    let regions: Vec<Region> = regions[..count].to_vec();
+    let regions: Vec<Region> = regions.to_vec();
     let regions = alloc::boxed::Box::leak(alloc::boxed::Box::new(regions));
     let stack = alloc::boxed::Box::leak(alloc::vec![0u8; 1 << 20].into_boxed_slice());
     let top = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
@@ -101,26 +185,23 @@ pub extern "efiapi" fn efi_main(image: uefi::Handle, system: *mut uefi::SystemTa
             "mov rsp, {top}",
             "call {main}",
             top = in(reg) top,
-            main = sym kernel_main,
+            main = sym kernel_main2,
             in("rdi") regions as *const Vec<Region>,
             options(noreturn)
         )
     }
 }
 
-extern "sysv64" fn kernel_main(regions: &Vec<Region>) -> ! {
+extern "sysv64" fn kernel_main2(regions: &Vec<Region>) -> ! {
     let info = unsafe { *BOOT_INFO.load(Ordering::SeqCst) };
     arch::load_cpu_tables();
     arch::load_idt();
-    arch::build_page_tables(info.memory_end.max(4 << 30));
     arch::load_page_attributes();
-    let framebuffer_size = (info.stride * info.height * 4) as u64;
-    arch::map_framebuffer(info.framebuffer as u64, framebuffer_size);
     // The firmware's boot services memory is free now (the kernel has its
     // own stack, tables and page tables).
     let mut reclaimed = 0;
     for region in regions.iter().filter(|r| matches!(r.kind, 3 | 4) && r.start >= 0x10_0000) {
-        unsafe { HEAP.add_region(region.start as usize, region.size as usize) };
+        unsafe { HEAP.add_region(paging::to_virtual(region.start) as usize, region.size as usize) };
         reclaimed += region.size;
     }
     log!(
@@ -273,9 +354,6 @@ unsafe fn take_machine(image: uefi::Handle, system: *mut uefi::SystemTable) -> (
         // RAM (not device ranges, which are mapped when a driver asks).
         if (1..=10).contains(&d.kind) && d.kind != 8 {
             memory_end = memory_end.max(d.physical_start + size);
-        }
-        if d.kind == 7 && d.physical_start >= 0x10_0000 {
-            HEAP.add_region(d.physical_start as usize, size as usize);
         }
         // A free page below 1 MiB (not page 0) to start other CPUs from.
         if trampoline == 0 && d.kind == 7 && d.physical_start < 0x9F000 {

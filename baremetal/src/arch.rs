@@ -1,7 +1,6 @@
 //! The CPU's own tables: segments (GDT and TSS), interrupts and exceptions
 //! (IDT), and the page tables, all the kernel's rather than the firmware's.
 
-use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -325,93 +324,4 @@ pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-// ── Page tables ──
-
-const PRESENT: u64 = 1;
-const WRITABLE: u64 = 2;
-const WRITE_THROUGH: u64 = 1 << 3;
-const NO_CACHE: u64 = 1 << 4;
-const HUGE: u64 = 1 << 7;
-const ADDRESS: u64 = 0x000F_FFFF_FFFF_F000;
-const TWO_MIB: u64 = 2 << 20;
-
-static PML4: AtomicU64 = AtomicU64::new(0);
-
-fn new_table() -> *mut u64 {
-    let table = unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) } as *mut u64;
-    assert!(!table.is_null(), "out of memory for page tables");
-    table
-}
-
-/// Map physical memory at its own address (identity mapping) in 2 MiB
-/// pages: [0, `end`) cached normally (the firmware's memory type ranges keep
-/// device memory below 4 GiB uncached).
-pub fn build_page_tables(end: u64) {
-    let pml4 = new_table();
-    // The table must be below 4 GiB: other CPUs load it while still in
-    // 32-bit code when they start.
-    assert!((pml4 as u64) < 1 << 32, "page tables above 4 GiB");
-    PML4.store(pml4 as u64, Ordering::SeqCst);
-    let end = end.div_ceil(TWO_MIB) * TWO_MIB;
-    let mut address = 0;
-    while address < end {
-        map_2mib(address, 0);
-        address += TWO_MIB;
-    }
-    unsafe { asm!("mov cr3, {}", in(reg) pml4 as u64) };
-}
-
-pub fn page_table_root() -> u64 {
-    PML4.load(Ordering::SeqCst)
-}
-
-fn map_2mib(address: u64, flags: u64) {
-    unsafe {
-        let pml4 = PML4.load(Ordering::SeqCst) as *mut u64;
-        let mut table = pml4;
-        for shift in [39u64, 30] {
-            let entry = table.add((address >> shift & 511) as usize);
-            if *entry & PRESENT == 0 {
-                *entry = new_table() as u64 | PRESENT | WRITABLE;
-            }
-            table = (*entry & ADDRESS) as *mut u64;
-        }
-        *table.add((address >> 21 & 511) as usize) = address | PRESENT | WRITABLE | HUGE | flags;
-    }
-}
-
-/// The page attribute table: entry 1 (page tables' write-through bit
-/// alone) becomes write-combining, for the framebuffer; the rest keep
-/// their power-on meaning. Every CPU loads the same table.
-pub fn load_page_attributes() {
-    // WB, WC, UC-, UC, WB, WT, UC-, UC
-    write_msr(0x277, 0x0007_0406_0007_0106);
-}
-
-/// Map the framebuffer write-combining: writes to it are batched rather
-/// than sent one at a time, which is what makes drawing fast on real
-/// hardware.
-pub fn map_framebuffer(address: u64, size: u64) {
-    let start = address / TWO_MIB * TWO_MIB;
-    let end = (address + size).div_ceil(TWO_MIB) * TWO_MIB;
-    let mut page = start;
-    while page < end {
-        map_2mib(page, WRITE_THROUGH);
-        unsafe { asm!("invlpg [{}]", in(reg) page) };
-        page += TWO_MIB;
-    }
-    // Drop whatever the caches hold for it.
-    unsafe { asm!("wbinvd") };
-}
-
-/// Make device registers at [address, address + size) reachable, uncached.
-pub fn map_device(address: u64, size: u64) {
-    let start = address / TWO_MIB * TWO_MIB;
-    let end = (address + size).div_ceil(TWO_MIB) * TWO_MIB;
-    let mut page = start;
-    while page < end {
-        map_2mib(page, NO_CACHE | WRITE_THROUGH);
-        unsafe { asm!("invlpg [{}]", in(reg) page) };
-        page += TWO_MIB;
-    }
-}
+pub use crate::paging::{load_page_attributes, map_device, page_table_root};

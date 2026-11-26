@@ -98,7 +98,7 @@ pub fn probe(device: &pci::Device) -> Vec<Arc<dyn Disk>> {
     if base == 0 {
         return disks;
     }
-    arch::map_device(base, size.max(0x1100));
+    let base = arch::map_device(base, size.max(0x1100));
     set(base + 0x04, get(base + 0x04) | 1 << 31); // AHCI mode
     let implemented = get(base + 0x0C);
     for index in 0..32u64 {
