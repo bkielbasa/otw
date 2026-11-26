@@ -21,6 +21,8 @@ const STATUS_INVALID_INFO_CLASS: u64 = 0xC000_0003;
 
 #[derive(Debug, Default)]
 pub struct State {
+    /// NTDLL's export table has been filled in.
+    pub exports_written: bool,
     /// Completion ports: queued (bytes, key, overlapped) packets.
     pub ports: HashMap<u32, VecDeque<(u32, u64, u64)>>,
     /// Vectored exception handlers, first to call first.
@@ -1405,4 +1407,75 @@ fn unicode_upper(unit: u16) -> u16 {
             if upper.len() == 1 { upper.next().unwrap_or(c) as u32 as u16 } else { unit }
         })
         .unwrap_or(unit)
+}
+
+/// NTDLL functions programs look up in its export table themselves
+/// (rather than with GetProcAddress); those the subsystem implements are
+/// exported.
+const NTDLL_EXPORTS: &[&str] = &[
+    "LdrLoadDll", "LdrUnloadDll", "NtAllocateVirtualMemory", "NtClose", "NtDuplicateObject", "NtFreeVirtualMemory",
+    "NtMapViewOfSection", "NtOpenFile", "NtOpenProcess", "NtOpenSection", "NtProtectVirtualMemory",
+    "NtQueryFullAttributesFile", "NtQueryInformationProcess", "NtQueryInformationThread", "NtQueryObject",
+    "NtQuerySection", "NtQuerySystemInformation", "NtQueryVirtualMemory", "NtReadVirtualMemory",
+    "NtSetInformationThread", "NtUnmapViewOfSection", "NtWaitForSingleObject", "NtWriteVirtualMemory",
+    "RtlAcquireSRWLockExclusive", "RtlAcquireSRWLockShared", "RtlAddFunctionTable", "RtlAllocateHeap",
+    "RtlAnsiStringToUnicodeString", "RtlCaptureContext", "RtlCaptureStackBackTrace", "RtlCompareMemory",
+    "RtlCompareUnicodeString", "RtlDuplicateUnicodeString", "RtlEqualUnicodeString", "RtlFreeHeap",
+    "RtlFreeUnicodeString", "RtlGetLastWin32Error", "RtlInitAnsiString", "RtlInitUnicodeString",
+    "RtlLookupFunctionEntry", "RtlNtStatusToDosError", "RtlQueryPerformanceCounter", "RtlReAllocateHeap",
+    "RtlReleaseSRWLockExclusive", "RtlReleaseSRWLockShared", "RtlRunOnceExecuteOnce", "RtlRunOnceInitialize",
+    "RtlSetLastWin32Error", "RtlSleepConditionVariableSRW", "RtlUnwindEx", "RtlVirtualUnwind",
+    "RtlWakeAllConditionVariable", "RtlWakeConditionVariable",
+];
+
+/// Fill NTDLL's export table (once per process): each export is a stub in
+/// its image that jumps to the subsystem's function.
+pub fn ntdll_exports<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) {
+    use crate::kernel::memory::NTDLL_HANDLE as BASE;
+    if !ctx.shared.borrow().x64 || ctx.shared.borrow().nt.exports_written {
+        return;
+    }
+    ctx.shared.borrow_mut().nt.exports_written = true;
+    let mut names: Vec<&str> = NTDLL_EXPORTS
+        .iter()
+        .copied()
+        .filter(|name| crate::win32::has_implementation("ntdll.dll", &ImportName::ByName((*name).into())))
+        .collect();
+    names.sort_unstable();
+    let thunks: Vec<(&str, u32)> = names
+        .into_iter()
+        .filter_map(|name| crate::win32::kernel32::dynamic_thunk(ctx, "ntdll.dll", name).map(|thunk| (name, thunk)))
+        .collect();
+    let count = thunks.len() as u32;
+    // Directory at 0x1000, then the function, name and ordinal tables,
+    // the names, and the stubs from 0x8000.
+    let directory = 0x1000u32;
+    let functions = directory + 40;
+    let name_table = functions + 4 * count;
+    let ordinals = name_table + 4 * count;
+    let mut strings = ordinals + 2 * count;
+    let dll_name = strings;
+    let _ = memory.write_bytes(BASE + dll_name, b"ntdll.dll\0");
+    strings += 10;
+    for (index, (name, thunk)) in thunks.iter().enumerate() {
+        let index = index as u32;
+        let stub = 0x8000 + index * 16;
+        // jmp [rip+0]; the thunk's address.
+        let mut code = vec![0xFF, 0x25, 0, 0, 0, 0];
+        code.extend_from_slice(&(*thunk as u64).to_le_bytes());
+        let _ = memory.write_bytes(BASE + stub, &code);
+        let _ = memory.write_u32(BASE + functions + 4 * index, stub);
+        let _ = memory.write_u32(BASE + name_table + 4 * index, strings);
+        let _ = memory.write_bytes(BASE + ordinals + 2 * index, &(index as u16).to_le_bytes());
+        let _ = memory.write_bytes(BASE + strings, &[name.as_bytes(), b"\0"].concat());
+        strings += name.len() as u32 + 1;
+    }
+    let mut header = Vec::new();
+    for value in [0u32, 0, 0, dll_name, 1, count, count, functions, name_table, ordinals] {
+        header.extend_from_slice(&value.to_le_bytes());
+    }
+    let _ = memory.write_bytes(BASE + directory, &header);
+    // The export data directory of the optional header (PE32+ at 0x98).
+    let _ = memory.write_u32(BASE + 0x98 + 112, directory);
+    let _ = memory.write_u32(BASE + 0x98 + 116, strings - directory);
 }

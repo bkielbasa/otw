@@ -13,6 +13,8 @@ pub const HEAP_SIZE: u32 = 0x0780_0000;
 /// (without exports; GetProcAddress serves the functions) at the top of
 /// the address space, clear of large reservations.
 pub const NTDLL_HANDLE: u32 = 0xFFF0_0000;
+/// The size of NTDLL's image.
+pub const NTDLL_SIZE: u32 = 0x1_0000;
 
 /// More heap for 64-bit processes, whose programs allocate far more.
 pub const HEAP64_EXTRA_BASE: u32 = 0x4000_0000;

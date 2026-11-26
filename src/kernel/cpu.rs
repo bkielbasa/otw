@@ -397,7 +397,18 @@ fn deliver_fault(uc: &mut Unicorn<'_, ()>, state: &Rc<RefCell<RunState<'_>>>) ->
             None => return false,
         }
     };
-    eprintln!("[eh] {}", fault.describe());
+    {
+        let rsp = uc.reg_read(unicorn_engine::RegisterX86::RSP).unwrap_or(0);
+        let mut ret = [0u8; 8];
+        let _ = uc.mem_read(rsp, &mut ret);
+        let thread = state.borrow().running.last().copied().unwrap_or(1);
+        eprintln!(
+            "[eh] {} ({}, thread {thread}, rsp {rsp:#x}, [rsp] {:#x})",
+            fault.describe(),
+            std::thread::current().name().unwrap_or("main"),
+            u64::from_le_bytes(ret)
+        );
+    }
     if state.borrow().x64 {
         // x64: the record and context below the faulting frame; the
         // dispatcher gets them in RCX and RDX.
@@ -1686,10 +1697,12 @@ fn build<'a>(
         headers[o + 24..o + 32].copy_from_slice(&(memory::NTDLL_HANDLE as u64).to_le_bytes());
         headers[o + 32..o + 36].copy_from_slice(&0x1000u32.to_le_bytes());
         headers[o + 36..o + 40].copy_from_slice(&0x200u32.to_le_bytes());
-        headers[o + 56..o + 60].copy_from_slice(&0x1000u32.to_le_bytes());
+        headers[o + 56..o + 60].copy_from_slice(&memory::NTDLL_SIZE.to_le_bytes());
         headers[o + 60..o + 64].copy_from_slice(&0x200u32.to_le_bytes());
         headers[o + 108..o + 112].copy_from_slice(&16u32.to_le_bytes());
-        uc.mem_map(memory::NTDLL_HANDLE as u64, 0x1000, Prot::READ)
+        // The rest of its image is for the subsystem's exports and their
+        // stubs (see `win32::nt::ntdll_exports`).
+        uc.mem_map(memory::NTDLL_HANDLE as u64, memory::NTDLL_SIZE as u64, Prot::ALL)
             .and_then(|()| uc.mem_write(memory::NTDLL_HANDLE as u64, &headers))
             .map_err(|error| RunError::Unicorn("mapping NTDLL's headers", error))?;
     }

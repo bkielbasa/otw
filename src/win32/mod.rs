@@ -815,6 +815,9 @@ pub struct SharedState {
     /// The process id (1 for the first program; processes started to run
     /// alongside it get their own).
     pub pid: u32,
+    /// Started to run alongside its parent: headless input scripts and
+    /// idle exits are the first program's.
+    pub alongside: bool,
     /// Pipes, sections and completion ports of this process.
     pub ipc: ipc::State,
     /// The program asked Windows to restart (ExitWindowsEx).
@@ -872,6 +875,7 @@ impl Default for SharedState {
             sync: sync::SyncState::default(),
             launcher: LauncherSlot::default(),
             pid: 1,
+            alongside: false,
             ipc: ipc::State::default(),
             restart_requested: false,
             image_lists: HashMap::new(),

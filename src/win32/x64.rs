@@ -322,6 +322,7 @@ pub fn call(
     if dll.eq_ignore_ascii_case("dwrite.dll") {
         return crate::win32::dwrite::call(ctx, memory, by_name(name)?, args);
     }
+    crate::win32::ipc::adopt_files(ctx, &args[..count.min(args.len())]);
     if let Some(outcome) = by_name(name).and_then(|text| crate::win32::ipc::call(ctx, memory, text, args)) {
         return Some(outcome);
     }

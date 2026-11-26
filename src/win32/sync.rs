@@ -552,9 +552,17 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
     loop {
         if !reported && began.elapsed().as_secs() >= 20 && std::env::var_os("OTW_TRACE_WAITS").is_some() {
             reported = true;
-            eprintln!("[waits] thread {thread} has waited 20 s for {:?} (address {:#x})", wait.handles, wait.address);
+            let pid = ctx.shared.borrow().pid;
+            let owner = if wait.section != 0 { memory.read_u32(wait.section + 12).unwrap_or(0) } else { 0 };
+            eprintln!(
+                "[waits] process {pid:#x} thread {thread} has waited 20 s for {:?} (address {:#x}, section {:#x} owned by {owner}, messages {})",
+                wait.handles, wait.address, wait.section, wait.messages
+            );
             for (other, w) in &ctx.shared.borrow().sync.waits {
-                eprintln!("[waits]   thread {other}: handles {:?} address {:#x} deadline {:?}", w.handles, w.address, w.deadline);
+                eprintln!(
+                    "[waits]   thread {other}: handles {:?} address {:#x} section {:#x} deadline {:?}",
+                    w.handles, w.address, w.section, w.deadline
+                );
             }
         }
         refresh_processes(ctx);

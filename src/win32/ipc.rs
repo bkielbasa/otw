@@ -270,6 +270,7 @@ fn object_type(ctx: &ApiContext, handle: u32) -> &'static str {
         Some(Object::Section { .. }) => Some("Section"),
         Some(Object::PipeEnd { .. }) => Some("File"),
         Some(Object::Process { .. }) => Some("Process"),
+        Some(Object::File { .. }) => Some("File"),
         None => None,
     });
     if let Some(name) = shared {
@@ -668,6 +669,11 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 shared.ipc.skip_on_success.remove(&p(0));
             }
             kobj::with(|k| k.close(me, p(0)));
+            {
+                let mut shared = ctx.shared.borrow_mut();
+                shared.files.remove(&p(0));
+                shared.file_paths.remove(&p(0));
+            }
             if trace(ctx) {
                 eprintln!("[ipc {me}] CloseHandle {:#x}", p(0));
             }
@@ -730,6 +736,28 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                     let _ = memory.write_ptr(p(3), new as u64);
                 }
                 return ok(1);
+            }
+            if source == me {
+                // A file of this process: the other gets the same open file.
+                let file = {
+                    let shared = ctx.shared.borrow();
+                    shared.files.get(&p(1)).and_then(|f| f.try_clone().ok()).map(|f| (f, shared.file_paths.get(&p(1)).cloned().unwrap_or_default()))
+                };
+                if let Some((file, path)) = file {
+                    let new = kobj::with(|k| k.create(target, Object::File { file: std::sync::Arc::new(file), path }));
+                    if close_source {
+                        let mut shared = ctx.shared.borrow_mut();
+                        shared.files.remove(&p(1));
+                        shared.file_paths.remove(&p(1));
+                    }
+                    if trace(ctx) {
+                        eprintln!("[ipc {me}] DuplicateHandle file {:#x} into {target} = {new:#x}", p(1));
+                    }
+                    if p(3) != 0 {
+                        let _ = memory.write_ptr(p(3), new as u64);
+                    }
+                    return ok(1);
+                }
             }
             eprintln!("[ipc {me}] DuplicateHandle {:#x} of {source} into {target}: not shareable", p(1));
             if source == me && close_source {
@@ -806,5 +834,29 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(1)
         }
         _ => None,
+    }
+}
+
+/// Take files other processes passed to this one into its file table,
+/// for the handles among a call's arguments.
+pub fn adopt_files(ctx: &ApiContext, args: &[u64]) {
+    for &arg in args {
+        let handle = arg as u32;
+        if arg > u32::MAX as u64 || handle < kobj::FIRST_HANDLE || handle >= kobj::FIRST_HANDLE + 0x100_0000 {
+            continue;
+        }
+        if ctx.shared.borrow().files.contains_key(&handle) {
+            continue;
+        }
+        let me = pid(ctx);
+        let file = kobj::with(|k| match k.get(me, handle) {
+            Some(Object::File { file, path }) => file.try_clone().ok().map(|f| (f, path.clone())),
+            _ => None,
+        });
+        if let Some((file, path)) = file {
+            let mut shared = ctx.shared.borrow_mut();
+            shared.files.insert(handle, file);
+            shared.file_paths.insert(handle, path);
+        }
     }
 }

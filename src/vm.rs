@@ -460,7 +460,9 @@ fn start_alongside(parent: &ApiContext, path: &[u8], command_line: &[u8], direct
             {
                 let mut state = shared.borrow_mut();
                 state.pid = pid;
+                state.alongside = true;
                 state.gui.screen = screen;
+                state.gui.script = Some(Default::default());
                 if let Some(block) = &environment {
                     win32::env::set_all(&mut state.env, block);
                 }

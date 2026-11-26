@@ -26,6 +26,9 @@ pub enum Object {
     PipeEnd { pipe: u64, side: usize },
     /// A process (a handle another process was given to it).
     Process { pid: u32 },
+    /// An open file another process passed on: the receiving process
+    /// takes it into its own file table when it first uses the handle.
+    File { file: Arc<std::fs::File>, path: Vec<u8> },
 }
 
 impl std::fmt::Debug for Object {
@@ -34,6 +37,7 @@ impl std::fmt::Debug for Object {
             Object::Section { size, .. } => write!(f, "Section({size:#x})"),
             Object::PipeEnd { pipe, side } => write!(f, "PipeEnd({pipe}, {side})"),
             Object::Process { pid } => write!(f, "Process({pid})"),
+            Object::File { path, .. } => write!(f, "File({})", String::from_utf8_lossy(path)),
         }
     }
 }

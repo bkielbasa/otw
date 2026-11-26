@@ -624,7 +624,12 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             match found {
                 Some(base) => ok(base),
                 None => match system_module(&requested) {
-                    Some(handle) => ok(handle),
+                    Some(handle) => {
+                        if handle == crate::kernel::memory::NTDLL_HANDLE {
+                            crate::win32::nt::ntdll_exports(ctx, memory);
+                        }
+                        ok(handle)
+                    }
                     None => {
                         set_error(ctx, 126);
                         ok(0)
@@ -636,7 +641,12 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             let requested = String::from_utf8_lossy(&read_cstr(memory, args[0])).into_owned();
             let flags = if name == "LoadLibraryExA" { args[2] } else { 0 };
             match crate::win32::module::load_library(ctx, memory, &requested, flags) {
-                Ok(handle) => ok(handle),
+                Ok(handle) => {
+                    if handle == crate::kernel::memory::NTDLL_HANDLE {
+                        crate::win32::nt::ntdll_exports(ctx, memory);
+                    }
+                    ok(handle)
+                }
                 Err(error) => {
                     if std::env::var_os("OTW_TRACE_MODULES").is_some() {
                         eprintln!("[module] {requested}: error {error}");
@@ -800,7 +810,12 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             })
         }
         "ReadFile" | "_lread" => {
+            let overlapped = if name == "ReadFile" { args[4] } else { 0 };
+            seek_to_overlapped(ctx, memory, args[0], overlapped);
             let bytes = crt::read_file(ctx, args[0], args[2] as usize);
+            if let Some(bytes) = &bytes {
+                finish_overlapped(ctx, memory, overlapped, bytes.len() as u32);
+            }
             match bytes {
                 Some(bytes) => {
                     let _ = memory.write_bytes(args[1], &bytes);
@@ -823,6 +838,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             let Some(bytes) = memory.read_bytes(args[1], args[2] as usize) else {
                 return ok(0);
             };
+            let overlapped = if name == "WriteFile" { args[4] } else { 0 };
+            seek_to_overlapped(ctx, memory, args[0], overlapped);
             let written = if (args[0] as i32) <= -10 && (args[0] as i32) >= -12 {
                 use std::io::Write;
                 let mut stdout = std::io::stdout().lock();
@@ -832,6 +849,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             } else {
                 crt::write_file(ctx, args[0], &bytes)
             };
+            if let Some(count) = written {
+                finish_overlapped(ctx, memory, overlapped, count as u32);
+            }
             match written {
                 Some(count) => {
                     if name == "WriteFile" {
@@ -1299,5 +1319,33 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             let _ = ResName::Id(0);
             None
         }
+    }
+}
+
+/// ReadFile and WriteFile with an OVERLAPPED: its offset says where in the
+/// file (the operation itself finishes at once).
+fn seek_to_overlapped<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, file: u32, overlapped: u32) {
+    if overlapped == 0 {
+        return;
+    }
+    let at = overlapped + 2 * memory.ptr_size();
+    let offset = memory.read_u32(at).unwrap_or(0) as u64 | (memory.read_u32(at + 4).unwrap_or(0) as u64) << 32;
+    use std::io::{Seek, SeekFrom};
+    if let Some(handle) = ctx.shared.borrow_mut().files.get_mut(&file) {
+        let _ = handle.seek(SeekFrom::Start(offset));
+    }
+}
+
+/// Mark an OVERLAPPED operation finished: its status, byte count and event.
+fn finish_overlapped<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, overlapped: u32, bytes: u32) {
+    if overlapped == 0 {
+        return;
+    }
+    let size = memory.ptr_size();
+    let _ = memory.write_ptr(overlapped, 0);
+    let _ = memory.write_ptr(overlapped + size, bytes as u64);
+    let event = memory.read_ptr(overlapped + 2 * size + 8).unwrap_or(0) as u32;
+    if event & !1 != 0 {
+        crate::win32::sync::set_event(&mut ctx.shared.borrow_mut().sync, event & !1);
     }
 }
