@@ -357,6 +357,15 @@ impl GuestMemory for NativeMemory<'_> {
         1
     }
 
+    /// The desktop is there: programs show windows and wait for input.
+    fn has_host(&self) -> bool {
+        true
+    }
+
+    fn pump(&mut self, block: bool) {
+        crate::desktop::pump(block);
+    }
+
     fn current_tib(&self) -> u32 {
         TIB_BASE
     }
@@ -378,7 +387,7 @@ fn exception_name(vector: u8) -> &'static str {
 pub fn run(path: &str, command_line: &str) -> Ended {
     let started = apic::now_us();
     let shared = Rc::new(RefCell::new(SharedState::default()));
-    let vm = match Vm::from_drive(path.as_bytes(), command_line.as_bytes(), shared) {
+    let vm = match Vm::from_drive(path.as_bytes(), command_line.as_bytes(), shared.clone()) {
         Ok(vm) => vm,
         Err(error) => return Ended::Failed(format!("cannot load {path}: {error}")),
     };
@@ -468,6 +477,7 @@ pub fn run(path: &str, command_line: &str) -> Ended {
         (apic::now_us() - started) / 1000
     );
 
+    crate::desktop::program_started(&shared, path.rsplit('\\').next().unwrap_or(path));
     // Its memory, its thread block.
     runner.space.activate();
     if x64 {
