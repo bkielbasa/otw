@@ -185,6 +185,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "GetSecurityDescriptorControl" => 3,
         "RegisterTraceGuidsW" => 8,
         "GetDynamicTimeZoneInformation" => 1,
+        "GetTimeZoneInformationForYear" | "TzSpecificLocalTimeToSystemTime" => 3,
         "GlobalMemoryStatusEx" | "IsValidSecurityDescriptor" => 1,
         "GetSystemCpuSetInformation" => 5,
         "GetUserPreferredUILanguages" | "GetThreadPreferredUILanguages" | "GetUserDefaultPreferredUILanguages" => 4,
@@ -836,6 +837,16 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         "RegisterTraceGuidsW" => {
             let _ = memory.write_u64(p(7), 0);
             ok(0)
+        }
+        // The machine keeps UTC, without daylight saving time.
+        "GetTimeZoneInformationForYear" => {
+            let _ = memory.write_bytes(p(2), &[0u8; 172]);
+            ok(1)
+        }
+        "TzSpecificLocalTimeToSystemTime" => {
+            let time = memory.read_bytes(p(1), 16).unwrap_or_else(|| vec![0; 16]);
+            let _ = memory.write_bytes(p(2), &time);
+            ok(1)
         }
         "GetDynamicTimeZoneInformation" => {
             // UTC: all zero, "Coordinated Universal Time".

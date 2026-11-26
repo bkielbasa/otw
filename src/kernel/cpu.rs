@@ -2316,6 +2316,43 @@ fn build<'a>(
             }
         }
         if intr_state.borrow().error.is_none() {
+            if std::env::var_os("OTW_TRACE_FAULTS").is_some() && intr_state.borrow().x64 {
+                // Where it came from: the stack's words that look like
+                // return addresses into mapped code.
+                let rsp = uc.reg_read(unicorn_engine::RegisterX86::RSP).unwrap_or(0);
+                let mut stack = vec![0u8; 0x800];
+                let _ = uc.mem_read(rsp, &mut stack);
+                let regions: Vec<(u64, u64)> = uc.mem_regions().map(|r| r.iter().map(|r| (r.begin, r.end)).collect()).unwrap_or_default();
+                let mut returns = Vec::new();
+                for word in stack.chunks_exact(8) {
+                    let value = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+                    if value > 0x40_0000 && value < 0x1_0000_0000 && regions.iter().any(|&(b, e)| value >= b && value <= e) {
+                        let mut before = [0u8; 6];
+                        // A call ends just before a return address.
+                        if uc.mem_read(value - 6, &mut before).is_ok()
+                            && (before[1] == 0xE8 || before[0] == 0xFF || before[4] == 0xFF)
+                        {
+                            returns.push(format!("{value:#x}"));
+                        }
+                    }
+                    if returns.len() >= 12 {
+                        break;
+                    }
+                }
+                eprintln!("[eh] int {intno} at {eip:#x} ({}), stack: {}", std::thread::current().name().unwrap_or("main"), returns.join(" "));
+                // A crash reason a register may point at (text).
+                for reg in [unicorn_engine::RegisterX86::R8, unicorn_engine::RegisterX86::RAX, unicorn_engine::RegisterX86::RCX, unicorn_engine::RegisterX86::RDX] {
+                    let at = uc.reg_read(reg).unwrap_or(0);
+                    let mut text = vec![0u8; 300];
+                    if at == 0 || uc.mem_read(at, &mut text).is_err() {
+                        continue;
+                    }
+                    let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+                    if end >= 8 && text[..end].iter().all(|&b| (0x20..0x7F).contains(&b) || b == b'\n') {
+                        eprintln!("[eh]   {reg:?} -> {:?}", String::from_utf8_lossy(&text[..end]));
+                    }
+                }
+            }
             abort(
                 &intr_state,
                 uc,
