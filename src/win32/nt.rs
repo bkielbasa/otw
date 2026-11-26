@@ -573,6 +573,9 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(0)
         }
         "RtlWakeAllConditionVariable" | "RtlWakeConditionVariable" | "WakeByAddressAll" | "WakeByAddressSingle" => {
+            if trace_address() == Some(p(0)) {
+                eprintln!("[addr] {name} {:#x} by thread {} value {:x?}", p(0), memory.current_thread(), memory.read_bytes(p(0), 4));
+            }
             crate::win32::sync::wake(ctx, p(0), name.ends_with("All") || name == "RtlWakeAllConditionVariable");
             ok(0)
         }
@@ -626,6 +629,9 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             // The thread waits until the value changes (WakeByAddress* need
             // do nothing: the waiting thread looks at the value).
             let expected = memory.read_bytes(compare, length).unwrap_or_default();
+            if trace_address() == Some(address) {
+                eprintln!("[addr] WaitOnAddress {address:#x} by thread {} expecting {expected:x?} now {:x?}", memory.current_thread(), memory.read_bytes(address, length));
+            }
             if memory.read_bytes(address, length).unwrap_or_default() != expected {
                 return ok(1);
             }
@@ -1507,4 +1513,10 @@ pub fn ntdll_exports<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M) 
     // The export data directory of the optional header (PE32+ at 0x98).
     let _ = memory.write_u32(BASE + 0x98 + 112, directory);
     let _ = memory.write_u32(BASE + 0x98 + 116, strings - directory);
+}
+
+/// OTW_TRACE_ADDRESS=0x...: trace waits and wakes on that address.
+fn trace_address() -> Option<u32> {
+    static ADDRESS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *ADDRESS.get_or_init(|| std::env::var("OTW_TRACE_ADDRESS").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
 }
