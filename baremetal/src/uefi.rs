@@ -127,13 +127,6 @@ pub struct MemoryDescriptor {
     pub attribute: u64,
 }
 
-/// Memory free for the kernel once boot services have ended.
-pub fn is_usable(kind: u32) -> bool {
-    // 7: conventional memory. Not 1/2 (this image), 4 (boot services data:
-    // the kernel's stack), or 3 (boot services code: free, but the
-    // firmware's page tables keep it read-only until the kernel has its own).
-    kind == 7
-}
 
 /// Print on the firmware console (before ExitBootServices).
 pub unsafe fn print(system: *mut SystemTable, text: &str) {
@@ -156,4 +149,27 @@ pub unsafe fn print(system: *mut SystemTable, text: &str) {
     }
     buffer[n] = 0;
     ((*out).output_string)(out, buffer.as_ptr());
+}
+
+const ACPI_20_GUID: [u8; 16] = [0x71, 0xe8, 0x68, 0x88, 0xf1, 0xe4, 0xd3, 0x11, 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81];
+const ACPI_10_GUID: [u8; 16] = [0x30, 0x2d, 0x9d, 0xeb, 0x88, 0x2d, 0xd3, 0x11, 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d];
+
+/// The ACPI root pointer from the configuration table (2.0 preferred).
+pub unsafe fn find_acpi(system: *mut SystemTable) -> u64 {
+    let count = (*system).number_of_table_entries;
+    let table = (*system).configuration_table as *const u8;
+    let mut found = 0;
+    for i in 0..count {
+        // Each entry: a GUID (16 bytes) and a pointer.
+        let entry = table.add(i * 24);
+        let guid = core::slice::from_raw_parts(entry, 16);
+        let pointer = core::ptr::read_unaligned(entry.add(16) as *const u64);
+        if guid == ACPI_20_GUID {
+            return pointer;
+        }
+        if guid == ACPI_10_GUID {
+            found = pointer;
+        }
+    }
+    found
 }

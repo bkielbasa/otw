@@ -23,10 +23,10 @@ make run TARGET=path/to/PROGRAM.EXE FEATURES=display ARGS="--run --window"
 
 ## Boot it on bare metal
 
-`baremetal/` is OTW's own kernel: a UEFI machine boots it with no other operating system underneath. So far it brings up the screen, memory, PS/2 keyboard and mouse, and the desktop; running programs on it is the work in progress.
+`baremetal/` is OTW's own kernel: a UEFI machine boots it with no other operating system underneath. It brings up its own CPU tables, interrupts and page tables, all CPUs, the timer, PS/2 keyboard and mouse, NVMe and SATA (AHCI) disks, and reads drive C: (a FAT32 partition named `OTW-C`, filled from `~/.otw/C` when the image is built). Running programs on it is the work in progress.
 
 ```sh
-make image      # build target/os/otw.img (about 40 MB)
+make image      # build target/os/otw.img (40 MB, plus drive C:)
 make os         # boot it in QEMU
 ```
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build target/os/otw.img: a bootable (UEFI) disk image of OTW running on
 # the machine by itself (baremetal/: no other operating system underneath).
+# Drive C: is a second partition (OTW-C) filled from OTW_DRIVE_C (default
+# ~/.otw/C); OTW_DRIVE_C= (empty) leaves it out.
 # Write it to a USB stick or disk for a real machine
 # (sudo dd if=target/os/otw.img of=/dev/sdX bs=4M conv=fsync status=progress)
 # and boot it with UEFI and Secure Boot off; or try it with `make os`.
@@ -17,5 +19,10 @@ rm -rf "$ESP"
 mkdir -p "$ESP/EFI/BOOT"
 cp "$ROOT/baremetal/target/x86_64-unknown-uefi/release/otw-kernel.efi" "$ESP/EFI/BOOT/BOOTX64.EFI"
 
+partitions=("esp:OTW:40:$ESP")
+DRIVE_C="${OTW_DRIVE_C-$HOME/.otw/C}"
+if [[ -n "$DRIVE_C" && -d "$DRIVE_C" ]]; then
+  partitions+=("data:OTW-C:auto:$DRIVE_C")
+fi
 echo "==> making the disk"
-python3 -I "$ROOT/scripts/make-disk.py" "$OUT/otw.img" "esp:OTW:40:$ESP"
+python3 -I "$ROOT/scripts/make-disk.py" "$OUT/otw.img" "${partitions[@]}"

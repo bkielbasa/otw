@@ -4,6 +4,8 @@
 // this list; `tests/layering.rs` checks the rule.
 
 /// The host side: the window the desktop is drawn in.
+extern crate alloc;
+
 pub mod host;
 /// The OTW kernel: processes and their CPU, scheduling, the guest address
 /// space, PE loading and structured exception dispatch.

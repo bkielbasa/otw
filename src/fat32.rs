@@ -4,8 +4,41 @@
 //! image: what directories exist, what is in a directory, and how to read a
 //! file's cluster chain. This module implements only that surface. It does not
 //! write, mount through the host kernel, or emulate the Win32 file APIs.
+//!
+//! It needs only `core` and `alloc`: the bare-metal kernel (`baremetal/`)
+//! builds it too, over a disk instead of an image in memory (`Volume`).
 
-use std::collections::HashSet;
+use alloc::{
+    collections::BTreeSet,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
+
+/// Where a volume's bytes come from: an image in memory, or a disk.
+pub trait Volume: Send + Sync {
+    /// The volume's size in bytes.
+    fn size(&self) -> u64;
+    /// Fill `buffer` from `offset`.
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), Fat32Error>;
+}
+
+impl Volume for Vec<u8> {
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), Fat32Error> {
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .filter(|&end| end <= self.len() as u64)
+            .ok_or(Fat32Error::OutOfBounds(offset, buffer.len()))?;
+        buffer.copy_from_slice(&self[offset as usize..end as usize]);
+        Ok(())
+    }
+}
 
 const DIR_ENTRY_SIZE: usize = 32;
 const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
@@ -25,8 +58,8 @@ pub enum Fat32Error {
     InvalidFileSize(u32),
 }
 
-impl std::fmt::Display for Fat32Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Fat32Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::ImageTooSmall => write!(f, "FAT32 image is smaller than one boot sector"),
             Self::InvalidBootSector(message) => write!(f, "invalid FAT32 boot sector: {message}"),
@@ -47,7 +80,7 @@ impl std::fmt::Display for Fat32Error {
     }
 }
 
-impl std::error::Error for Fat32Error {}
+impl core::error::Error for Fat32Error {}
 
 /// One decoded directory entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,11 +104,11 @@ struct LfnSlot {
     chars: [u16; 13],
 }
 
-/// A parsed, read-only FAT32 volume. The raw image is owned so host-side UI
+/// A parsed, read-only FAT32 volume. The volume is shared so host-side UI
 /// can keep it alive without borrowing from a temporary buffer.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Fat32FileSystem {
-    image: Vec<u8>,
+    volume: Arc<dyn Volume>,
     bytes_per_sector: u32,
     sectors_per_cluster: u32,
     reserved_sectors: u32,
@@ -88,11 +121,27 @@ pub struct Fat32FileSystem {
     volume_label: String,
 }
 
+impl core::fmt::Debug for Fat32FileSystem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Fat32FileSystem")
+            .field("volume_label", &self.volume_label)
+            .field("total_sectors", &self.total_sectors)
+            .finish()
+    }
+}
+
 impl Fat32FileSystem {
+    /// A volume whose image is in memory.
     pub fn new(image: Vec<u8>) -> Result<Self, Fat32Error> {
-        if image.len() < 512 {
+        Self::from_volume(Arc::new(image))
+    }
+
+    pub fn from_volume(volume: Arc<dyn Volume>) -> Result<Self, Fat32Error> {
+        if volume.size() < 512 {
             return Err(Fat32Error::ImageTooSmall);
         }
+        let mut image = vec![0u8; 512];
+        volume.read_at(0, &mut image)?;
         if image[510] != 0x55 || image[511] != 0xaa {
             return Err(Fat32Error::InvalidBootSector(
                 "missing 0x55aa signature".to_string(),
@@ -180,10 +229,10 @@ impl Fat32FileSystem {
         }
 
         let required_len = total_sectors as u64 * bytes_per_sector as u64;
-        if (image.len() as u64) < required_len {
+        if volume.size() < required_len {
             return Err(Fat32Error::InvalidBootSector(format!(
                 "image has {} bytes but the volume declares {required_len}",
-                image.len()
+                volume.size()
             )));
         }
 
@@ -196,7 +245,7 @@ impl Fat32FileSystem {
         let volume_label = String::from_utf8_lossy(&label_bytes).trim_end().to_string();
 
         Ok(Self {
-            image,
+            volume,
             bytes_per_sector,
             sectors_per_cluster,
             reserved_sectors,
@@ -242,14 +291,10 @@ impl Fat32FileSystem {
         self.root_cluster
     }
 
-    fn slice(&self, offset: u64, len: usize) -> Result<&[u8], Fat32Error> {
-        let end = offset
-            .checked_add(len as u64)
-            .ok_or(Fat32Error::OutOfBounds(offset, len))?;
-        if end > self.image.len() as u64 {
-            return Err(Fat32Error::OutOfBounds(offset, len));
-        }
-        Ok(&self.image[offset as usize..end as usize])
+    fn slice(&self, offset: u64, len: usize) -> Result<Vec<u8>, Fat32Error> {
+        let mut buffer = vec![0u8; len];
+        self.volume.read_at(offset, &mut buffer)?;
+        Ok(buffer)
     }
 
     fn cluster_offset(&self, cluster: u32) -> Result<u64, Fat32Error> {
@@ -267,7 +312,7 @@ impl Fat32FileSystem {
         }
         let offset =
             self.reserved_sectors as u64 * self.bytes_per_sector as u64 + cluster as u64 * 4;
-        Ok(u32::from_le_bytes(self.slice(offset, 4)?.try_into().unwrap()) & END_OF_CHAIN)
+        Ok(u32::from_le_bytes(self.slice(offset, 4)?[..4].try_into().unwrap()) & END_OF_CHAIN)
     }
 
     fn next_cluster(&self, cluster: u32) -> Result<Option<u32>, Fat32Error> {
@@ -280,7 +325,7 @@ impl Fat32FileSystem {
             return Err(Fat32Error::InvalidCluster(start));
         }
         let mut chain = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         let mut current = start;
         loop {
             if current < 2 || current >= self.cluster_count + 2 {
@@ -297,7 +342,7 @@ impl Fat32FileSystem {
         }
     }
 
-    fn read_cluster(&self, cluster: u32) -> Result<&[u8], Fat32Error> {
+    fn read_cluster(&self, cluster: u32) -> Result<Vec<u8>, Fat32Error> {
         let offset = self.cluster_offset(cluster)?;
         let len = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
         self.slice(offset, len)
@@ -320,7 +365,7 @@ impl Fat32FileSystem {
             return Err(Fat32Error::IsADirectory(entry.name.clone()));
         }
         let size = entry.size as usize;
-        if size > self.image.len() {
+        if size as u64 > self.volume.size() {
             return Err(Fat32Error::InvalidFileSize(entry.size));
         }
         let mut contents = Vec::with_capacity(size);
@@ -528,7 +573,8 @@ fn short_name_checksum(name: &[u8]) -> u8 {
 fn build_long_name(slots: &[Option<LfnSlot>], len: usize, short_name: &[u8]) -> Option<String> {
     let checksum = short_name_checksum(short_name);
     let mut units = Vec::new();
-    for slot in slots.iter().take(len).rev() {
+    // Slot i holds characters 13 * i onwards.
+    for slot in slots.iter().take(len) {
         let slot = slot.as_ref()?;
         if slot.checksum != checksum {
             return None;
@@ -667,6 +713,11 @@ mod tests {
         let readme_short = name11("README~1TXT");
         lfn_entry(&mut image, 3, 2, "readme.txt", &readme_short, 1, 1);
         short_entry(&mut image, 3, 3, &readme_short, 0x20, 6, 3);
+        // A long name in two parts (the last part's entry comes first).
+        let long_short = name11("ALONGF~1TXT");
+        lfn_entry(&mut image, 3, 4, "ame.txt", &long_short, 2, 2);
+        lfn_entry(&mut image, 3, 5, "a long file n", &long_short, 1, 2);
+        short_entry(&mut image, 3, 6, &long_short, 0x20, 6, 3);
 
         let first: Vec<u8> = (0..512).map(|index| (index % 251) as u8).collect();
         let second: Vec<u8> = (0..88).map(|index| (index % 97) as u8).collect();
@@ -675,6 +726,14 @@ mod tests {
         image[cluster_offset_for_test(6)..cluster_offset_for_test(6) + 3].copy_from_slice(b"ok\n");
 
         image
+    }
+
+    #[test]
+    fn long_names_in_several_entries() {
+        let fs = Fat32FileSystem::new(test_image()).unwrap();
+        let names: Vec<String> = fs.list("Documents").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "a long file name.txt"), "{names:?}");
+        assert_eq!(fs.read_file("Documents/a long file name.txt").unwrap(), b"ok\n");
     }
 
     #[test]

@@ -25,7 +25,8 @@ MIB = 1024 * 1024
 # ── FAT32 ──
 
 class Fat32:
-    def __init__(self, size_bytes, label):
+    def __init__(self, size_bytes, label, out, offset):
+        self.out, self.offset = out, offset
         self.sectors = size_bytes // SECTOR
         # Clusters must number at least 65525 for FAT32.
         for spc in (1, 2, 4, 8, 16, 32, 64):
@@ -42,7 +43,6 @@ class Fat32:
         self.cluster_bytes = spc * SECTOR
         self.label = label.upper()[:11].ljust(11).encode("ascii")
         self.fat = [0x0FFFFFF8, 0x0FFFFFFF]
-        self.data = {}  # cluster -> bytes (only clusters written)
         self.next_cluster = 2
 
     def allocate(self, nbytes):
@@ -57,10 +57,9 @@ class Fat32:
         return first
 
     def write_chain(self, first, payload):
-        for i in range(0, max(len(payload), 1), self.cluster_bytes):
-            chunk = payload[i:i + self.cluster_bytes]
-            if chunk.strip(b"\0"):
-                self.data[first + i // self.cluster_bytes] = chunk
+        """Write `payload` to its (contiguous) clusters, straight to the disk."""
+        self.out.seek(self.offset + (self.data_start + (first - 2) * self.spc) * SECTOR)
+        self.out.write(payload)
 
     def boot_sector(self, volume_id):
         b = bytearray(SECTOR)
@@ -82,7 +81,8 @@ class Fat32:
         b[510:512] = b"\x55\xAA"
         return bytes(b)
 
-    def write_to(self, out, offset):
+    def finish(self):
+        out, offset = self.out, self.offset
         volume_id = int.from_bytes(os.urandom(4), "little")
         boot = self.boot_sector(volume_id)
         for base in (0, 6):
@@ -95,9 +95,6 @@ class Fat32:
         for copy in range(2):
             out.seek(offset + (self.reserved + copy * self.fat_sectors) * SECTOR)
             out.write(fat)
-        for cluster, chunk in self.data.items():
-            out.seek(offset + (self.data_start + (cluster - 2) * self.spc) * SECTOR)
-            out.write(chunk)
 
 
 def short_name(name, taken):
@@ -167,7 +164,7 @@ def fill(fat, directory, cluster=None, parent=0):
             children.append((name, 0x20, path, os.path.getsize(path)))
     # Room for this directory's records: allocate before the children so
     # its cluster number is known to them ("..").
-    estimate = 32 * (2 + sum(1 + (len(n) + 12) // 13 for n, *_ in children)) + 32
+    estimate = 32 * (3 + sum(1 + (len(n.encode("utf-16-le")) // 2 + 13) // 13 for n, *_ in children))
     if cluster is None:
         cluster = fat.allocate(estimate)
     entries = [] if parent == 0 and cluster == 2 else [(".", 0x10, cluster, 0), ("..", 0x10, parent, 0)]
@@ -179,7 +176,7 @@ def fill(fat, directory, cluster=None, parent=0):
             first = fat.allocate(size) if size else 0
             if size:
                 with open(path, "rb") as f:
-                    fat.write_chain(first, f.read())
+                    fat.write_chain(first, f.read())  # one file at a time
             entries.append((name, 0x20, first, size))
     records = directory_entries(entries)
     if parent == 0 and cluster == 2:
@@ -253,9 +250,9 @@ def main():
     with open(output, "wb") as out:
         out.truncate(total_sectors * SECTOR)
         for kind, label, start, end, directory in layout:
-            fat = Fat32((end - start + 1) * SECTOR, label)
+            fat = Fat32((end - start + 1) * SECTOR, label, out, start * SECTOR)
             fill(fat, directory)
-            fat.write_to(out, start * SECTOR)
+            fat.finish()
         gpt(out, total_sectors, [(k, l, s, e) for k, l, s, e, _ in layout])
     print(f"wrote {output} ({total_sectors * SECTOR // MIB} MiB)")
 

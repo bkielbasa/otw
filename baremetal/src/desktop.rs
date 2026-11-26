@@ -7,7 +7,7 @@ use alloc::string::String;
 use crate::heap::Heap;
 use crate::io::{self, Input};
 use crate::screen::{Screen, BLACK, FACE, NAVY, SHADOW, TEAL, WHITE};
-use crate::BootInfo;
+use crate::System;
 
 const TASKBAR: i32 = 28;
 
@@ -22,7 +22,14 @@ struct State {
     ps2: bool,
 }
 
-pub fn run(info: &BootInfo, heap: &Heap) -> ! {
+pub fn run(system: &System, heap: &Heap) -> ! {
+    let info = &system.info;
+    let drive_c: alloc::vec::Vec<String> = system
+        .drive_c
+        .as_ref()
+        .and_then(|fs| fs.list("").ok())
+        .map(|entries| entries.into_iter().map(|e| if e.is_directory() { format!("{}\\", e.name) } else { e.name }).collect())
+        .unwrap_or_default();
     crate::log!("OTW kernel: desktop");
     let mut screen = Screen::new(info.framebuffer, info.width, info.height, info.stride, info.bgr);
     let ps2 = io::ps2_init();
@@ -44,16 +51,17 @@ pub fn run(info: &BootInfo, heap: &Heap) -> ! {
             dirty |= handle(&mut state, input, &screen);
         }
         let now = io::rtc_time();
-        if now.1 != last_clock.1 || now.0 != last_clock.0 {
+        if now != last_clock {
             last_clock = now;
             dirty = true;
         }
         if dirty {
-            draw(&mut screen, &state, info, heap, now);
+            draw(&mut screen, &state, system, &drive_c, heap, now);
             screen.present();
             dirty = false;
         }
-        core::hint::spin_loop();
+        // Sleep until the next interrupt (the timer, 100 times a second).
+        crate::arch::wait_for_interrupt();
     }
 }
 
@@ -123,26 +131,56 @@ fn click(state: &mut State, screen: &Screen) {
     }
 }
 
-fn draw(screen: &mut Screen, state: &State, info: &BootInfo, heap: &Heap, now: (u8, u8, u8)) {
+fn draw(screen: &mut Screen, state: &State, system: &System, drive_c: &[String], heap: &Heap, now: (u8, u8, u8)) {
+    let info = &system.info;
     let (w, h) = (screen.width as i32, screen.height as i32);
     screen.fill(0, 0, w, h, TEAL);
 
     // A window: what this machine is.
-    let (wx, wy, ww, wh) = (w / 2 - 260, h / 2 - 150, 520, 260);
+    let disk_lines = system.disks.len().max(1);
+    let extra = disk_lines + drive_c.len().min(8).div_ceil(2) + system.notes.len();
+    let (ww, wh) = (720, 330 + 24 * extra as i32);
+    let (wx, wy) = (w / 2 - ww / 2, (h / 2 - wh / 2).max(10));
     screen.fill(wx, wy, ww, wh, FACE);
     screen.bevel(wx, wy, ww, wh, false);
     screen.fill(wx + 3, wy + 3, ww - 6, 20, NAVY);
     screen.text(wx + 8, wy + 6, "Welcome to OTW", WHITE, 2);
-    let lines = [
+    let mut lines = alloc::vec![
         String::from("OTW is running on this machine by itself:"),
         String::from("no other operating system underneath."),
         String::new(),
         format!("Screen      {} x {}", info.width, info.height),
         format!("Memory      {} MiB ({} MiB free)", heap.total() >> 20, heap.free_bytes() >> 20),
+        format!("CPUs        {} running", system.cpus),
+        format!("Up for      {} s", crate::apic::now_us() / 1_000_000),
         format!("Keyboard    {}", if state.ps2 { "PS/2" } else { "none found (USB to come)" }),
-        String::new(),
-        format!("Type here:  {}_", state.typed),
     ];
+    if system.disks.is_empty() {
+        lines.push(String::from("Disks       none found"));
+    }
+    for (i, disk) in system.disks.iter().enumerate() {
+        lines.push(format!("{}{}", if i == 0 { "Disks       " } else { "            " }, disk));
+    }
+    match &system.drive_c {
+        None => lines.push(String::from("Drive C:    not found")),
+        Some(fs) => {
+            lines.push(format!("Drive C:    {} ({} MiB), holding:", fs.volume_label(), fs.total_sectors() as u64 * fs.bytes_per_sector() as u64 >> 20));
+            for row in drive_c.chunks(2).take(4) {
+                let mut line = String::from("            ");
+                for name in row {
+                    let mut name: String = name.chars().take(20).collect();
+                    while name.len() < 22 {
+                        name.push(' ');
+                    }
+                    line.push_str(&name);
+                }
+                lines.push(line);
+            }
+        }
+    }
+    lines.extend(system.notes.iter().cloned());
+    lines.push(String::new());
+    lines.push(format!("Type here:  {}_", state.typed));
     for (i, line) in lines.iter().enumerate() {
         screen.text(wx + 16, wy + 36 + i as i32 * 24, line, BLACK, 2);
     }

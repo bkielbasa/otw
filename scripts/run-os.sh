@@ -2,7 +2,8 @@
 # Boot target/os/otw.img (scripts/build-os-image.sh) in QEMU with UEFI, as a
 # real machine would: the PC's own PS/2 keyboard and mouse, a plain VGA
 # card. The kernel logs to the serial port (VM_SERIAL).
-# Settings: OS_IMAGE, VM_CPUS (8), VM_MEMORY (8G), VM_DISPLAY (gtk; none),
+# Settings: OS_IMAGE, VM_CPUS (8), VM_MEMORY (8G), VM_DISK (nvme; sata),
+# VM_DISPLAY (gtk; none),
 # VM_MONITOR (unix socket for the QEMU monitor), VM_QMP (unix socket for
 # QMP), VM_SERIAL (serial log file).
 set -euo pipefail
@@ -19,6 +20,18 @@ if [[ ! -f "$IMAGE" ]]; then
 fi
 [[ -f "$VARS" ]] || cp "$OVMF_VARS" "$VARS"
 
+# The disk: NVMe (VM_DISK=nvme, as in most new PCs) or SATA (VM_DISK=sata).
+case "${VM_DISK:-nvme}" in
+  sata) disk_args=(-device ide-hd,drive=disk,bus=ide.0,bootindex=0) ;;
+  *) disk_args=(-device nvme,drive=disk,serial=OTW0001,bootindex=0) ;;
+esac
+# KVM where this user may use it; emulated (slower) otherwise.
+if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+  cpu_args=(-machine q35,accel=kvm -cpu host)
+else
+  echo "no access to /dev/kvm: emulating the CPU (slow)" >&2
+  cpu_args=(-machine q35,accel=tcg -cpu max)
+fi
 args=()
 [[ -n "${VM_MONITOR:-}" ]] && args+=(-monitor "unix:$VM_MONITOR,server,nowait")
 [[ -n "${VM_QMP:-}" ]] && args+=(-qmp "unix:$VM_QMP,server,nowait")
@@ -26,13 +39,13 @@ args=()
 
 exec qemu-system-x86_64 \
   -name OTW \
-  -machine q35,accel=kvm \
-  -cpu host \
+  "${cpu_args[@]}" \
   -smp "${VM_CPUS:-8}" \
   -m "${VM_MEMORY:-8G}" \
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
   -drive "if=pflash,format=raw,file=$VARS" \
-  -drive "file=$IMAGE,if=virtio,format=raw" \
+  -drive "file=$IMAGE,if=none,id=disk,format=raw" \
+  "${disk_args[@]}" \
   -nic user,model=virtio-net-pci \
   -vga std \
   -display "${VM_DISPLAY:-gtk}" \
