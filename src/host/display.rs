@@ -888,13 +888,26 @@ impl GuestApp {
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), DisplayError> {
-        let attributes = WindowAttributes::default()
+        let mut attributes = WindowAttributes::default()
             .with_title("OTW Desktop")
             .with_inner_size(winit::dpi::LogicalSize {
                 width: DESKTOP_WIDTH,
                 height: DESKTOP_HEIGHT,
             })
             .with_resizable(true);
+        // OTW_FULLSCREEN=1: the desktop is the whole screen (OTW booted as
+        // the system, scripts/build-os-image.sh). Sized and placed by hand
+        // as well, for X without a window manager, which ignores requests
+        // for full screen.
+        if std::env::var_os("OTW_FULLSCREEN").is_some_and(|v| v != "0") {
+            if let Some(monitor) = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next()) {
+                attributes = attributes
+                    .with_inner_size(monitor.size())
+                    .with_position(monitor.position())
+                    .with_decorations(false);
+            }
+            attributes = attributes.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
         let (window, config, display, not_current) = gl_context(event_loop, attributes)?;
         let (context, surface, gl) = make_current(&window, &config, &display, not_current)?;
         let placeholder = VideoFrame {

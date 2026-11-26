@@ -15,7 +15,7 @@ QEMU_DISPLAY ?= vnc=:1
 # Set to a FAT32 image to browse that image read-only instead.
 DESKTOP_FAT32 ?=
 
-.PHONY: all build run desktop qemu test fmt package clean
+.PHONY: all build run desktop qemu image os test fmt package clean
 
 all: build
 
@@ -36,6 +36,14 @@ desktop:
 
 qemu:
 	QEMU='$(QEMU)' QEMU_DISPLAY='$(QEMU_DISPLAY)' $(ROOT)scripts/run-qemu.sh
+
+# A bootable disk image that starts the OTW desktop (real machines via UEFI,
+# or QEMU with `make os`).
+image:
+	$(ROOT)scripts/build-os-image.sh
+
+os:
+	$(ROOT)scripts/run-os.sh
 
 test:
 	$(CARGO) test $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))")
