@@ -112,7 +112,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(1)
         }
         "VirtualProtect" => {
-            let old = crate::win32::vmem::protect(ctx, args[0], args[1], args[2]).unwrap_or(0x40);
+            let old = crate::win32::vmem::protect(ctx, memory, args[0], args[1], args[2]).unwrap_or(0x40);
             let _ = memory.write_u32(args[3], old);
             ok(1)
         }

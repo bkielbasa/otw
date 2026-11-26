@@ -36,6 +36,8 @@ pub struct State {
     high: BTreeMap<u64, HighRegion>,
     /// The next free 4 GiB slot above the low space, for high reservations.
     next_slot: u64,
+    /// Pages of loaded images whose protection was changed.
+    image_pages: BTreeMap<u32, u32>,
 }
 
 /// A reservation too large for the 4 GiB OTW keeps a process in (the
@@ -164,17 +166,56 @@ pub fn free<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address: 
 }
 
 /// VirtualProtect: the old protection of the first page.
-pub fn protect(ctx: &ApiContext, address: u32, size: u32, protect: u32) -> Option<u32> {
+pub fn protect<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address: u32, size: u32, protect: u32) -> Option<u32> {
+    let first = address & !(PAGE - 1);
+    let end = ((address as u64 + size.max(1) as u64 + PAGE as u64 - 1) & !(PAGE as u64 - 1)).min(u32::MAX as u64) as u32;
+    if find(&ctx.shared.borrow().vmem, address).is_none() {
+        // A loaded image: its pages start with their sections' protection.
+        let old = image_protection(ctx, memory, first)?;
+        let mut shared = ctx.shared.borrow_mut();
+        for page in (first..end).step_by(PAGE as usize) {
+            shared.vmem.image_pages.insert(page, protect);
+        }
+        return Some(old);
+    }
     let mut shared = ctx.shared.borrow_mut();
     let (base, region) = find(&shared.vmem, address)?;
-    let start = ((address & !(PAGE - 1)) - base) / PAGE;
-    let end = (((address as u64 + size.max(1) as u64 + PAGE as u64 - 1) as u32 & !(PAGE - 1)) - base).min(region.size) / PAGE;
+    let start = (first - base) / PAGE;
+    let end = (end - base).min(region.size) / PAGE;
     let old = region.pages.get(start as usize).copied().filter(|&p| p != 0).unwrap_or(region.protect);
     let region = shared.vmem.regions.get_mut(&base)?;
     for page in &mut region.pages[start as usize..end as usize] {
         *page = protect;
     }
     Some(old)
+}
+
+/// The protection of a page of a loaded image: as changed by
+/// `VirtualProtect`, otherwise its section's (read-only for the headers).
+fn image_protection<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, page: u32) -> Option<u32> {
+    if let Some(&protect) = ctx.shared.borrow().vmem.image_pages.get(&page) {
+        return Some(protect);
+    }
+    let base = ctx.modules.borrow().iter().find(|m| page >= m.image_base && page < m.image_base + m.size)?.image_base;
+    let pe = base + memory.read_u32(base + 0x3C)?;
+    let sections = memory.read_u32(pe + 4)? >> 16;
+    let first = pe + 24 + (memory.read_u32(pe + 20)? & 0xFFFF);
+    for index in 0..sections.min(96) {
+        let header = first + index * 40;
+        let size = memory.read_u32(header + 8)?;
+        let start = base + memory.read_u32(header + 12)?;
+        if page >= start && page < start + ((size + PAGE - 1) & !(PAGE - 1)) {
+            let flags = memory.read_u32(header + 36)?;
+            let (execute, write) = (flags & 0x2000_0000 != 0, flags & 0x8000_0000 != 0);
+            return Some(match (execute, write) {
+                (true, true) => 0x40,
+                (true, false) => 0x20,
+                (false, true) => 0x04,
+                (false, false) => 0x02,
+            });
+        }
+    }
+    Some(0x02)
 }
 
 /// MEMORY_BASIC_INFORMATION values for an address: base, allocation base,
@@ -202,8 +243,13 @@ pub fn query<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, address:
     // is free up to the next mapping.
     let mapped = memory.mapped();
     if let Some(&(begin, end)) = mapped.iter().find(|&&(b, e)| page as u64 >= b && page as u64 <= e) {
-        let image = ctx.modules.borrow().iter().any(|m| page >= m.image_base && page < m.image_base + m.size);
-        return [page, begin as u32, 0x40, (end + 1 - page as u64) as u32, MEM_COMMIT, 0x40, if image { MEM_IMAGE } else { MEM_PRIVATE }];
+        let image = ctx.modules.borrow().iter().find(|m| page >= m.image_base && page < m.image_base + m.size).map(|m| m.image_base);
+        if let Some(base) = image {
+            // One page at a time: sections differ in protection.
+            let protect = image_protection(ctx, memory, page).unwrap_or(0x40);
+            return [page, base, 0x80, PAGE, MEM_COMMIT, protect, MEM_IMAGE];
+        }
+        return [page, begin as u32, 0x40, (end + 1 - page as u64) as u32, MEM_COMMIT, 0x40, MEM_PRIVATE];
     }
     let next = mapped.iter().map(|&(b, _)| b).filter(|&b| b > page as u64).min().unwrap_or(0x8000_0000).max(page as u64 + PAGE as u64);
     [page, 0, 0, (next - page as u64).min(u32::MAX as u64) as u32 & !(PAGE - 1), MEM_FREE, 1, 0]
