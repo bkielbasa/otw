@@ -461,7 +461,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             if name.is_empty() {
                 return Some(fail(&mut shared.winsock, WSAEFAULT, count));
             }
+            let started = std::time::Instant::now();
             let addresses = resolve_host(&name);
+            if std::env::var_os("OTW_TRACE_NET").is_some() {
+                eprintln!("[net] gethostbyname {name}: {addresses:?} in {:.0?}", started.elapsed());
+            }
             match build_hostent(&mut shared, memory, &name, &addresses) {
                 Some(va) => ok(&mut shared.winsock, va, count),
                 None => {

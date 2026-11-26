@@ -41,6 +41,14 @@ pub trait SystemCalls {
     fn describe(&self, dll: &str, name: &ImportName) -> String {
         format!("{dll}!{}", name.display())
     }
+
+    /// Machine code to run in place of a system call for a small function
+    /// that needs nothing of the subsystem (a C library leaf such as
+    /// `strlen`), in a 64-bit process: called millions of times, it is far
+    /// faster run by the CPU than dispatched.
+    fn native_x64(&self, _dll: &str, _name: &ImportName) -> Option<&'static [u8]> {
+        None
+    }
 }
 
 /// The arguments of a call: one 64-bit value per argument from 64-bit

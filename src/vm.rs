@@ -55,6 +55,7 @@ impl Vm {
         command_line: String,
     ) -> Result<Self, VmError> {
         win32::crt::prepare_drive();
+        crate::kernel::memory::set_idle_wait(|timeout| win32::kobj::wait_change(win32::kobj::generation(), timeout));
         let image = Image::load(inputs, &command_line, &Win32Imports, &win32::entry_points())?;
         let api_ctx = ApiContext::for_image(&image, shared);
         Ok(Self { image, api_ctx })
@@ -450,6 +451,9 @@ fn start_alongside(parent: &ApiContext, path: &[u8], command_line: &[u8], direct
     let name = String::from_utf8_lossy(path.rsplit(|&b| b == b'\\').next().unwrap_or(&path)).into_owned();
     if std::env::var_os("OTW_TRACE_THREADS").is_some() {
         eprintln!("[process] {name} starts as process {pid:#x} alongside {parent_pid:#x}: {}", String::from_utf8_lossy(&command_line));
+        for entry in options.environment.iter().flatten().filter(|e| e.starts_with("MOZ_") || e.starts_with("XRE_")) {
+            eprintln!("[process]   {entry}");
+        }
     }
     std::thread::Builder::new()
         .name(format!("{name} {pid:#x}"))
@@ -473,8 +477,12 @@ fn start_alongside(parent: &ApiContext, path: &[u8], command_line: &[u8], direct
                     if !directory.is_empty() {
                         shared.borrow_mut().current_dir = directory.clone();
                     }
-                    while win32::kobj::with(|k| k.processes.get(&pid).is_some_and(|p| p.suspended && p.exit.is_none())) {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    loop {
+                        let generation = win32::kobj::generation();
+                        if !win32::kobj::with(|k| k.processes.get(&pid).is_some_and(|p| p.suspended && p.exit.is_none())) {
+                            break;
+                        }
+                        win32::kobj::wait_change(generation, std::time::Duration::from_millis(50));
                     }
                     match vm.run() {
                         Ok(result) => result.exit_code,
@@ -498,6 +506,7 @@ fn start_alongside(parent: &ApiContext, path: &[u8], command_line: &[u8], direct
                 }
                 k.close_all(pid);
             });
+            win32::kobj::notify();
         })
         .map_err(|error| error.to_string())?;
     Ok(pid)

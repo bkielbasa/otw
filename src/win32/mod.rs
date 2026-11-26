@@ -1179,6 +1179,14 @@ impl SystemCalls for ApiContext {
         x64::arg_count(self, &dll, &name)
     }
 
+    fn native_x64(&self, dll: &str, name: &ImportName) -> Option<&'static [u8]> {
+        let (dll, name) = self.resolve(dll, name)?;
+        if !is_ucrt(api_set_host(&dll).unwrap_or(&dll)) {
+            return None;
+        }
+        ucrt::native_x64(name.as_str()?)
+    }
+
     fn describe(&self, dll: &str, name: &ImportName) -> String {
         match self.resolve(dll, name) {
             Some((dll, name)) => format!("{dll}!{}", name.display()),

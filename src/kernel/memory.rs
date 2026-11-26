@@ -76,6 +76,22 @@ impl Drop for SharedMemory {
     }
 }
 
+/// How a process with nothing to do waits: the subsystem may wake it
+/// early when another process does something it may wait for.
+static IDLE_WAIT: std::sync::OnceLock<fn(std::time::Duration)> = std::sync::OnceLock::new();
+
+pub fn set_idle_wait(wait: fn(std::time::Duration)) {
+    let _ = IDLE_WAIT.set(wait);
+}
+
+/// Wait up to `timeout` with nothing to do.
+pub fn idle_wait(timeout: std::time::Duration) {
+    match IDLE_WAIT.get() {
+        Some(wait) => wait(timeout),
+        None => std::thread::sleep(timeout),
+    }
+}
+
 /// What became of a thread given the CPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadRun {

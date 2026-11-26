@@ -322,6 +322,11 @@ pub fn call(
     if dll.eq_ignore_ascii_case("dwrite.dll") {
         return crate::win32::dwrite::call(ctx, memory, by_name(name)?, args);
     }
+    if crate::win32::sync::preempt(ctx, memory) {
+        // The thread comes off the CPU; the call is made again when it
+        // next runs.
+        return Some(ApiOutcome::wide(0, count));
+    }
     crate::win32::ipc::adopt_files(ctx, &args[..count.min(args.len())]);
     if let Some(outcome) = by_name(name).and_then(|text| crate::win32::ipc::call(ctx, memory, text, args)) {
         return Some(outcome);

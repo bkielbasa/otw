@@ -1261,7 +1261,7 @@ impl GuestMemory for UnicornGuestMemory<'_, '_, '_, '_> {
             pump(block);
             run.borrow_mut().pump = Some(pump);
         } else if block {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            memory::idle_wait(std::time::Duration::from_millis(10));
         }
     }
 
@@ -1788,6 +1788,34 @@ fn build<'a>(
         .map_err(|error| RunError::Unicorn("mapping IAT thunks", error))?;
     uc.mem_write(THUNK_BASE as u64, &vec![0xC3; thunk_size as usize])
         .map_err(|error| RunError::Unicorn("writing IAT thunks", error))?;
+    if x64 {
+        // Leaf functions the subsystem has machine code for are bound to
+        // that code, after the thunks (outside the range calls are caught in).
+        let mut code = Vec::new();
+        let mut bindings = Vec::new();
+        let mut placed: std::collections::HashMap<&'static [u8], u32> = std::collections::HashMap::new();
+        for entry in iat.entries.iter().filter(|entry| entry.slot_va != 0) {
+            let Some(native) = syscalls.native_x64(&entry.dll, &entry.name) else {
+                continue;
+            };
+            let at = *placed.entry(native).or_insert_with(|| {
+                let at = thunk_end + code.len() as u32;
+                code.extend_from_slice(native);
+                code.resize((code.len() + 15) & !15, 0xCC);
+                at
+            });
+            bindings.push((entry.slot_va, at));
+        }
+        if !code.is_empty() {
+            uc.mem_map(thunk_end as u64, align_up(code.len() as u32, PAGE_SIZE) as u64, Prot::ALL)
+                .and_then(|()| uc.mem_write(thunk_end as u64, &code))
+                .map_err(|error| RunError::Unicorn("writing native leaf functions", error))?;
+            for (slot, at) in bindings {
+                uc.mem_write(slot as u64, &(at as u64).to_le_bytes())
+                    .map_err(|error| RunError::Unicorn("binding native leaf functions", error))?;
+            }
+        }
+    }
 
     if !x64 {
         init_win95_state(process, &mut uc)?;
@@ -1842,6 +1870,8 @@ fn build<'a>(
         .filter(|v| v != "1")
         .map(|v| v.split(',').map(|n| n.trim().to_string()).collect());
     let trace_api = std::env::var_os("OTW_TRACE_API").is_some();
+    // OTW_STACK_AT=Name,...: a rough backtrace at each call of those.
+    let stack_at = std::env::var("OTW_STACK_AT").ok();
     let trace_results = std::env::var_os("OTW_TRACE_RESULTS").is_some();
     let trace_code = std::env::var_os("OTW_TRACE_CODE").is_some();
     let code_trace = Rc::new(RefCell::new(VecDeque::<String>::new()));
@@ -2033,6 +2063,9 @@ fn build<'a>(
             }
             let args: Vec<u32> = wide_args.iter().map(|&value| value as u32).collect();
 
+            if stack_at.as_deref().is_some_and(|names| names.split(',').any(|n| thunk_calls.describe(&entry.dll, &entry.name).ends_with(&format!("!{n}")))) {
+                eprintln!("[stack] {}: {}", thunk_calls.describe(&entry.dll, &entry.name), stack_returns(uc));
+            }
             let traced = trace_api
                 && trace_filter.as_ref().is_none_or(|names| {
                     let described = thunk_calls.describe(&entry.dll, &entry.name);
@@ -2048,6 +2081,7 @@ fn build<'a>(
                 );
             }
 
+            let stats_started = api_stats::enabled().then(std::time::Instant::now);
             let outcome = {
                 let mut memory = UnicornGuestMemory {
                     uc,
@@ -2067,6 +2101,9 @@ fn build<'a>(
                     thunk_calls.call(&mut memory, &entry.dll, &entry.name, &call_args, return_address)
                 }
             };
+            if let Some(started) = stats_started {
+                api_stats::record(&thunk_calls.describe(&entry.dll, &entry.name), started.elapsed());
+            }
             // A nested guest callback may have exited the process or faulted.
             {
                 let state = thunk_state.borrow();
@@ -2319,27 +2356,8 @@ fn build<'a>(
             if std::env::var_os("OTW_TRACE_FAULTS").is_some() && intr_state.borrow().x64 {
                 // Where it came from: the stack's words that look like
                 // return addresses into mapped code.
-                let rsp = uc.reg_read(unicorn_engine::RegisterX86::RSP).unwrap_or(0);
-                let mut stack = vec![0u8; 0x800];
-                let _ = uc.mem_read(rsp, &mut stack);
-                let regions: Vec<(u64, u64)> = uc.mem_regions().map(|r| r.iter().map(|r| (r.begin, r.end)).collect()).unwrap_or_default();
-                let mut returns = Vec::new();
-                for word in stack.chunks_exact(8) {
-                    let value = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
-                    if value > 0x40_0000 && value < 0x1_0000_0000 && regions.iter().any(|&(b, e)| value >= b && value <= e) {
-                        let mut before = [0u8; 6];
-                        // A call ends just before a return address.
-                        if uc.mem_read(value - 6, &mut before).is_ok()
-                            && (before[1] == 0xE8 || before[0] == 0xFF || before[4] == 0xFF)
-                        {
-                            returns.push(format!("{value:#x}"));
-                        }
-                    }
-                    if returns.len() >= 12 {
-                        break;
-                    }
-                }
-                eprintln!("[eh] int {intno} at {eip:#x} ({}), stack: {}", std::thread::current().name().unwrap_or("main"), returns.join(" "));
+                let returns = stack_returns(uc);
+                eprintln!("[eh] int {intno} at {eip:#x} ({}), stack: {}", std::thread::current().name().unwrap_or("main"), returns);
                 // A crash reason a register may point at (text).
                 for reg in [unicorn_engine::RegisterX86::R8, unicorn_engine::RegisterX86::RAX, unicorn_engine::RegisterX86::RCX, unicorn_engine::RegisterX86::RDX] {
                     let at = uc.reg_read(reg).unwrap_or(0);
@@ -2448,4 +2466,71 @@ fn build<'a>(
         entry: image.entry_va(),
         started: false,
     })
+}
+
+/// OTW_STATS=1: how long API calls take, by function (including the guest
+/// code they call back and their waits), printed now and then.
+mod api_stats {
+    use std::{cell::RefCell, collections::HashMap, time::{Duration, Instant}};
+
+    thread_local! {
+        static STATS: RefCell<(HashMap<String, (u64, Duration)>, Option<Instant>, Option<Instant>)> =
+            RefCell::new((HashMap::new(), None, None));
+    }
+
+    pub fn enabled() -> bool {
+        thread_local! {
+            static ON: bool = std::env::var_os("OTW_STATS").is_some();
+        }
+        ON.with(|on| *on)
+    }
+
+    pub fn record(name: &str, took: Duration) {
+        STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            let entry = stats.0.entry(name.to_string()).or_default();
+            entry.0 += 1;
+            entry.1 += took;
+            let begun = *stats.2.get_or_insert_with(Instant::now);
+            let last = *stats.1.get_or_insert_with(Instant::now);
+            if last.elapsed() >= Duration::from_secs(15) {
+                stats.1 = Some(Instant::now());
+                let mut rows: Vec<(&String, &(u64, Duration))> = stats.0.iter().collect();
+                rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+                let calls: u64 = stats.0.values().map(|v| v.0).sum();
+                eprintln!(
+                    "[stats] {} after {:.0?}: {calls} calls",
+                    std::thread::current().name().unwrap_or("main"),
+                    begun.elapsed()
+                );
+                for (name, (count, total)) in rows.into_iter().take(12) {
+                    eprintln!("[stats]   {name:<36} {count:>9} calls {total:>10.2?}");
+                }
+            }
+        });
+    }
+}
+
+/// The words on the stack that look like return addresses into mapped
+/// code (a rough backtrace for diagnostics).
+fn stack_returns(uc: &Unicorn<'_, ()>) -> String {
+    let rsp = uc.reg_read(unicorn_engine::RegisterX86::RSP).unwrap_or(0);
+    let mut stack = vec![0u8; 0x1000];
+    let _ = uc.mem_read(rsp, &mut stack);
+    let regions: Vec<(u64, u64)> = uc.mem_regions().map(|r| r.iter().map(|r| (r.begin, r.end)).collect()).unwrap_or_default();
+    let mut returns = Vec::new();
+    for word in stack.chunks_exact(8) {
+        let value = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+        if value > 0x40_0000 && value < 0x1_0000_0000 && regions.iter().any(|&(b, e)| value >= b && value <= e) {
+            let mut before = [0u8; 6];
+            // A call ends just before a return address.
+            if uc.mem_read(value - 6, &mut before).is_ok() && (before[1] == 0xE8 || before[0] == 0xFF || before[4] == 0xFF) {
+                returns.push(format!("{value:#x}"));
+            }
+        }
+        if returns.len() >= 16 {
+            break;
+        }
+    }
+    returns.join(" ")
 }

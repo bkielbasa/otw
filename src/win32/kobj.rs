@@ -245,3 +245,33 @@ pub fn known_process(pid: u32) -> bool {
 pub fn terminated(pid: u32) -> bool {
     pid != 1 && with(|k| k.processes.get(&pid).is_some_and(|p| p.terminated))
 }
+
+/// A count of changes other processes may wait for (data written to a
+/// pipe, a pipe closed, a process resumed or ended), so that a process
+/// with nothing to do sleeps until one comes rather than for a fixed time.
+fn changes() -> &'static (Mutex<u64>, std::sync::Condvar) {
+    static CHANGES: OnceLock<(Mutex<u64>, std::sync::Condvar)> = OnceLock::new();
+    CHANGES.get_or_init(|| (Mutex::new(0), std::sync::Condvar::new()))
+}
+
+/// Note a change and wake the processes waiting for one.
+pub fn notify() {
+    let (count, condvar) = changes();
+    *count.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+    condvar.notify_all();
+}
+
+/// The change count now.
+pub fn generation() -> u64 {
+    *changes().0.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Sleep until there was a change since `since`, or for `timeout`.
+pub fn wait_change(since: u64, timeout: std::time::Duration) {
+    let (count, condvar) = changes();
+    let guard = count.lock().unwrap_or_else(|p| p.into_inner());
+    if *guard != since {
+        return;
+    }
+    let _ = condvar.wait_timeout_while(guard, timeout, |now| *now == since);
+}

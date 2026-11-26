@@ -89,10 +89,18 @@ pub fn arg_count(name: &str) -> Option<usize> {
 }
 
 fn pipe_name(memory: &mut dyn GuestMemory, va: u32) -> Option<String> {
+    pipe_name_in(memory, va, true)
+}
+
+fn pipe_name_in(memory: &mut dyn GuestMemory, va: u32, wide: bool) -> Option<String> {
     if va == 0 {
         return None;
     }
-    let name = String::from_utf16_lossy(&crate::win32::unicode::read_wstr(memory, va));
+    let name = if wide {
+        String::from_utf16_lossy(&crate::win32::unicode::read_wstr(memory, va))
+    } else {
+        String::from_utf8_lossy(&crate::win32::read_cstr(memory, va)).into_owned()
+    };
     let lower = name.to_ascii_lowercase();
     (lower.starts_with("\\\\.\\pipe\\") || lower.starts_with("\\\\?\\pipe\\")).then_some(lower)
 }
@@ -307,9 +315,9 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
     let ours = |handle: u32| kobj::with(|k| k.owns(me, handle));
     match name {
         // ── Pipes ──
-        "CreateNamedPipeW" => {
+        "CreateNamedPipeW" | "CreateNamedPipeA" => {
             // (name, open mode, pipe mode, instances, out size, in size, timeout, attributes)
-            let Some(pipe_name) = pipe_name(memory, p(0)) else {
+            let Some(pipe_name) = pipe_name_in(memory, p(0), name.ends_with('W')) else {
                 return fail(123, u32::MAX as u64);
             };
             let first = p(1) & 0x8_0000 != 0;
@@ -347,6 +355,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             if inherits(memory, p(3)) {
                 kobj::with(|k| k.set_inheritable(me, handle, true));
             }
+            kobj::notify();
             if trace(ctx) {
                 eprintln!("[ipc {me}] open pipe {pipe_name} = {handle:#x}");
             }
@@ -464,6 +473,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             let Some(written) = written else {
                 return fail(ERROR_NO_DATA, 0);
             };
+            kobj::notify();
             if p(3) != 0 {
                 let _ = memory.write_u32(p(3), written);
             }
@@ -669,6 +679,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 shared.ipc.skip_on_success.remove(&p(0));
             }
             kobj::with(|k| k.close(me, p(0)));
+            kobj::notify();
             {
                 let mut shared = ctx.shared.borrow_mut();
                 shared.files.remove(&p(0));
@@ -831,6 +842,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                     process.exit.get_or_insert(p(1));
                 }
             });
+            kobj::notify();
             ok(1)
         }
         _ => None,

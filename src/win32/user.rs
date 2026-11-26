@@ -3507,7 +3507,8 @@ fn advance_timed_script<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &M) {
 /// `m 100 120; d; m 200 220; u; k 65 a; w 2; s /tmp/shot.ppm`:
 /// `t n` waits n seconds (and goes on even while the program is busy),
 /// `m x y` move, `d`/`u` left button, `rd`/`ru` right button, `k vk [ch]`
-/// key press and release, `w n` wait n idle rounds, `s path` screenshot.
+/// key press and release, `w n` wait n idle rounds, `s path` screenshot,
+/// `q` end OTW (every program) at once.
 /// Returns true if an event was fed.
 pub fn feed_script(ctx: &ApiContext) -> bool {
     let mut shared = ctx.shared.borrow_mut();
@@ -3607,6 +3608,13 @@ pub fn feed_script(ctx: &ApiContext) -> bool {
             drop(shared);
             write_screenshot(ctx, &path);
             return true;
+        }
+        "q" => {
+            // End OTW itself, with every program (a headless run done).
+            drop(shared);
+            crate::win32::registry::flush();
+            eprintln!("[script] quit");
+            std::process::exit(0);
         }
         _ => {}
     }

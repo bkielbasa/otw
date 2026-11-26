@@ -3195,3 +3195,64 @@ mod tests {
         assert_eq!(text, ["prog.exe", "a b", "c\"d", "e\\\\"]);
     }
 }
+
+/// Machine code for C library leaves that 64-bit programs call in hot
+/// loops (Firefox's software renderer calls `floorf` per pixel): run by the
+/// CPU instead of dispatched. The x64 convention: arguments in RCX, RDX,
+/// R8 (XMM0 for floating point), the result in RAX or XMM0.
+pub fn native_x64(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        // roundss/roundsd xmm0, xmm0, mode (9 floor, 10 ceiling, 11
+        // toward zero; inexact not raised); ret.
+        "floorf" => &[0x66, 0x0F, 0x3A, 0x0A, 0xC0, 0x09, 0xC3],
+        "ceilf" => &[0x66, 0x0F, 0x3A, 0x0A, 0xC0, 0x0A, 0xC3],
+        "truncf" => &[0x66, 0x0F, 0x3A, 0x0A, 0xC0, 0x0B, 0xC3],
+        "floor" => &[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x09, 0xC3],
+        "ceil" => &[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0A, 0xC3],
+        "trunc" => &[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0B, 0xC3],
+        // sqrtss/sqrtsd xmm0, xmm0; ret.
+        "sqrtf" => &[0xF3, 0x0F, 0x51, 0xC0, 0xC3],
+        "sqrt" => &[0xF2, 0x0F, 0x51, 0xC0, 0xC3],
+        // strlen: rax = rcx; while [rax] != 0: rax++; return rax - rcx.
+        "strlen" => &[
+            0x48, 0x89, 0xC8, // mov rax, rcx
+            0x80, 0x38, 0x00, // loop: cmp byte [rax], 0
+            0x74, 0x05, // je done
+            0x48, 0xFF, 0xC0, // inc rax
+            0xEB, 0xF6, // jmp loop
+            0x48, 0x29, 0xC8, // done: sub rax, rcx
+            0xC3,
+        ],
+        // strcmp: the difference of the first differing bytes (unsigned).
+        "strcmp" => &[
+            0x0F, 0xB6, 0x01, // loop: movzx eax, byte [rcx]
+            0x44, 0x0F, 0xB6, 0x02, // movzx r8d, byte [rdx]
+            0x44, 0x29, 0xC0, // sub eax, r8d
+            0x75, 0x0D, // jnz done
+            0x45, 0x85, 0xC0, // test r8d, r8d
+            0x74, 0x08, // jz done
+            0x48, 0xFF, 0xC1, // inc rcx
+            0x48, 0xFF, 0xC2, // inc rdx
+            0xEB, 0xE7, // jmp loop
+            0xC3, // done: ret
+        ],
+        // strncmp: as strcmp, for at most R8 bytes.
+        "strncmp" => &[
+            0x31, 0xC0, // xor eax, eax
+            0x4D, 0x85, 0xC0, // loop: test r8, r8
+            0x74, 0x1C, // jz done
+            0x0F, 0xB6, 0x01, // movzx eax, byte [rcx]
+            0x44, 0x0F, 0xB6, 0x0A, // movzx r9d, byte [rdx]
+            0x44, 0x29, 0xC8, // sub eax, r9d
+            0x75, 0x10, // jnz done
+            0x45, 0x85, 0xC9, // test r9d, r9d
+            0x74, 0x0B, // jz done
+            0x48, 0xFF, 0xC1, // inc rcx
+            0x48, 0xFF, 0xC2, // inc rdx
+            0x49, 0xFF, 0xC8, // dec r8
+            0xEB, 0xDF, // jmp loop
+            0xC3, // done: ret
+        ],
+        _ => return None,
+    })
+}

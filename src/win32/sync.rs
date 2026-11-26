@@ -84,6 +84,11 @@ pub struct SyncState {
     next_start: u32,
     /// Modules that asked for no thread notifications.
     pub quiet_modules: HashSet<u32>,
+    /// When the running thread got the CPU (64-bit processes are
+    /// time-sliced at API calls).
+    slice_start: Option<std::time::Instant>,
+    /// The main thread is letting others run.
+    preempting: bool,
 }
 
 pub fn arg_count(name: &str) -> Option<usize> {
@@ -348,6 +353,33 @@ fn refresh_processes(ctx: &ApiContext) {
     }
 }
 
+/// Time-slicing for the threads of a 64-bit process, which otherwise only
+/// change places when one waits: a thread that has had the CPU for a
+/// while gives it up at its next API call. A worker comes off the CPU
+/// (returns true: the call is made again when it next runs); the main
+/// thread lets the threads that can go on run first.
+pub fn preempt(ctx: &ApiContext, memory: &mut dyn GuestMemory) -> bool {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(15);
+    {
+        let mut shared = ctx.shared.borrow_mut();
+        let now = std::time::Instant::now();
+        let started = *shared.sync.slice_start.get_or_insert(now);
+        if now.duration_since(started) < SLICE || shared.sync.preempting {
+            return false;
+        }
+        shared.sync.slice_start = Some(now);
+    }
+    if memory.suspend_thread() {
+        return true;
+    }
+    ctx.shared.borrow_mut().sync.preempting = true;
+    run_ready_threads(ctx, memory);
+    let mut shared = ctx.shared.borrow_mut();
+    shared.sync.preempting = false;
+    shared.sync.slice_start = Some(std::time::Instant::now());
+    false
+}
+
 /// Signal an event (another part of the subsystem finished something a
 /// thread may wait for).
 pub fn set_event(sync: &mut SyncState, handle: u32) {
@@ -419,7 +451,10 @@ fn launch_options<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, arg
             }
         }
     }
-    let _ = (ctx, wide);
+    let _ = wide;
+    // Without one of its own, a child gets the parent's environment as it
+    // now is.
+    let environment = environment.or_else(|| Some(crate::win32::env::block(ctx)));
     crate::win32::LaunchOptions { environment, handles, inherit: args[4] != 0, suspended: flags & 4 != 0 }
 }
 
@@ -565,6 +600,7 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
                 );
             }
         }
+        let generation = crate::win32::kobj::generation();
         refresh_processes(ctx);
         crate::win32::ipc::poll(ctx, memory);
         let me = ctx.shared.borrow().pid;
@@ -637,7 +673,8 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             memory.pump(true);
         } else {
             let remaining = wait.deadline.map(|d| d.saturating_sub(now)).unwrap_or(10);
-            std::thread::sleep(std::time::Duration::from_millis(remaining.clamp(1, 10)));
+            // Until another process changes something, or a while.
+            crate::win32::kobj::wait_change(generation, std::time::Duration::from_millis(remaining.clamp(1, 10)));
         }
     }
 }
@@ -952,6 +989,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                         process.suspended = name == "SuspendThread";
                         Some(was)
                     });
+                    crate::win32::kobj::notify();
                     return ok(u32::from(was.unwrap_or(false)));
                 }
                 _ => return ok(0),

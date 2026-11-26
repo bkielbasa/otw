@@ -25,9 +25,11 @@ build:
 run:
 	$(CARGO) run $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))") -- $(if $(strip $(TARGET)),"$(strip $(TARGET))") $(ARGS)
 
-# Firefox: no crash reporter process; stubs for the few functions it
-# imports that OTW lacks.
+# Firefox: no crash reporter process; content processes started directly
+# (OTW has no sandbox for them); stubs for the few functions it imports
+# that OTW lacks.
 desktop: export OTW_ENV_MOZ_CRASHREPORTER_DISABLE ?= 1
+desktop: export OTW_ENV_MOZ_DISABLE_CONTENT_SANDBOX ?= 1
 desktop: export OTW_STUB_MISSING ?= 1
 desktop:
 	$(CARGO) run --features display -- --desktop $(if $(strip $(DESKTOP_FAT32)),--fat32 "$(strip $(DESKTOP_FAT32))")
