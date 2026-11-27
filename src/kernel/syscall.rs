@@ -113,6 +113,30 @@ impl std::ops::Deref for Args {
 pub trait ImportPolicy {
     /// Bind this import to the subsystem even when a mapped DLL exports it.
     fn prefers_subsystem(&self, dll: &str, name: &ImportName) -> bool;
+
+    /// A variable the subsystem exports (not a function): the loader
+    /// places it in the program's memory and points the import at it.
+    fn data_import(&self, _dll: &str, _name: &ImportName) -> Option<DataImport> {
+        None
+    }
+}
+
+/// A variable a DLL exports, as the loader places it: one pointer-sized
+/// value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataImport {
+    /// This value.
+    Value(u32),
+    /// The command line (a pointer to it).
+    CommandLine,
+    /// The command line in UTF-16.
+    WideCommandLine,
+    /// `{ command line, NULL }`.
+    Arguments,
+    /// `{ wide command line, NULL }`.
+    WideArguments,
+    /// `{ NULL }`: an empty list of strings.
+    EmptyList,
 }
 
 /// Bind every import to genuine DLL code when it is available.

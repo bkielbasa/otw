@@ -13,7 +13,7 @@ use super::{
     iat::{Iat, IatEntry, THUNK_BASE, THUNK_STRIDE},
     loader::{self, MappedModule},
     pe::{ImportName, PeImage},
-    syscall::ImportPolicy,
+    syscall::{DataImport, ImportPolicy},
 };
 
 /// Where the command line string is placed in the main module's memory,
@@ -55,6 +55,64 @@ impl fmt::Display for ImageError {
 
 impl std::error::Error for ImageError {}
 
+/// Place the variables the subsystem exports that the program's modules
+/// import (`ImportPolicy::data_import`) after the command line in the
+/// main module's memory, and point their import slots at them.
+fn place_data_imports(
+    main: &mut MappedModule,
+    entries: &[IatEntry],
+    policy: &dyn ImportPolicy,
+    command_line_va: u32,
+    command_line: &str,
+) -> Result<(), ImageError> {
+    let wanted: Vec<(&IatEntry, DataImport)> = entries
+        .iter()
+        .filter(|e| e.slot_va != 0)
+        .filter_map(|e| policy.data_import(&e.dll, &e.name).map(|d| (e, d)))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let base = main.image.image_base;
+    let pointer = if main.image.is64 { 8u32 } else { 4 };
+    let mut at = (command_line_va + command_line.len() as u32 + 1 + 15) & !15;
+    let mut put = |memory: &mut Vec<u8>, bytes: &[u8]| -> u32 {
+        let va = at;
+        let offset = (va - base) as usize;
+        if memory.len() < offset + bytes.len() {
+            memory.resize(offset + bytes.len(), 0);
+        }
+        memory[offset..offset + bytes.len()].copy_from_slice(bytes);
+        at = (at + bytes.len() as u32 + 15) & !15;
+        va
+    };
+    let word = |value: u32| -> Vec<u8> { (value as u64).to_le_bytes()[..pointer as usize].to_vec() };
+    let wide: Vec<u8> = command_line.encode_utf16().chain([0]).flat_map(|u| u.to_le_bytes()).collect();
+    let wide_va = put(&mut main.memory, &wide);
+    let list = |memory: &mut Vec<u8>, put: &mut dyn FnMut(&mut Vec<u8>, &[u8]) -> u32, first: Option<u32>| {
+        let mut bytes = first.map(word).unwrap_or_default();
+        bytes.extend(word(0));
+        put(memory, &bytes)
+    };
+    for (entry, data) in wanted {
+        let value = match data {
+            DataImport::Value(value) => value,
+            DataImport::CommandLine => command_line_va,
+            DataImport::WideCommandLine => wide_va,
+            DataImport::Arguments => list(&mut main.memory, &mut put, Some(command_line_va)),
+            DataImport::WideArguments => list(&mut main.memory, &mut put, Some(wide_va)),
+            DataImport::EmptyList => list(&mut main.memory, &mut put, None),
+        };
+        // Slots of the main module only (its DLLs keep their thunks).
+        let Some(slot) = entry.slot_va.checked_sub(base).map(|s| s as usize).filter(|&s| s + (pointer as usize) <= main.image.size_of_image as usize) else {
+            continue;
+        };
+        let variable = put(&mut main.memory, &word(value));
+        main.memory[slot..slot + pointer as usize].copy_from_slice(&word(variable));
+    }
+    Ok(())
+}
+
 pub struct Image {
     /// Module zero is the executable that starts execution.
     pub modules: Vec<MappedModule>,
@@ -89,6 +147,7 @@ impl Image {
             .copy_from_slice(format!("{command_line}\0").as_bytes());
 
         let mut entries = result.iat.entries.clone();
+        place_data_imports(&mut modules[0], &entries, policy, command_line_va, command_line)?;
         let kernel_entries = [
             (KERNEL_DLL.to_string(), EXCEPTION_DISPATCHER.to_string()),
             (KERNEL_DLL.to_string(), THREAD_RETURN.to_string()),
@@ -144,5 +203,77 @@ impl Image {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
+    use super::*;
+
+    struct Variables;
+
+    impl ImportPolicy for Variables {
+        fn prefers_subsystem(&self, _dll: &str, _name: &ImportName) -> bool {
+            false
+        }
+        fn data_import(&self, dll: &str, name: &ImportName) -> Option<DataImport> {
+            if dll != "MSVCRT.dll" {
+                return None;
+            }
+            match name.as_str()? {
+                "_acmdln" => Some(DataImport::CommandLine),
+                "_wcmdln" => Some(DataImport::WideCommandLine),
+                "__argv" => Some(DataImport::Arguments),
+                "__argc" => Some(DataImport::Value(1)),
+                _ => None,
+            }
+        }
+    }
+
+    fn read(memory: &[u8], base: u32, va: u32) -> u32 {
+        let at = (va - base) as usize;
+        u32::from_le_bytes(memory[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn data_imports_point_at_their_variables() {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/binaries/guests/HELLO.EXE")).unwrap();
+        let image = PeImage::parse(bytes).unwrap();
+        let memory = loader::map_image("HELLO.EXE", &image).unwrap();
+        let base = image.image_base;
+        let mut main = MappedModule { name: "HELLO.EXE".into(), image, memory };
+        let entry = |name: &str, slot: u32, thunk: u32| IatEntry {
+            dll: "MSVCRT.dll".into(),
+            name: ImportName::ByName(name.into()),
+            slot_va: base + slot,
+            thunk_va: thunk,
+        };
+        let entries = [
+            entry("_acmdln", 0x100, 1),
+            entry("_wcmdln", 0x104, 2),
+            entry("__argv", 0x108, 3),
+            entry("__argc", 0x10C, 4),
+            entry("printf", 0x110, 5),
+        ];
+        let command_line_va = base + main.memory.len() as u32;
+        let text = "\"C:\\SETUP.EXE\" /S";
+        main.memory.resize(main.memory.len() + text.len() + 1, 0);
+        let function_slot = read(&main.memory, base, base + 0x110);
+        place_data_imports(&mut main, &entries, &Variables, command_line_va, text).unwrap();
+        let m = &main.memory;
+        assert_eq!(read(m, base, read(m, base, base + 0x100)), command_line_va);
+        let wide = read(m, base, read(m, base, base + 0x104));
+        let at = (wide - base) as usize;
+        let units: Vec<u16> = m[at..at + 2 * text.len()].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), text);
+        let argv = read(m, base, read(m, base, base + 0x108));
+        assert_eq!((read(m, base, argv), read(m, base, argv + 4)), (command_line_va, 0));
+        assert_eq!(read(m, base, read(m, base, base + 0x10C)), 1);
+        // A function keeps its slot.
+        assert_eq!(read(m, base, base + 0x110), function_slot);
     }
 }

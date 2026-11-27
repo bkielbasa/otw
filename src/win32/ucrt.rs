@@ -61,9 +61,37 @@ pub struct State {
     pub(crate) native_page: Option<(u32, u32)>,
 }
 
+/// The maths functions and how many arguments each takes: their
+/// floating-point arguments and results are in XMM registers.
+fn math_args(name: &str) -> Option<usize> {
+    Some(match name {
+        "fabs" | "sqrt" | "sqrtf" | "sin" | "sinf" | "cos" | "cosf" | "tan" | "tanf" | "asin" | "asinf" | "acos"
+        | "acosf" | "atan" | "atanf" | "sinh" | "sinhf" | "cosh" | "coshf" | "tanh" | "tanhf" | "asinh" | "asinhf"
+        | "acosh" | "acoshf" | "atanh" | "atanhf" | "exp" | "expf" | "exp2" | "exp2f" | "expm1" | "expm1f" | "log"
+        | "logf" | "log10" | "log10f" | "log2" | "log2f" | "log1p" | "log1pf" | "cbrt" | "cbrtf" | "ceil" | "ceilf"
+        | "floor" | "floorf" | "trunc" | "truncf" | "round" | "roundf" | "rint" | "rintf" | "nearbyint"
+        | "nearbyintf" | "lrint" | "lrintf" | "llrint" | "llrintf" | "lround" | "lroundf" | "llround" | "llroundf"
+        | "llroundl" | "ilogb" | "ilogbf" | "erff" | "erf" | "lgamma" | "lgammaf" | "lgammal" | "_dclass"
+        | "_fdclass" | "_ldclass" | "_dsign" | "_fdsign" | "_ldsign" | "_isnan" | "_finite" | "_fpclass" => 1,
+        "atan2" | "atan2f" | "pow" | "powf" | "fmod" | "fmodf" | "hypot" | "_hypot" | "_hypotf" | "copysign"
+        | "copysignf" | "fmax" | "fmaxf" | "fmin" | "fminf" | "remainder" | "remainderf" | "nextafter"
+        | "nextafterf" | "nexttoward" => 2,
+        "fma" | "fmaf" => 3,
+        _ => return None,
+    })
+}
+
+/// Whether `name` is one of the maths functions.
+pub fn is_math(name: &str) -> bool {
+    math_args(name.strip_prefix("_o_").unwrap_or(name)).is_some()
+}
+
 /// The functions implemented here and how many arguments each takes.
 pub fn arg_count(name: &str) -> Option<usize> {
     let name = name.strip_prefix("_o_").unwrap_or(name);
+    if let Some(count) = math_args(name) {
+        return Some(count);
+    }
     Some(match name {
         "_get_initial_narrow_environment" | "_get_initial_wide_environment" | "__p___argc" | "__p___argv"
         | "__p___wargv" | "__p__environ" | "__p__wenviron" | "__p__commode" | "_get_wide_winmain_command_line"
@@ -118,19 +146,6 @@ pub fn arg_count(name: &str) -> Option<usize> {
         | "__stdio_common_vswprintf_s" | "__stdio_common_vsscanf" | "__stdio_common_vswscanf" => 6,
         "__stdio_common_vsnprintf_s" | "__stdio_common_vsnwprintf_s" => 7,
         "_splitpath_s" => 9,
-        // Maths: arguments in XMM registers (and an integer or pointer).
-        "fabs" | "sqrt" | "sqrtf" | "sin" | "sinf" | "cos" | "cosf" | "tan" | "tanf" | "asin" | "asinf" | "acos"
-        | "acosf" | "atan" | "atanf" | "sinh" | "sinhf" | "cosh" | "coshf" | "tanh" | "tanhf" | "asinh" | "asinhf"
-        | "acosh" | "acoshf" | "atanh" | "atanhf" | "exp" | "expf" | "exp2" | "exp2f" | "expm1" | "expm1f" | "log"
-        | "logf" | "log10" | "log10f" | "log2" | "log2f" | "log1p" | "log1pf" | "cbrt" | "cbrtf" | "ceil" | "ceilf"
-        | "floor" | "floorf" | "trunc" | "truncf" | "round" | "roundf" | "rint" | "rintf" | "nearbyint"
-        | "nearbyintf" | "lrint" | "lrintf" | "llrint" | "llrintf" | "lround" | "lroundf" | "llround" | "llroundf"
-        | "llroundl" | "ilogb" | "ilogbf" | "erff" | "erf" | "lgamma" | "lgammaf" | "lgammal" | "_dclass"
-        | "_fdclass" | "_ldclass" | "_dsign" | "_fdsign" | "_ldsign" | "_isnan" | "_finite" | "_fpclass" => 1,
-        "atan2" | "atan2f" | "pow" | "powf" | "fmod" | "fmodf" | "hypot" | "_hypot" | "_hypotf" | "copysign"
-        | "copysignf" | "fmax" | "fmaxf" | "fmin" | "fminf" | "remainder" | "remainderf" | "nextafter"
-        | "nextafterf" | "nexttoward" => 2,
-        "fma" | "fmaf" => 3,
         "_seh_filter_exe" | "_seh_filter_dll" => 2,
         "getenv_s" | "memcpy_s" | "wmemcpy_s" | "strncpy_s" | "wcsncpy_s" => 4,
         "_makepath_s" | "_wsopen_dispatch" => 6,

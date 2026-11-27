@@ -44,6 +44,7 @@ pub mod kobj;
 pub mod ipc;
 pub mod menu;
 pub mod misc;
+pub mod msvcrt;
 pub mod module;
 pub mod ole;
 pub mod storage;
@@ -742,6 +743,8 @@ pub struct SharedState {
     /// the slot has not been allocated by `TlsAlloc`.
     pub tls_slots: Vec<Option<u32>>,
     pub crt: CrtGlobals,
+    /// MSVCRT's wide start-up variables (made when first asked for).
+    pub msvcrt: msvcrt::WideGlobals,
     pub heap: GuestHeap,
     pub gdi: crate::win32::gdi::GdiState,
     /// Host files opened by CreateFileA/_lopen/fopen, keyed by guest handle.
@@ -850,6 +853,7 @@ impl Default for SharedState {
             winsock: WinSockState::default(),
             tls_slots: vec![None; 64],
             crt: CrtGlobals::default(),
+            msvcrt: msvcrt::WideGlobals::default(),
             heap: GuestHeap::default(),
             gdi: crate::win32::gdi::GdiState::default(),
             files: HashMap::new(),
@@ -1201,6 +1205,9 @@ impl SystemCalls for ApiContext {
             let _ = memory.write_u32(memory.current_tib() + native::TEB_LAST_ERROR, error);
             return outcome;
         }
+        if msvcrt::is_msvcrt(&dll) {
+            return msvcrt::call(self, memory, &name, args);
+        }
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
     }
 
@@ -1262,6 +1269,10 @@ pub struct Win32Imports;
 impl ImportPolicy for Win32Imports {
     fn prefers_subsystem(&self, dll: &str, name: &ImportName) -> bool {
         prefer_rust_handler(dll, name)
+    }
+
+    fn data_import(&self, dll: &str, name: &ImportName) -> Option<crate::kernel::syscall::DataImport> {
+        msvcrt::is_msvcrt(dll).then(|| msvcrt::data_import(name.as_str()?)).flatten()
     }
 }
 
@@ -1417,6 +1428,9 @@ pub fn api_set_host(dll: &str) -> Option<&'static str> {
 }
 
 pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
+    if msvcrt::is_msvcrt(dll) {
+        return msvcrt::arg_count(name.as_str()?);
+    }
     let dll = api_set_host(dll).unwrap_or(dll);
     if is_ucrt(dll) {
         return ucrt::arg_count(name.as_str()?);
