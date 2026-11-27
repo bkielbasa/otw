@@ -36,7 +36,8 @@ pub struct Task {
     #[allow(dead_code)]
     stack: Option<Box<[u8]>>,
     state: State,
-    wake_at: u64,
+    /// When a sleeping task is due (0: at once; set by other CPUs too).
+    wake_at: AtomicU64,
     start: Option<Box<dyn FnOnce()>>,
     /// The innermost user-mode entry's kernel frame (`user`).
     pub entry_rsp: u64,
@@ -47,6 +48,8 @@ pub struct Task {
     pub gs_base: u64,
     /// 32-bit program code: FS holds a data selector.
     pub compat: bool,
+    /// What kernel work it does, for OTW_PROFILE (`profile::tag`; 0: none).
+    pub tag: usize,
 }
 
 /// Tasks are handed between CPUs: only one CPU uses one at a time.
@@ -99,13 +102,14 @@ fn new_task(stack: Option<Box<[u8]>>) -> *mut Task {
         rsp: 0,
         stack,
         state: State::Running,
-        wake_at: 0,
+        wake_at: AtomicU64::new(0),
         start: None,
         entry_rsp: 0,
         cr3: 0,
         fs_base: 0,
         gs_base: 0,
         compat: false,
+        tag: 0,
     }))
 }
 
@@ -120,6 +124,32 @@ pub fn current_id() -> u64 {
         0
     } else {
         unsafe { (*task).id }
+    }
+}
+
+/// For a profile sample, from an interrupt: whether this CPU is idle, its
+/// task's id, tag and address space.
+pub fn sample_current() -> (bool, u64, usize, u64) {
+    let index = cpu();
+    let task = CURRENT[index].load(Ordering::Relaxed);
+    if task.is_null() || task == IDLE[index].load(Ordering::Relaxed) {
+        return (true, 0, 0, 0);
+    }
+    unsafe { (false, (*task).id, (*task).tag, (*task).cr3) }
+}
+
+/// Tag the running task's kernel work (OTW_PROFILE) until the guard goes.
+pub fn tagged(tag: usize) -> Tagged {
+    let task = current();
+    let previous = core::mem::replace(&mut task.tag, tag);
+    Tagged(previous)
+}
+
+pub struct Tagged(usize);
+
+impl Drop for Tagged {
+    fn drop(&mut self) {
+        current().tag = self.0;
     }
 }
 
@@ -198,7 +228,16 @@ fn finish_switch() {
     let state = unsafe { (*previous).state };
     match state {
         State::Ready => READY.lock().push_back(TaskPtr(previous)),
-        State::Sleeping => SLEEPING.lock().push(TaskPtr(previous)),
+        State::Sleeping => {
+            // Woken (or due) while it was still switching away: ready now.
+            if unsafe { (*previous).wake_at.load(Ordering::SeqCst) } <= apic::now_us() {
+                forget_waits(&[TaskPtr(previous)]);
+                unsafe { (*previous).state = State::Ready };
+                READY.lock().push_back(TaskPtr(previous));
+            } else {
+                SLEEPING.lock().push(TaskPtr(previous));
+            }
+        }
         State::Dead => drop(unsafe { Box::from_raw(previous) }),
         State::Running => {}
     }
@@ -264,9 +303,95 @@ pub fn sleep_us(us: u64) {
         crate::apic::delay_us(us);
         return;
     }
-    unsafe { (*me).wake_at = apic::now_us() + us };
+    unsafe { (*me).wake_at.store(apic::now_us().saturating_add(us), Ordering::SeqCst) };
     let next = next_ready().unwrap_or(IDLE[index].load(Ordering::SeqCst));
     switch_to(next, State::Sleeping);
+}
+
+/// Tasks blocked in `wait_on`, by the address of the word they wait on.
+static WAITERS: SpinLock<Vec<(usize, TaskPtr)>> = SpinLock::new(Vec::new());
+/// CPUs halted for want of work (a bit each).
+static HALTED: AtomicU64 = AtomicU64::new(0);
+
+/// Block while `word` holds `expected`, until `wake(word)` or `timeout_us`
+/// passes. May return early.
+pub fn wait_on(word: &core::sync::atomic::AtomicU32, expected: u32, timeout_us: u64) {
+    let index = cpu();
+    let me = CURRENT[index].load(Ordering::SeqCst);
+    let key = word as *const _ as usize;
+    if me.is_null() || me == IDLE[index].load(Ordering::SeqCst) {
+        // Not a task that can sleep: look again and again, a while.
+        let start = apic::now_us();
+        while word.load(Ordering::SeqCst) == expected && apic::now_us() - start < timeout_us.min(1000) {
+            core::hint::spin_loop();
+        }
+        return;
+    }
+    {
+        let mut waiters = WAITERS.lock();
+        if word.load(Ordering::SeqCst) != expected {
+            return;
+        }
+        unsafe { (*me).wake_at.store(apic::now_us().saturating_add(timeout_us), Ordering::SeqCst) };
+        waiters.push((key, TaskPtr(me)));
+    }
+    let next = next_ready().unwrap_or(IDLE[index].load(Ordering::SeqCst));
+    switch_to(next, State::Sleeping);
+    // Woken, or the time is up: no longer waiting.
+    let mut waiters = WAITERS.lock();
+    if let Some(i) = waiters.iter().position(|(_, t)| t.0 == me) {
+        waiters.remove(i);
+    }
+}
+
+/// Wake one task blocked on `word` (the one waiting longest), or all.
+/// (Tasks whose wait timed out are no longer listed: the wake goes to
+/// one still waiting.)
+pub fn wake(word: &core::sync::atomic::AtomicU32, all: bool) {
+    let key = word as *const _ as usize;
+    let mut woke = false;
+    {
+        let mut waiters = WAITERS.lock();
+        if waiters.is_empty() {
+            return;
+        }
+        waiters.retain(|&(k, t)| {
+            if k == key && (all || !woke) {
+                unsafe { (*t.0).wake_at.store(0, Ordering::SeqCst) };
+                woke = true;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if woke {
+        wake_sleepers();
+        wake_a_halted_cpu();
+    }
+}
+
+/// Tasks woken by time: no longer waiting on a word (a wake must go to
+/// one still waiting).
+fn forget_waits(tasks: &[TaskPtr]) {
+    let mut waiters = WAITERS.lock();
+    if waiters.is_empty() {
+        return;
+    }
+    waiters.retain(|(_, t)| !tasks.iter().any(|w| w.0 == t.0));
+}
+
+/// A task became ready: a halted CPU (if any) should take it now rather
+/// than at its next timer interrupt.
+fn wake_a_halted_cpu() {
+    let halted = HALTED.load(Ordering::SeqCst) & !(1 << cpu());
+    if halted == 0 {
+        return;
+    }
+    let index = halted.trailing_zeros() as usize;
+    if let Some(id) = apic::apic_id_of(index) {
+        apic::send_ipi(id, crate::arch::WAKE_VECTOR as u32);
+    }
 }
 
 /// End the running task.
@@ -285,13 +410,14 @@ fn wake_sleepers() {
     }
     let mut woken = Vec::new();
     sleeping.retain(|t| {
-        let due = unsafe { (*t.0).wake_at <= now };
+        let due = unsafe { (*t.0).wake_at.load(Ordering::SeqCst) <= now };
         if due {
             woken.push(*t);
         }
         !due
     });
     drop(sleeping);
+    forget_waits(&woken);
     let mut ready = READY.lock();
     for t in woken {
         unsafe { (*t.0).state = State::Ready };
@@ -303,11 +429,24 @@ fn wake_sleepers() {
 /// ready, else halt until the next interrupt (the timer, 1000 times a
 /// second, or another CPU).
 pub fn idle_loop() -> ! {
+    let bit = 1u64 << cpu();
     loop {
         wake_sleepers();
         match next_ready() {
             Some(next) => switch_to(next, State::Running),
-            None => crate::arch::wait_for_interrupt(),
+            None => {
+                // Halted (until an interrupt), and known to be: a CPU that
+                // readies a task wakes it. Interrupts stay off from the last
+                // look at the queue to the halt, so a wake is not missed.
+                crate::arch::disable_interrupts();
+                HALTED.fetch_or(bit, Ordering::SeqCst);
+                if READY.lock().is_empty() {
+                    crate::arch::wait_for_interrupt();
+                } else {
+                    crate::arch::enable_interrupts();
+                }
+                HALTED.fetch_and(!bit, Ordering::SeqCst);
+            }
         }
     }
 }

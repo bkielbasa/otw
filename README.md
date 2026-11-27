@@ -23,14 +23,14 @@ make run TARGET=path/to/PROGRAM.EXE FEATURES=display ARGS="--run --window"
 
 ## Boot it on bare metal
 
-`baremetal/` is OTW's own kernel: a UEFI machine boots it with no other operating system underneath. It brings up its own CPU tables, interrupts and page tables, all CPUs, the timer, PS/2 keyboard and mouse, NVMe and SATA (AHCI) disks, a virtio network card with TCP/IP (smoltcp, DHCP, DNS), and reads drive C: (a FAT32 partition named `OTW-C`, filled from `~/.otw/C` when the image is built). On top runs OTW's own library — the same shell and Win32 code as on Linux, built without `std` (`src/platform` stands in for it). Programs run natively in user mode, their threads on all CPUs; 64-bit Firefox browses the web on it.
+`baremetal/` is OTW's own kernel: a UEFI machine boots it with no other operating system underneath. It brings up its own CPU tables, interrupts and page tables, all CPUs, the timer, PS/2 keyboard and mouse, NVMe and SATA (AHCI) disks, network cards — virtio, Intel's (e1000, e1000e including the I217/I218/I219 in Intel chipsets, igb/igc) and Realtek's (RTL8169/8168/8111/8125) — with TCP/IP (smoltcp, DHCP, DNS), and reads drive C: (a FAT32 partition named `OTW-C`, filled from `~/.otw/C` when the image is built). On top runs OTW's own library — the same shell and Win32 code as on Linux, built without `std` (`src/platform` stands in for it). Programs run natively in user mode, their threads on all CPUs; 64-bit Firefox browses the web on it.
 
 ```sh
 make image      # build target/os/otw.img (40 MB, plus drive C:)
 make os         # boot it in QEMU
 ```
 
-`make os` opens a window in a desktop session; without one the screen is at `vnc://127.0.0.1:5901` (`VM_DISPLAY=gtk` or `sdl` to choose). The kernel's log goes to the serial port (`VM_SERIAL=file` to keep it).
+`make os` opens a window in a desktop session; without one the screen is at `vnc://127.0.0.1:5901` (`VM_DISPLAY=gtk` or `sdl` to choose). The kernel's log goes to the serial port (`VM_SERIAL=file` to keep it). `VM_NIC=e1000`, `e1000e` or `igb` gives the machine an Intel card instead of virtio. A kernel built with `OTW_PROFILE=1` logs where the CPUs' time goes every ten seconds (idle, program code by module, the subsystem by call).
 
 On a real machine, write it to a USB stick and boot it with UEFI and Secure Boot off:
 

@@ -279,6 +279,9 @@ pub fn set_user_entry_stack(rsp0: u64) {
 }
 
 extern "sysv64" fn interrupt(frame: &mut Frame, fx: *const u8) {
+    if frame.vector == TIMER_VECTOR as u64 {
+        crate::profile::sample(frame.cs & 3 == 3, frame.rip);
+    }
     if frame.cs & 3 == 3 {
         // From a program: a system call, a callback's return, or a fault
         // go to the kernel code that ran it; interrupts are handled here

@@ -183,6 +183,7 @@ impl Desktop {
         let now_s = apic::now_us() / 10_000_000;
         if LAST_REPORT.swap(now_s, Ordering::Relaxed) != now_s {
             crate::process::report();
+            crate::process::profile_report();
             if otw_vm::platform::env::var("OTW_TRACE_STATUS").is_ok_and(|v| v != "0") {
                 each_program(|shared, name| {
                     for w in shared.gui.windows.iter().filter(|w| w.style & WS_CHILD == 0) {
@@ -251,6 +252,7 @@ impl Desktop {
     }
 
     fn draw(&mut self) {
+        let _tag = crate::profile::on().then(|| crate::sched::tagged(crate::profile::tag("[desktop draw]")));
         let started = apic::now_us();
         let tasks = self.tasks();
         let t1 = apic::now_us();
@@ -261,7 +263,20 @@ impl Desktop {
             self.background_stale = false;
             self.background_tasks = task_list;
         }
-        self.frame.pixels.copy_from_slice(&self.background.pixels);
+        // The background, where no window will cover it.
+        let mut covered: Vec<(i32, i32, i32, i32)> = Vec::new();
+        each_program(|shared, _| {
+            for window in &shared.gui.windows {
+                if !window.visible || window.minimized || window.style & WS_CHILD != 0 {
+                    continue;
+                }
+                if let Some(surface) = shared.gdi.surfaces.get(&window.hwnd) {
+                    covered.push((window.x, window.y, window.x + surface.width, window.y + surface.height));
+                }
+            }
+            false
+        });
+        copy_uncovered(&mut self.frame, &self.background, &covered);
         let t2 = apic::now_us();
         let frame = &mut self.frame;
         each_program(|shared, _| {
@@ -279,7 +294,7 @@ impl Desktop {
         self.shell.paint(&mut self.frame, Layer::Foreground, &tasks);
         self.shell.paint(&mut self.frame, Layer::Top, &tasks);
         let painted = apic::now_us();
-        if self.stats.frames % 200 == 1 {
+        if self.stats.frames % 200 == 1 && crate::profile::on() {
             log!("OTW kernel: [paint] tasks {} us, background {} us, windows {} us, top {} us", t1 - started, t2 - t1, t3 - t2, painted - t3);
         }
         let rows = self.screen.show(&self.frame, self.input.pointer);
@@ -318,6 +333,15 @@ impl Desktop {
                 list.iter().rposition(|r| {
                     let _hold = otw_vm::kernel::lock::Hold::new(&r.lock);
                     top_level_at(&unsafe { &*r.shared }.borrow().gui, x, y).is_some()
+                })
+            })
+            // Keys: the front program that shows a window (one started
+            // later without any, such as Firefox's content processes, must
+            // not take them).
+            .or_else(|| {
+                list.iter().rposition(|r| {
+                    let _hold = otw_vm::kernel::lock::Hold::new(&r.lock);
+                    has_window(&unsafe { &*r.shared }.borrow().gui)
                 })
             })
             .or(list.len().checked_sub(1));
@@ -442,6 +466,26 @@ fn each_program(mut f: impl FnMut(&SharedState, &str) -> bool) {
         let shared = unsafe { &*r.shared }.borrow();
         if f(&shared, &r.name) {
             break;
+        }
+    }
+}
+
+/// Copy `background` into `frame` outside the rectangles (x0, y0, x1, y1)
+/// windows will cover.
+fn copy_uncovered(frame: &mut Surface, background: &Surface, covered: &[(i32, i32, i32, i32)]) {
+    let width = frame.width;
+    let mut spans: Vec<(i32, i32)> = Vec::new();
+    for y in 0..frame.height {
+        spans.clear();
+        spans.extend(covered.iter().filter(|c| y >= c.1 && y < c.3).map(|c| (c.0.max(0), c.2.min(width))));
+        spans.sort_unstable();
+        let row = (y * width) as usize;
+        let mut x = 0;
+        for &(start, end) in spans.iter().chain(core::iter::once(&(width, width))) {
+            if start > x {
+                frame.pixels[row + x as usize..row + start as usize].copy_from_slice(&background.pixels[row + x as usize..row + start as usize]);
+            }
+            x = x.max(end);
         }
     }
 }
@@ -607,25 +651,30 @@ impl ScreenCopy {
 
     /// Show `frame`; returns how many rows changed.
     fn show(&mut self, frame: &Surface, pointer: (i32, i32)) -> usize {
+        let _tag = crate::profile::on().then(|| crate::sched::tagged(crate::profile::tag("[desktop show]")));
         let width = self.width.min(frame.width as usize);
         let mut changed = 0;
         for y in 0..self.height.min(frame.height as usize) {
             let source = &frame.pixels[y * frame.width as usize..][..width];
             // The frame is 0x00RRGGBB: as it is for a BGR screen, swapped
             // for RGB.
+            let copy = &mut self.pixels[y * self.width..][..width];
             if self.bgr {
-                self.row[..width].copy_from_slice(source);
+                if copy[..] == source[..] {
+                    continue;
+                }
+                copy.copy_from_slice(source);
             } else {
                 for (target, &p) in self.row.iter_mut().zip(source) {
                     *target = (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF);
                 }
-            }
-            let copy = &mut self.pixels[y * self.width..][..width];
-            if copy[..] != self.row[..width] {
+                if copy[..] == self.row[..width] {
+                    continue;
+                }
                 copy.copy_from_slice(&self.row[..width]);
-                self.write_row(y, 0, width);
-                changed += 1;
             }
+            self.write_row(y, 0, width);
+            changed += 1;
         }
         // The rows under the old pointer may not have changed: restore them.
         self.restore_pointer_area();
@@ -698,7 +747,7 @@ impl FrameStats {
         self.paint_us += paint_us;
         self.show_us += show_us;
         self.rows += rows as u64;
-        if self.frames % 20 == 1 {
+        if self.frames % 200 == 1 && crate::profile::on() {
             log!(
                 "OTW kernel: frames: {} so far; on average {} us painting, {} us showing, {} rows changed",
                 self.frames,
@@ -708,4 +757,9 @@ impl FrameStats {
             );
         }
     }
+}
+
+/// Whether a program shows a top-level window.
+fn has_window(gui: &otw_vm::win32::GuiState) -> bool {
+    gui.windows.iter().any(|w| w.style & WS_CHILD == 0 && w.visible && !w.minimized)
 }

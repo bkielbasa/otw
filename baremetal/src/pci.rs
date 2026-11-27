@@ -5,7 +5,6 @@ use alloc::vec::Vec;
 use crate::io::{inb, outb};
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // vendor and device: for drivers to come
 pub struct Device {
     pub bus: u8,
     pub slot: u8,
@@ -58,6 +57,24 @@ impl Device {
         self.write(offset, low);
         let size = (!mask).wrapping_add(1) as u64;
         ((high as u64) << 32 | (low & !0xF) as u64, size)
+    }
+
+    /// The first base address register that points at memory, if any:
+    /// (index, address, size).
+    pub fn memory_bar(&self) -> Option<(u8, u64, u64)> {
+        let mut index = 0;
+        while index < 6 {
+            let low = self.read(0x10 + index * 4);
+            if low & 1 == 0 {
+                let (base, size) = self.bar(index);
+                if base != 0 && size != 0 {
+                    return Some((index, base, size));
+                }
+            }
+            // A 64-bit memory BAR takes two.
+            index += if low & 1 == 0 && low & 0x6 == 0x4 { 2 } else { 1 };
+        }
+        None
     }
 
     /// Let the device reach memory (bus mastering) and its registers.

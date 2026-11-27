@@ -28,3 +28,24 @@ pub mod prelude {
         vec::Vec,
     };
 }
+
+/// Name what the running thread does, for a profile (the bare-metal
+/// kernel's OTW_PROFILE), until the guard goes. Nothing with `std`.
+pub fn doing(name: &'static str) -> Doing {
+    #[cfg(not(feature = "std"))]
+    return Doing(bare::system().tag(name));
+    #[cfg(feature = "std")]
+    {
+        let _ = name;
+        Doing(0)
+    }
+}
+
+pub struct Doing(#[allow(dead_code)] usize);
+
+impl Drop for Doing {
+    fn drop(&mut self) {
+        #[cfg(not(feature = "std"))]
+        bare::system().untag(self.0);
+    }
+}

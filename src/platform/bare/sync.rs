@@ -5,7 +5,7 @@
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use core::time::Duration;
 
 pub use alloc::sync::{Arc, Weak};
@@ -149,41 +149,43 @@ impl WaitTimeoutResult {
 
 /// Waits release the lock, let the system run something else, and take
 /// the lock again (a wake-up may come at any time, as with `std`).
+/// A condition variable: a count of notifications, which waiters block
+/// on until it changes (the kernel's `wait_on` / `wake`).
 #[derive(Default, Debug)]
-pub struct Condvar(#[allow(dead_code)] AtomicU8);
+pub struct Condvar(AtomicU32);
 
 impl Condvar {
     pub const fn new() -> Self {
-        Self(AtomicU8::new(0))
+        Self(AtomicU32::new(0))
     }
 
-    fn pause<'a, T: ?Sized>(&self, guard: MutexGuard<'a, T>, us: u64) -> MutexGuard<'a, T> {
+    /// Release `guard`, block until notified (or `timeout_us`), take the
+    /// lock again.
+    fn block<'a, T: ?Sized>(&self, guard: MutexGuard<'a, T>, timeout_us: u64) -> MutexGuard<'a, T> {
         let mutex = guard.mutex;
+        let seen = self.0.load(Ordering::SeqCst);
         drop(guard);
-        // Short waits let other threads run; longer ones sleep.
-        if us <= 100 {
-            super::system().yield_now();
-        } else {
-            super::system().sleep_us(us);
-        }
+        super::system().wait_on(&self.0, seen, timeout_us);
         mutex.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn wait<'a, T: ?Sized>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
-        Ok(self.pause(guard, 1000))
+        Ok(self.block(guard, u64::MAX))
     }
 
     pub fn wait_while<'a, T: ?Sized, F: FnMut(&mut T) -> bool>(&self, mut guard: MutexGuard<'a, T>, mut condition: F) -> LockResult<MutexGuard<'a, T>> {
         while condition(&mut *guard) {
-            guard = self.pause(guard, 1000);
+            guard = self.block(guard, u64::MAX);
         }
         Ok(guard)
     }
 
     pub fn wait_timeout<'a, T: ?Sized>(&self, guard: MutexGuard<'a, T>, timeout: Duration) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
-        let us = (timeout.as_micros() as u64).min(1000);
-        let guard = self.pause(guard, us);
-        Ok((guard, WaitTimeoutResult(us >= timeout.as_micros() as u64)))
+        let system = super::system();
+        let us = timeout.as_micros().min(u64::MAX as u128 - 1) as u64;
+        let started = system.now_us();
+        let guard = self.block(guard, us);
+        Ok((guard, WaitTimeoutResult(system.now_us() - started >= us)))
     }
 
     pub fn wait_timeout_while<'a, T: ?Sized, F: FnMut(&mut T) -> bool>(
@@ -193,7 +195,7 @@ impl Condvar {
         mut condition: F,
     ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
         let system = super::system();
-        let deadline = system.now_us().saturating_add(timeout.as_micros() as u64);
+        let deadline = system.now_us().saturating_add(timeout.as_micros().min(u64::MAX as u128) as u64);
         loop {
             if !condition(&mut *guard) {
                 return Ok((guard, WaitTimeoutResult(false)));
@@ -202,12 +204,19 @@ impl Condvar {
             if now >= deadline {
                 return Ok((guard, WaitTimeoutResult(true)));
             }
-            guard = self.pause(guard, (deadline - now).min(1000));
+            guard = self.block(guard, deadline - now);
         }
     }
 
-    pub fn notify_one(&self) {}
-    pub fn notify_all(&self) {}
+    pub fn notify_one(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        super::system().wake(&self.0, false);
+    }
+
+    pub fn notify_all(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        super::system().wake(&self.0, true);
+    }
 }
 
 pub struct OnceLock<T> {

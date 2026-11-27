@@ -6,6 +6,7 @@
 //! it too. Nothing here waits for the network except `resolve`.
 
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -18,17 +19,17 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
 use crate::sync::SpinLock;
-use crate::virtio_net::VirtioNet;
+use crate::nic::Nic;
 use crate::{apic, sched};
 
 const TCP_RECEIVE: usize = 256 * 1024;
 const TCP_SEND: usize = 64 * 1024;
 const LOOPBACK_LIMIT: usize = 256 * 1024;
 
-struct Card(VirtioNet);
+struct Card(Box<dyn Nic>);
 
 struct Rx(Vec<u8>);
-struct Tx<'a>(&'a mut VirtioNet);
+struct Tx<'a>(&'a mut dyn Nic);
 
 impl RxToken for Rx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -38,7 +39,10 @@ impl RxToken for Rx {
 
 impl TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, length: usize, f: F) -> R {
-        self.0.send(length, f)
+        let mut frame = alloc::vec![0u8; length];
+        let result = f(&mut frame);
+        self.0.send(&frame);
+        result
     }
 }
 
@@ -51,11 +55,11 @@ impl Device for Card {
             return None;
         }
         let frame = self.0.receive()?;
-        Some((Rx(frame), Tx(&mut self.0)))
+        Some((Rx(frame), Tx(&mut *self.0)))
     }
 
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
-        self.0.can_send().then(|| Tx(&mut self.0))
+        self.0.can_send().then(|| Tx(&mut *self.0))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -155,7 +159,9 @@ impl Stack {
         }
         if self.address.is_none() && apic::now_us() / 5_000_000 != self.reported {
             self.reported = apic::now_us() / 5_000_000;
-            crate::log!("OTW kernel: network: no address yet ({} frames received, {} sent)", self.card.0.received, self.card.0.sent);
+            let (received, sent) = self.card.0.counters();
+            let link = if self.card.0.link_up() { "link up" } else { "no link" };
+            crate::log!("OTW kernel: network: no address yet ({link}, {received} frames received, {sent} sent)");
         }
         // Closed streams the program let go of.
         let sockets = &mut self.sockets;
@@ -187,10 +193,11 @@ impl Stack {
 
 /// Find the network card and start DHCP; the stack is polled from then on.
 pub fn init(devices: &[crate::pci::Device]) -> bool {
-    let Some(card) = devices.iter().find_map(crate::virtio_net::probe) else {
+    let Some(card) = crate::nic::find(devices) else {
         return false;
     };
-    let mac = card.mac;
+    let mac = card.mac();
+    let name = card.name();
     let mut card = Card(card);
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = apic::now_us() ^ unsafe { core::arch::x86_64::_rdtsc() };
@@ -199,7 +206,8 @@ pub fn init(devices: &[crate::pci::Device]) -> bool {
     let dhcp = sockets.add(dhcpv4::Socket::new());
     let dns = sockets.add(dns::Socket::new(&[], Vec::new()));
     crate::log!(
-        "OTW kernel: network card {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        "OTW kernel: network card ({}) {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        name,
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
     *STACK.lock() = Some(Stack {
@@ -216,6 +224,7 @@ pub fn init(devices: &[crate::pci::Device]) -> bool {
         reported: 0,
     });
     sched::spawn(|| loop {
+        let _tag = crate::profile::on().then(|| sched::tagged(crate::profile::tag("[network]")));
         if let Some(stack) = STACK.lock().as_mut() {
             stack.poll();
         }

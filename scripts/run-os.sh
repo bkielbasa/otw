@@ -3,7 +3,7 @@
 # real machine would: the PC's own PS/2 keyboard and mouse, a plain VGA
 # card. The kernel logs to the serial port (VM_SERIAL).
 # Settings: OS_IMAGE, VM_CPUS (8), VM_MEMORY (8G), VM_DISK (nvme; sata),
-# VM_DISPLAY (gtk; none),
+# VM_DISPLAY (gtk; none), VM_NIC (virtio-net-pci; e1000, e1000e, igb),
 # VM_MONITOR (unix socket for the QEMU monitor), VM_QMP (unix socket for
 # QMP), VM_SERIAL (serial log file).
 set -euo pipefail
@@ -59,7 +59,7 @@ exec qemu-system-x86_64 \
   -drive "if=pflash,format=raw,file=$VARS" \
   -drive "file=$IMAGE,if=none,id=disk,format=raw" \
   "${disk_args[@]}" \
-  -nic user,model=virtio-net-pci \
+  -nic "user,model=${VM_NIC:-virtio-net-pci}" \
   -vga std \
   "${display_args[@]}" \
   "${args[@]}"

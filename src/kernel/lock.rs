@@ -30,12 +30,20 @@ struct Owner {
     since: Option<std::time::Instant>,
     /// The owner's name (OTW_TRACE_LOCK).
     name: String,
+    /// Threads waiting for it (a release wakes one only then).
+    waiting: usize,
 }
 
 #[derive(Default)]
 pub struct BigLock {
     owner: Mutex<Owner>,
     free: Condvar,
+    /// Whether some thread holds it (what spinning threads look at,
+    /// without taking `owner`).
+    busy: std::sync::atomic::AtomicBool,
+    /// What tells whether the process's state is in use (it must not be
+    /// when the lock is given up): a function and its argument.
+    in_use: std::sync::OnceLock<(fn(usize) -> bool, usize)>,
 }
 
 fn trace_lock() -> bool {
@@ -79,20 +87,20 @@ impl BigLock {
         let me = std::thread::current().id();
         // Briefly spin before sleeping: the lock is held for short spells
         // (a system call), and waking a sleeper costs more.
-        for _ in 0..200 {
-            let owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
-            if owner.thread.is_none() || owner.thread == Some(me) {
+        for _ in 0..100 {
+            if !self.busy.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            drop(owner);
             std::hint::spin_loop();
         }
         let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
         if owner.thread.is_some_and(|t| t != me) {
             let started = std::time::Instant::now();
+            owner.waiting += 1;
             while owner.thread.is_some_and(|t| t != me) {
                 owner = self.free.wait(owner).unwrap_or_else(|p| p.into_inner());
             }
+            owner.waiting -= 1;
             if trace_lock() {
                 WAITED.with(|w| {
                     let mut w = w.borrow_mut();
@@ -112,6 +120,7 @@ impl BigLock {
             owner.since = Some(std::time::Instant::now());
         }
         owner.thread = Some(me);
+        self.busy.store(true, std::sync::atomic::Ordering::Relaxed);
         owner.depth += 1;
     }
 
@@ -124,6 +133,7 @@ impl BigLock {
         owner.depth -= 1;
         if owner.depth == 0 {
             owner.thread = None;
+            self.busy.store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(since) = owner.since.take() {
                 let held = since.elapsed();
                 HELD.with(|h| {
@@ -137,13 +147,42 @@ impl BigLock {
                     }
                 });
             }
-            self.free.notify_one();
+            if owner.waiting > 0 {
+                self.free.notify_one();
+            }
+        }
+    }
+
+    /// Name a check that the process's state is not in use, made whenever
+    /// the lock is given up (a use then races with other threads').
+    pub fn set_in_use_check(&self, check: fn(usize) -> bool, argument: usize) {
+        let _ = self.in_use.set((check, argument));
+    }
+
+    #[track_caller]
+    fn check_not_in_use(&self) {
+        if let Some(&(check, argument)) = self.in_use.get() {
+            if check(argument) {
+                let at = core::panic::Location::caller();
+                static SEEN: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+                if !seen.contains(&(at.file(), at.line())) {
+                    seen.push((at.file(), at.line()));
+                    eprintln!("[lock] given up at {at} while the process state is in use");
+                }
+            }
         }
     }
 
     /// Give up every hold this host thread has; returns how many, for
     /// `reacquire`.
+    #[track_caller]
     pub fn release_all(self: &Arc<Self>) -> usize {
+        self.check_not_in_use();
+        self.release_all_unchecked()
+    }
+
+    fn release_all_unchecked(self: &Arc<Self>) -> usize {
         let depth = {
             let owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
             if owner.thread != Some(std::thread::current().id()) {
@@ -167,12 +206,15 @@ impl BigLock {
 
 /// Run `f` without the lock of the process this host thread is in the
 /// system for (sleeping, waiting for another thread or process).
+#[track_caller]
 pub fn unlocked<R>(f: impl FnOnce() -> R) -> R {
     let lock = ACTIVE.with(|active| active.borrow().last().cloned());
     match lock {
         Some(lock) => {
-            let depth = lock.release_all();
+            lock.check_not_in_use();
+            let depth = lock.release_all_unchecked();
             let result = f();
+            let _doing = std::doing("lock: again");
             lock.reacquire(depth);
             result
         }

@@ -27,6 +27,16 @@ const CONFIGURATION: &[(&str, &str)] = &[
     ("OTW_ENV_MOZ_DISABLE_CONTENT_SANDBOX", "1"),
 ];
 
+/// The configuration, and what the kernel was built with in OTW_KERNEL_ENV
+/// ("NAME=value,NAME=value": tracing, for one).
+fn configuration() -> impl Iterator<Item = (&'static str, &'static str)> {
+    let extra = option_env!("OTW_KERNEL_ENV").unwrap_or("");
+    extra
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .chain(CONFIGURATION.iter().copied())
+}
+
 pub struct Kernel {
     drive: Option<Fat32FileSystem>,
     boot_unix_time: u64,
@@ -110,11 +120,11 @@ impl System for Kernel {
     }
 
     fn env(&self, name: &str) -> Option<String> {
-        CONFIGURATION.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
+        configuration().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
     }
 
     fn vars(&self) -> Vec<(String, String)> {
-        CONFIGURATION.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
+        configuration().map(|(n, v)| (n.to_string(), v.to_string())).collect()
     }
 
     fn sleep_us(&self, us: u64) {
@@ -123,6 +133,28 @@ impl System for Kernel {
 
     fn yield_now(&self) {
         crate::sched::yield_now();
+    }
+
+    fn wait_on(&self, word: &core::sync::atomic::AtomicU32, expected: u32, timeout_us: u64) {
+        crate::sched::wait_on(word, expected, timeout_us);
+    }
+
+    fn tag(&self, name: &'static str) -> usize {
+        if !crate::profile::on() {
+            return 0;
+        }
+        let task = crate::sched::current();
+        core::mem::replace(&mut task.tag, crate::profile::tag(name))
+    }
+
+    fn untag(&self, previous: usize) {
+        if crate::profile::on() {
+            crate::sched::current().tag = previous;
+        }
+    }
+
+    fn wake(&self, word: &core::sync::atomic::AtomicU32, all: bool) {
+        crate::sched::wake(word, all);
     }
 
     fn thread_id(&self) -> u64 {

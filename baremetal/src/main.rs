@@ -20,11 +20,15 @@ mod desktop;
 mod disk;
 mod heap;
 mod io;
+mod intel_net;
 mod net;
+mod nic;
 mod nvme;
 mod paging;
 mod pci;
 mod process;
+mod profile;
+mod realtek_net;
 mod sched;
 mod screen;
 mod smp;
@@ -246,6 +250,11 @@ extern "sysv64" fn kernel_main2(regions: &Vec<Region>) -> ! {
 
     let (disks, drive_c) = find_disks();
     log!("OTW kernel: disks found ({} ms)", ms_since_start());
+    // A profile of where the CPUs' time goes, in the status report every
+    // ten seconds (a kernel built with OTW_PROFILE=1).
+    if option_env!("OTW_PROFILE").is_some_and(|v| v != "0") {
+        profile::start();
+    }
     if !net::init(&pci::scan()) {
         log!("OTW kernel: no network card this kernel drives");
     }

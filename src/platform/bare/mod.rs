@@ -41,6 +41,22 @@ pub trait System: Send + Sync {
     fn yield_now(&self) {
         self.sleep_us(0);
     }
+    /// Block the calling thread while `word` holds `expected`, until
+    /// `wake(word)` or `timeout_us` passes (u64::MAX: none). It may return
+    /// early (callers check again).
+    fn wait_on(&self, word: &core::sync::atomic::AtomicU32, expected: u32, timeout_us: u64) {
+        if word.load(core::sync::atomic::Ordering::SeqCst) == expected {
+            self.sleep_us(timeout_us.min(1000));
+        }
+    }
+    /// Name what the running thread does (for a profile); returns what it
+    /// was doing, for `untag`.
+    fn tag(&self, _name: &'static str) -> usize {
+        0
+    }
+    fn untag(&self, _previous: usize) {}
+    /// Wake one thread blocked on `word`, or all of them.
+    fn wake(&self, _word: &core::sync::atomic::AtomicU32, _all: bool) {}
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
     fn write_file(&self, path: &str, data: &[u8]) -> bool;
     fn info(&self, path: &str) -> Option<FileInfo>;

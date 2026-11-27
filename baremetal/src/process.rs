@@ -11,6 +11,7 @@
 //! wait or end (`run_thread`), and is run again later from the same call.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -54,11 +55,14 @@ pub fn report() {
     if otw_vm::platform::env::var("OTW_TRACE_STATUS").map_or(true, |v| v == "0") {
         return;
     }
-    let runners = RUNNERS.lock().unwrap().clone();
-    for runner in runners {
+    // (The list stays locked: a program that ends leaves it first, and
+    // its Runner goes only after.)
+    let runners = RUNNERS.lock().unwrap();
+    for &runner in runners.iter() {
         let runner = unsafe { &*(runner as *const Runner) };
         let _hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
-        let recent: Vec<String> = runner.recent.borrow().iter().rev().take(6).cloned().collect();
+        let mut recent = runner.recent_calls(6);
+        recent.reverse();
         let mut counts: Vec<(String, u64)> = core::mem::take(&mut *runner.counts.borrow_mut()).into_iter().collect();
         counts.sort_by(|a, b| b.1.cmp(&a.1));
         let top: Vec<String> = counts.iter().map(|(n, c)| alloc::format!("{n} {c}")).collect();
@@ -83,6 +87,88 @@ pub fn report() {
             recent.join(", ")
         );
     }
+}
+
+/// Where the CPUs' time went since the last report (OTW_PROFILE): idle,
+/// program code by module and place, kernel work by call or task.
+pub fn profile_report() {
+    if !crate::profile::on() {
+        return;
+    }
+    let samples = crate::profile::take();
+    if samples.is_empty() {
+        return;
+    }
+    let runners = RUNNERS.lock().unwrap();
+    // Each program's address space and modules (copied under its lock).
+    let mut spaces: Vec<(u64, String, Vec<(String, u64, u64, Vec<(u32, String)>)>)> = Vec::new();
+    for &runner in runners.iter() {
+        let runner = unsafe { &*(runner as *const Runner) };
+        let _hold = otw_vm::kernel::lock::Hold::new(&runner.lock);
+        let modules = runner
+            .modules
+            .borrow()
+            .iter()
+            .map(|m| {
+                let mut exports: Vec<(u32, String)> = m.exports_by_name.iter().map(|(n, &rva)| (rva, n.clone())).collect();
+                exports.sort();
+                (m.name.clone(), m.image_base as u64, m.size as u64, exports)
+            })
+            .collect();
+        spaces.push((runner.space.root, runner.name.clone(), modules));
+    }
+    drop(runners);
+    let total = samples.len() as u64;
+    let mut idle = 0u64;
+    let mut kernel: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_module: BTreeMap<String, u64> = BTreeMap::new();
+    let mut places: BTreeMap<String, u64> = BTreeMap::new();
+    let mut user = 0u64;
+    for s in &samples {
+        match s.kind {
+            crate::profile::IDLE => idle += 1,
+            crate::profile::USER => {
+                user += 1;
+                let space = spaces.iter().find(|(root, _, _)| *root == s.space);
+                let module = space.and_then(|(_, _, modules)| modules.iter().find(|(_, base, size, _)| s.at >= *base && s.at < base + size));
+                let (module_name, place) = match module {
+                    Some((name, base, _, exports)) => {
+                        let rva = (s.at - base) as u32;
+                        let near = exports.iter().rev().find(|(e, _)| *e <= rva);
+                        let place = match near {
+                            Some((e, n)) if rva - e < 0x1000 => alloc::format!("{name}!{n}+{:#x}", rva - e),
+                            _ => alloc::format!("{name}+{:#x}", rva & !0xFF),
+                        };
+                        (name.clone(), place)
+                    }
+                    None => (String::from("?"), alloc::format!("{:#x}", s.at & !0xFF)),
+                };
+                *by_module.entry(module_name).or_default() += 1;
+                *places.entry(place).or_default() += 1;
+            }
+            _ => {
+                let name = crate::profile::name(s.at as usize);
+                let key = if name.is_empty() { alloc::format!("[task {}]", s.task) } else { String::from(name) };
+                *kernel.entry(key).or_default() += 1;
+            }
+        }
+    }
+    let top = |map: BTreeMap<String, u64>, n: usize| -> String {
+        let mut v: Vec<(String, u64)> = map.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.iter().take(n).map(|(k, c)| alloc::format!("{k} {:.1}%", *c as f64 * 100.0 / total as f64)).collect::<Vec<_>>().join(", ")
+    };
+    let kernel_total = total - idle - user;
+    log!(
+        "OTW kernel: [profile] {} samples: idle {:.1}%, programs {:.1}%, kernel {:.1}%",
+        total,
+        idle as f64 * 100.0 / total as f64,
+        user as f64 * 100.0 / total as f64,
+        kernel_total as f64 * 100.0 / total as f64
+    );
+    log!("OTW kernel: [profile] kernel: {}", top(kernel, 25));
+    log!("OTW kernel: [profile] modules: {}", top(by_module, 12));
+    log!("OTW kernel: [profile] places: {}", top(places, 25));
 }
 
 /// How a program run ended.
@@ -154,8 +240,15 @@ impl<T: Default> PerTask<T> {
 /// The program's memory, threads and state.
 struct Runner {
     space: AddressSpace,
+    /// The process's subsystem state (checked: never borrowed while its
+    /// code runs, when other threads may want it).
+    state: Rc<RefCell<SharedState>>,
     x64: bool,
     entries: Vec<IatEntry>,
+    /// The program's file name.
+    name: String,
+    /// Each entry's profile tag (OTW_PROFILE), made when first called.
+    tags: RefCell<Vec<usize>>,
     syscalls: Rc<dyn SystemCalls>,
     /// The loaded modules (to name code addresses when a program fails).
     modules: Rc<RefCell<Vec<otw_vm::win32::LoadedModule>>>,
@@ -200,7 +293,8 @@ struct Runner {
     /// The last ranges unmapped (for when a program touches one).
     unmapped: RefCell<alloc::collections::VecDeque<(u64, u64)>>,
     /// The last calls made (for when a program ends badly).
-    recent: RefCell<alloc::collections::VecDeque<String>>,
+    /// (Entries, by index: named only when shown.)
+    recent: RefCell<alloc::collections::VecDeque<usize>>,
 }
 
 /// What the subsystem sees of the program (`GuestMemory`), while it runs a
@@ -330,6 +424,12 @@ impl Runner {
             }
             // Program code runs without the subsystem's lock.
             let depth = self.lock.release_all();
+            if depth == 0 {
+                static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    log!("OTW kernel: [lock] program code entered without the lock, in {:?}", crate::profile::name(crate::sched::current().tag));
+                }
+            }
             user::run(regs);
             let vector = regs.vector as u8;
             if vector == arch::TIMER_VECTOR || vector == arch::WAKE_VECTOR {
@@ -340,7 +440,11 @@ impl Runner {
                 self.lock.reacquire(depth);
                 continue;
             }
-            self.lock.reacquire(depth);
+            {
+                let _tag = crate::profile::on().then(|| crate::sched::tagged(crate::profile::tag("[lock]")));
+                self.lock.reacquire(depth);
+            }
+            let _tag = (crate::profile::on() && regs.vector == 14).then(|| crate::sched::tagged(crate::profile::tag("[page fault]")));
             let stop = match regs.vector as u8 {
                 arch::SYSTEM_CALL_VECTOR => self.system_call(regs),
                 arch::CALLBACK_RETURN_VECTOR => Some(Stop::Returned(regs.rax)),
@@ -467,6 +571,13 @@ impl Runner {
         None
     }
 
+    /// The last `n` calls made, by name, oldest first.
+    fn recent_calls(&self, n: usize) -> Vec<String> {
+        let recent = self.recent.borrow();
+        let skip = recent.len().saturating_sub(n);
+        recent.iter().skip(skip).map(|&i| self.syscalls.describe(&self.entries[i].dll, &self.entries[i].name)).collect()
+    }
+
     /// The program called an import: run it in the subsystem.
     fn system_call(&self, regs: &mut UserRegs) -> Option<Stop> {
         let thunk = regs.rip.wrapping_sub(2);
@@ -480,13 +591,21 @@ impl Runner {
             return Some(self.fail(format!("a system call from {:#x}, not an import", regs.rip)));
         };
         self.api_calls.set(self.api_calls.get() + 1);
+        let index = (entry as *const IatEntry as usize - self.entries.as_ptr() as usize) / core::mem::size_of::<IatEntry>();
+        let _tag = crate::profile::on().then(|| {
+            let mut tags = self.tags.borrow_mut();
+            if tags[index] == 0 {
+                tags[index] = crate::profile::tag(&self.syscalls.describe(&entry.dll, &entry.name));
+            }
+            crate::sched::tagged(tags[index])
+        });
         {
             let mut recent = self.recent.borrow_mut();
             if recent.len() >= 40 {
                 recent.pop_front();
             }
-            let described = self.syscalls.describe(&entry.dll, &entry.name);
             if self.trace_status {
+                let described = self.syscalls.describe(&entry.dll, &entry.name);
                 let short: String = described.rsplit('!').next().unwrap_or("").into();
                 *self.counts.borrow_mut().entry(short.clone()).or_default() += 1;
                 let mut last = self.last_call.borrow_mut();
@@ -499,7 +618,7 @@ impl Runner {
                 last.1 = crate::apic::now_us();
                 last.2 += 1;
             }
-            recent.push_back(described);
+            recent.push_back(index);
         }
         let x64 = self.x64;
         let esp = regs.rsp;
@@ -528,7 +647,7 @@ impl Runner {
             // programs), named in the log, to see what comes next.
             if x64 && otw_vm::platform::env::var_os("OTW_STUB_MISSING").is_some() {
                 let name = self.syscalls.describe(&entry.dll, &entry.name);
-                if self.recent.borrow().iter().filter(|n| **n == name).count() <= 1 {
+                if self.recent.borrow().iter().filter(|&&n| n == index).count() <= 1 {
                     log!("[stub] {name} returns 0");
                 }
                 regs.rax = 0;
@@ -1382,9 +1501,12 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
     let main = image.main();
     let x64 = main.is64;
     let runner = Runner {
+        state: shared.clone(),
         space: AddressSpace::new(),
         x64,
         entries: vm.iat().entries.clone(),
+        name: path.rsplit('\\').next().unwrap_or(path).into(),
+        tags: RefCell::new(alloc::vec![0; vm.iat().entries.len()]),
         syscalls: Rc::new(vm.api_context().clone()),
         modules: vm.api_context().modules.clone(),
         dispatcher: image.entry_point(KERNEL_DLL, EXCEPTION_DISPATCHER).unwrap_or(0) as u64,
@@ -1503,6 +1625,10 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         (apic::now_us() - started) / 1000
     );
 
+    fn state_in_use(state: usize) -> bool {
+        unsafe { &*(state as *const RefCell<SharedState>) }.try_borrow_mut().is_err()
+    }
+    runner.lock.set_in_use_check(state_in_use, Rc::as_ptr(&runner.state) as usize);
     RUNNERS.lock().unwrap().push(&runner as *const Runner as usize);
     let on_desktop = crate::desktop::program_started(shared, &runner.lock, path.rsplit('\\').next().unwrap_or(path));
     // In the subsystem (until program code runs).
@@ -1562,7 +1688,7 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         runner.next_thread.get() - 1
     );
     if !matches!(ended, Ended::Exited(0)) {
-        log!("OTW kernel: its last calls: {}", runner.recent.borrow().iter().cloned().collect::<Vec<_>>().join(", "));
+        log!("OTW kernel: its last calls: {}", runner.recent_calls(40).join(", "));
     }
     otw_vm::win32::registry::flush();
     ended

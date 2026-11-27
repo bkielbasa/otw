@@ -252,3 +252,24 @@ impl VirtioNet {
         result
     }
 }
+
+impl crate::nic::Nic for VirtioNet {
+    fn name(&self) -> &'static str {
+        "virtio"
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+    fn receive(&mut self) -> Option<Vec<u8>> {
+        VirtioNet::receive(self)
+    }
+    fn can_send(&mut self) -> bool {
+        VirtioNet::can_send(self)
+    }
+    fn send(&mut self, frame: &[u8]) {
+        VirtioNet::send(self, frame.len(), |bytes| bytes.copy_from_slice(&frame[..bytes.len()]));
+    }
+    fn counters(&self) -> (u64, u64) {
+        (self.received, self.sent)
+    }
+}

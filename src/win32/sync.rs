@@ -825,7 +825,9 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
     };
     let pid = ctx.shared.borrow().pid;
     loop {
+        let doing = std::doing("wait: interest");
         let _interest = crate::win32::kobj::interest(pid, keys.clone());
+        drop(doing);
         if !reported && began.elapsed().as_secs() >= 20 && std::env::var_os("OTW_TRACE_WAITS").is_some() {
             reported = true;
             let pid = ctx.shared.borrow().pid;
@@ -849,8 +851,13 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             }
         }
         let generation = crate::win32::kobj::generation();
+        let doing = std::doing("wait: processes");
         refresh_processes(ctx);
+        drop(doing);
+        let doing = std::doing("wait: pipes");
         crate::win32::ipc::poll(ctx, memory);
+        drop(doing);
+        let doing = std::doing("wait: objects");
         let me = ctx.shared.borrow().pid;
         if crate::win32::kobj::terminated(me) {
             // Another process ended this one: stop here for good.
@@ -895,13 +902,16 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         if wait.deadline.is_some_and(|deadline| now >= deadline) {
             return Outcome::Timeout;
         }
+        drop(doing);
         if memory.suspend_thread() {
             ctx.shared.borrow_mut().sync.waits.insert(thread, wait);
             return Outcome::Suspended;
         }
+        let doing = std::doing("wait: other threads");
         if run_ready_threads(ctx, memory) {
             continue;
         }
+        drop(doing);
         // Nothing else can run.
         let on_programs = {
             let shared = ctx.shared.borrow();
@@ -932,11 +942,13 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
             let remaining = wait.deadline.map(|d| d.saturating_sub(now)).unwrap_or(cap).min(cap);
             // Until another process changes something, or a while.
             let _ = generation;
+            let doing = std::doing("wait: park");
             crate::kernel::lock::unlocked(|| {
                 // Keep up with other threads' memory changes meanwhile.
                 memory.sync_memory();
                 crate::win32::kobj::park(std::time::Duration::from_millis(remaining.max(1)))
             });
+            drop(doing);
             memory.sync_memory();
         }
     }
