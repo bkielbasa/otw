@@ -213,6 +213,10 @@ pub mod time {
         pub fn now() -> Self {
             Self(super::system().now_us())
         }
+        /// The kernel clock's reading (microseconds since it started).
+        pub fn micros(&self) -> u64 {
+            self.0
+        }
         pub fn elapsed(&self) -> Duration {
             Self::now().duration_since(*self)
         }

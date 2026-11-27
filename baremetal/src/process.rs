@@ -1614,6 +1614,14 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         runner.init_teb64(tib, STACK_TOP as u64, X64_STACK_LOW, 1);
         let peb = tib + 0x2000;
         runner.write(peb + 0x20, &(peb + 0x400).to_le_bytes());
+        // The clock the program's own QueryPerformanceCounter reads
+        // (native.rs): microseconds since the process's start, as the
+        // subsystem counts them.
+        let started = vm.api_context().shared.borrow().started.micros();
+        let clock = peb + otw_vm::win32::native::PEB_CLOCK as u64;
+        for (offset, value) in [(0u64, apic::boot_tsc()), (8, apic::tsc_mhz()), (16, started)] {
+            runner.write(clock + offset, &value.to_le_bytes());
+        }
     } else {
         for (offset, value) in [(0u64, u32::MAX), (4, STACK_TOP), (8, STACK_BASE), (0x18, TIB_BASE), (0x30, TIB_BASE + 0x800)] {
             runner.write(tib + offset, &value.to_le_bytes());

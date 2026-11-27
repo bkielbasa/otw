@@ -162,6 +162,11 @@ pub fn start_timer(hz: u32) {
     write(TIMER_INITIAL, TIMER_PER_MS.load(Ordering::Relaxed) * 1000 / hz);
 }
 
+/// The time-stamp counter when the clock started (`now_us` 0).
+pub fn boot_tsc() -> u64 {
+    BOOT_TSC.load(Ordering::Relaxed)
+}
+
 pub fn tsc_mhz() -> u64 {
     TSC_PER_US.load(Ordering::Relaxed)
 }

@@ -15,7 +15,9 @@
 //! - a slim reader/writer lock's first 32 bits hold an exclusive owner
 //!   (bit 0), waiters in the subsystem (bit 1) and readers (from bit 2, 4
 //!   each). Only the subsystem, under its lock, changes bit 1; code here
-//!   takes the system call whenever it is set.
+//!   takes the system call whenever it is set;
+//! - the PEB holds the clock QueryPerformanceCounter reads (`PEB_CLOCK`),
+//!   when the kernel publishes one.
 
 #[allow(unused_imports)]
 use crate::platform as std;
@@ -29,6 +31,13 @@ pub const TEB_THREAD_ID: u32 = 0x48;
 pub const TEB_LAST_ERROR: u32 = 0x68;
 pub const TEB_TLS_SLOTS: u32 = 0x1480;
 pub const TLS_SLOTS: u32 = 64;
+
+/// The clock in the PEB (from `PEB_CLOCK`): the time-stamp counter at
+/// the kernel's start, its ticks per microsecond (0: no clock published,
+/// the system call answers) and the microsecond (of the kernel's clock)
+/// the process started at. QueryPerformanceCounter counts microseconds
+/// since the process started, as the subsystem's own does.
+pub const PEB_CLOCK: u32 = 0xC00;
 
 /// Critical section fields (see above).
 pub const CS_RECURSION: u32 = 8;
@@ -254,6 +263,33 @@ const WAIT_ON_ADDRESS: &[u8] = &[
     0xE9, 0x00, 0x00, 0x00, 0x00, // slow: jmp WaitOnAddress
 ];
 
+/// QueryPerformanceCounter(&count): microseconds since the process started,
+/// from the time-stamp counter and the clock in the PEB.
+const QUERY_PERFORMANCE_COUNTER: &[u8] = &[
+    0x65, 0x4C, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // mov r8, gs:[0x60] (the PEB)
+    0x4D, 0x8B, 0x88, 0x08, 0x0C, 0x00, 0x00, // mov r9, [r8+0xC08] (ticks per microsecond)
+    0x4D, 0x85, 0xC9, // test r9, r9
+    0x74, 0x25, // jz slow
+    0x0F, 0x31, // rdtsc
+    0x48, 0xC1, 0xE2, 0x20, // shl rdx, 32
+    0x48, 0x09, 0xD0, // or rax, rdx
+    0x49, 0x2B, 0x80, 0x00, 0x0C, 0x00, 0x00, // sub rax, [r8+0xC00] (counter at the start)
+    0x31, 0xD2, // xor edx, edx
+    0x49, 0xF7, 0xF1, // div r9
+    0x49, 0x2B, 0x80, 0x10, 0x0C, 0x00, 0x00, // sub rax, [r8+0xC10] (the process's start)
+    0x48, 0x89, 0x01, // mov [rcx], rax
+    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+    0xC3, // ret
+    0xE9, 0x00, 0x00, 0x00, 0x00, // slow: jmp QueryPerformanceCounter
+];
+
+/// QueryPerformanceFrequency(&frequency): microseconds.
+const QUERY_PERFORMANCE_FREQUENCY: &[u8] = &[
+    0x48, 0xC7, 0x01, 0x40, 0x42, 0x0F, 0x00, // mov qword [rcx], 1000000
+    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+    0xC3, // ret
+];
+
 /// The code for a KERNEL32 (or NTDLL, or API set) function, by name.
 pub fn kernel_native(name: &str) -> Option<Native> {
     let (code, slow) = match name {
@@ -274,6 +310,8 @@ pub fn kernel_native(name: &str) -> Option<Native> {
         "TryAcquireSRWLockExclusive" | "RtlTryAcquireSRWLockExclusive" => (SRW_TRY_EXCLUSIVE, false),
         "TryAcquireSRWLockShared" | "RtlTryAcquireSRWLockShared" => (SRW_TRY_SHARED, false),
         "WaitOnAddress" => (WAIT_ON_ADDRESS, true),
+        "QueryPerformanceCounter" | "RtlQueryPerformanceCounter" => (QUERY_PERFORMANCE_COUNTER, true),
+        "QueryPerformanceFrequency" | "RtlQueryPerformanceFrequency" => (QUERY_PERFORMANCE_FREQUENCY, false),
         _ => return None,
     };
     Some(Native { code, slow })
@@ -485,6 +523,37 @@ mod tests {
             assert_eq!(cpu.call("WaitOnAddress", [address, compare, size, u32::MAX as u64]), Ran::Returned(1), "size {size}");
         }
         assert_eq!(cpu.call("WaitOnAddress", [address, compare, 3, 0]), Ran::SystemCall);
+    }
+
+    #[test]
+    fn the_performance_counter_reads_the_clock_in_the_peb() {
+        let mut cpu = Cpu::new(1);
+        let peb = TEB + 0x2000;
+        cpu.0.mem_write(TEB + 0x60, &peb.to_le_bytes()).unwrap();
+        let out = DATA + 0x400;
+        // No clock published: the subsystem answers.
+        assert_eq!(cpu.call("QueryPerformanceCounter", [out, 0, 0, 0]), Ran::SystemCall);
+        // A counter at 1 tick per microsecond since 0, the process started
+        // at 0: the counter itself, which only grows.
+        let clock = peb + PEB_CLOCK as u64;
+        cpu.0.mem_write(clock, &0u64.to_le_bytes()).unwrap();
+        cpu.0.mem_write(clock + 8, &1u64.to_le_bytes()).unwrap();
+        assert_eq!(cpu.call("QueryPerformanceCounter", [out, 0, 0, 0]), Ran::Returned(1));
+        let read = |cpu: &Cpu| {
+            let mut bytes = [0u8; 8];
+            cpu.0.mem_read(out, &mut bytes).unwrap();
+            u64::from_le_bytes(bytes)
+        };
+        let first = read(&cpu);
+        assert!(first > 0);
+        cpu.call("QueryPerformanceCounter", [out, 0, 0, 0]);
+        assert!(read(&cpu) >= first);
+        // A process that started later counts from its start.
+        cpu.0.mem_write(clock + 16, &first.to_le_bytes()).unwrap();
+        cpu.call("QueryPerformanceCounter", [out, 0, 0, 0]);
+        assert!(read(&cpu) < first);
+        assert_eq!(cpu.call("QueryPerformanceFrequency", [out, 0, 0, 0]), Ran::Returned(1));
+        assert_eq!(read(&cpu), 1_000_000);
     }
 
     #[test]
