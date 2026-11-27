@@ -37,17 +37,48 @@ pub trait Fetch {
     fn open(&self, url: &str) -> Result<Response>;
 
     fn get(&self, url: &str) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        self.open(url)?
-            .body
-            .take(MAX_METADATA + 1)
-            .read_to_end(&mut out)
-            .map_err(|e| Error::Http(format!("{url}: {e}")))?;
+        self.get_with_progress(url, &mut |_, _| {})
+    }
+
+    /// Like [`Fetch::get`], calling `progress` with the bytes read so far
+    /// and the total, when known.
+    fn get_with_progress(
+        &self,
+        url: &str,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>> {
+        let response = self.open(url)?;
+        let total = response.length;
+        let mut body = response.body.take(MAX_METADATA + 1);
+        let mut out = Vec::with_capacity(total.unwrap_or(0).min(MAX_METADATA) as usize);
+        let mut buf = vec![0u8; 64 * 1024];
+        progress(0, total);
+        loop {
+            let n = body
+                .read(&mut buf)
+                .map_err(|e| Error::Http(format!("{url}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            progress(out.len() as u64, total);
+        }
         if out.len() as u64 > MAX_METADATA {
             return Err(Error::format(format!("{url} is too large")));
         }
         Ok(out)
     }
+}
+
+/// What [`Source::index_with_progress`] is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexProgress {
+    /// Reading the cached copy.
+    ReadingCache,
+    /// Downloading `source2.msix`: bytes so far and the total, when known.
+    Downloading { done: u64, total: Option<u64> },
+    /// Unpacking and checking the downloaded index.
+    Unpacking,
 }
 
 /// HTTPS through ureq with rustls and compiled-in root certificates, so
@@ -156,7 +187,16 @@ impl<F: Fetch> Source<F> {
 
     /// Downloads `source2.msix` and stores its `index.db` in the cache.
     pub fn update(&self) -> Result<Vec<u8>> {
-        let msix = self.fetch.get(&util::join(&self.base, "source2.msix"))?;
+        self.update_with_progress(&mut |_| {})
+    }
+
+    /// [`Source::update`], reporting what it is doing.
+    pub fn update_with_progress(&self, progress: &mut dyn FnMut(IndexProgress)) -> Result<Vec<u8>> {
+        let msix = self.fetch.get_with_progress(
+            &util::join(&self.base, "source2.msix"),
+            &mut |done, total| progress(IndexProgress::Downloading { done, total }),
+        )?;
+        progress(IndexProgress::Unpacking);
         let db = zip::Archive::open(&msix)?.read("Public/index.db")?;
         // Make sure it loads before replacing a good cached copy.
         Index::from_sqlite(&db)?;
@@ -170,8 +210,18 @@ impl<F: Fetch> Source<F> {
 
     /// The package index, from the cache when it is fresh enough.
     pub fn index(&self, force_update: bool) -> Result<(Index, IndexOrigin)> {
+        self.index_with_progress(force_update, &mut |_| {})
+    }
+
+    /// [`Source::index`], reporting what it is doing.
+    pub fn index_with_progress(
+        &self,
+        force_update: bool,
+        progress: &mut dyn FnMut(IndexProgress),
+    ) -> Result<(Index, IndexOrigin)> {
         let path = self.cached_index_path();
         if !force_update && self.cache_is_fresh(&path) {
+            progress(IndexProgress::ReadingCache);
             if let Ok(index) = std::fs::read(&path)
                 .map_err(Error::from)
                 .and_then(|d| Index::from_sqlite(&d))
@@ -179,7 +229,7 @@ impl<F: Fetch> Source<F> {
                 return Ok((index, IndexOrigin::Cache));
             }
         }
-        match self.update() {
+        match self.update_with_progress(progress) {
             Ok(db) => Ok((Index::from_sqlite(&db)?, IndexOrigin::Downloaded)),
             // Offline: an old index is better than none.
             Err(e) => match std::fs::read(&path) {
@@ -367,6 +417,47 @@ pub(crate) mod tests {
         let (_, origin) = src.index(true).unwrap();
         assert_eq!(origin, IndexOrigin::Downloaded);
         std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn index_progress_reports_download_then_cache() {
+        let cache = temp_dir("progress");
+        let src = fake_source(&cache);
+        let mut seen = Vec::new();
+        src.index_with_progress(false, &mut |p| seen.push(p))
+            .unwrap();
+        let size = make_zip("Public/index.db", &fixture("index.db")).len() as u64;
+        assert_eq!(
+            seen.first(),
+            Some(&IndexProgress::Downloading {
+                done: 0,
+                total: Some(size)
+            })
+        );
+        assert!(seen.contains(&IndexProgress::Downloading {
+            done: size,
+            total: Some(size)
+        }));
+        assert_eq!(seen.last(), Some(&IndexProgress::Unpacking));
+        seen.clear();
+        src.index_with_progress(false, &mut |p| seen.push(p))
+            .unwrap();
+        assert_eq!(seen, vec![IndexProgress::ReadingCache]);
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn get_with_progress_counts_bytes() {
+        let mut fetch = FakeFetch::default();
+        fetch.files.insert("u".into(), vec![7u8; 200_000]);
+        let mut calls = Vec::new();
+        let data = fetch
+            .get_with_progress("u", &mut |n, t| calls.push((n, t)))
+            .unwrap();
+        assert_eq!(data.len(), 200_000);
+        assert_eq!(calls.first(), Some(&(0, Some(200_000))));
+        assert_eq!(calls.last(), Some(&(200_000, Some(200_000))));
+        assert!(calls.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 
     #[test]

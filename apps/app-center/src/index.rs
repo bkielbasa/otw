@@ -20,6 +20,16 @@ pub struct Package {
 }
 
 impl Package {
+    /// The publisher part of the identifier ("Mozilla" for
+    /// "Mozilla.Firefox"): winget identifiers are `Publisher.Package`, and
+    /// the index has no other publisher name.
+    pub fn publisher_hint(&self) -> &str {
+        match self.id.split_once('.') {
+            Some((publisher, rest)) if !publisher.is_empty() && !rest.is_empty() => publisher,
+            _ => "",
+        }
+    }
+
     /// Path of the package's version list, relative to the source's base URL.
     pub fn version_data_path(&self) -> Result<String> {
         if self.hash.len() < 8 {
@@ -153,6 +163,21 @@ mod tests {
             "Notepad++.Notepad++"
         );
         assert!(index.get("No.Such.Package").is_none());
+    }
+
+    #[test]
+    fn publisher_hint_is_the_first_id_part() {
+        let p = |id: &str| Package {
+            id: id.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            p("Mozilla.Firefox.DeveloperEdition").publisher_hint(),
+            "Mozilla"
+        );
+        assert_eq!(p("Notepad++.Notepad++").publisher_hint(), "Notepad++");
+        assert_eq!(p("NoDot").publisher_hint(), "");
+        assert_eq!(p(".x").publisher_hint(), "");
     }
 
     #[test]

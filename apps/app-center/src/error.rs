@@ -20,6 +20,8 @@ pub enum Error {
     },
     /// The command line was wrong.
     Usage(String),
+    /// The user stopped the operation.
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -46,6 +48,7 @@ impl fmt::Display for Error {
                 "SHA-256 mismatch for {what}: expected {expected}, got {actual}"
             ),
             Error::Usage(e) => write!(f, "{e}"),
+            Error::Cancelled => write!(f, "cancelled"),
         }
     }
 }

@@ -11,6 +11,7 @@ use crate::source::Fetch;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Downloaded {
@@ -28,6 +29,20 @@ pub fn download(
     fallback_name: &str,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<Downloaded> {
+    download_cancellable(fetch, installer, dir, fallback_name, progress, None)
+}
+
+/// [`download`] that stops with [`Error::Cancelled`], deleting the partial
+/// file, once `cancel` is set.
+pub fn download_cancellable(
+    fetch: &dyn Fetch,
+    installer: &Installer,
+    dir: &Path,
+    fallback_name: &str,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+    cancel: Option<&AtomicBool>,
+) -> Result<Downloaded> {
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     let expected = hash::normalize(&installer.sha256).ok_or_else(|| {
         Error::format(format!(
             "the manifest has no valid InstallerSha256 for {}; refusing to download unverified",
@@ -47,6 +62,9 @@ pub fn download(
         let mut buf = vec![0u8; 64 * 1024];
         progress(0, response.length);
         loop {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
             let n = body
                 .read(&mut buf)
                 .map_err(|e| Error::Http(format!("{}: {e}", installer.url)))?;
@@ -114,6 +132,33 @@ mod tests {
             Some(&(content.len() as u64, Some(content.len() as u64)))
         );
         assert!(!dir.join("setup-1.0.exe.part").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_deletes_the_partial_file() {
+        let dir = temp_dir("dl-cancel");
+        let content = vec![1u8; 300_000];
+        let (fetch, inst) = setup(&content, &hash::sha256_hex(&content));
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0;
+        let err = download_cancellable(
+            &fetch,
+            &inst,
+            &dir,
+            "x.exe",
+            &mut |n, _| {
+                calls += 1;
+                if n > 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            Some(&cancel),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err}");
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -25,6 +25,34 @@ SHA-256 verified: 9b697f65ecc2d9b0152f5ee96d72dde522a7827690349d9307935dacf40f42
 Silent install switch: /S
 ```
 
+## The graphical App Center
+
+`app-center-gui.exe` is the same thing as a window: a search box, a list
+of apps (popular ones before anything is typed), and a details panel with
+the description, licence, homepage, versions and the installer that would
+be chosen and why. **Download** fetches it in the background with a
+progress bar (size, speed, time left), checks its SHA-256 and saves it to
+the Downloads folder (`FOLDERID_Downloads`, else `C:\My Documents\Downloads`);
+then **Run installer** and **Show in folder** appear. The look follows
+OTW's shell: dark, flat, one blue accent.
+
+Keys: typing searches (after a short pause; Enter searches at once), Up,
+Down, Page Up/Down and Ctrl+Home/End move through the list, Esc clears the
+search, F5 updates the index, Ctrl+V pastes.
+
+It is raw Win32 through `windows-sys`, using only classic USER32/GDI32
+calls that OTW implements: one custom-painted, double-buffered window
+(`CreateCompatibleDC`/`BitBlt`, `FillRect`, `RoundRect`, `Ellipse`,
+`TextOutW`, `GetTextExtentPoint32W`), timers, and `PostMessageW` from
+worker threads. Text wrapping, ellipsis, the search box's editing and caret
+are done in Rust rather than by `DrawText` or an EDIT control. Opening
+files uses `ShellExecuteW`. On other systems the binary just says that it
+needs Windows.
+
+All the state and what is shown lives in the library's `ui` module, which
+has no Win32 in it and is unit-tested on Linux; the binary
+(`src/bin/app-center-gui/`) only paints it and feeds it input.
+
 ## Where the data comes from
 
 winget's default source, `winget`, is a static file tree on
@@ -95,8 +123,8 @@ locale, then the manifest's order. `show` marks the chosen installer and
 
 ## Layout
 
-The library (`src/lib.rs`) does all the work; `src/main.rs` is a thin CLI so
-that a graphical front end can use the same library later.
+The library (`src/lib.rs`) does all the work; `src/main.rs` is a thin CLI
+and `src/bin/app-center-gui/` a thin Win32 front end.
 
 | Module | |
 |--------|---|
@@ -109,8 +137,12 @@ that a graphical front end can use the same library later.
 | `version` | winget's version ordering |
 | `search` | ranking packages against a query |
 | `select` | installer selection |
-| `download`, `hash` | streaming download with SHA-256 verification |
+| `download`, `hash` | streaming download with SHA-256 verification, cancellable |
+| `details` | a package's manifest, versions and chosen installer in one owned value |
 | `cli` | argument parsing |
+| `ui::app` | the GUI's state machine: input and worker events in, effects and view models out |
+| `ui::layout`, `ui::scroll`, `ui::geom` | window layout, list selection and scrolling, hit testing |
+| `ui::text_input`, `ui::format`, `ui::theme` | the search box, user-facing text (progress, errors, wrapping), colours and fonts |
 
 ## Dependencies
 
@@ -141,8 +173,15 @@ and small ZIP/MSZIP files made by `make_small_fixtures.py`.
 
 ### Windows
 
-The goal is to run App Center inside OTW, built for `x86_64-pc-windows-gnu`
-or `-msvc`. The code has no Unix-only parts (the cache directory uses
-`%LOCALAPPDATA%` on Windows). Building for windows-gnu needs `rustup target
-add x86_64-pc-windows-gnu` and, for `ring`, a MinGW C compiler
-(`x86_64-w64-mingw32-gcc`).
+The goal is to run App Center inside OTW. It builds for
+`x86_64-pc-windows-gnullvm` with llvm-mingw (`ring` needs its C compiler):
+
+```
+CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=x86_64-w64-mingw32-clang \
+CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang \
+AR_x86_64_pc_windows_gnullvm=llvm-ar \
+cargo build --release --target x86_64-pc-windows-gnullvm
+```
+
+which gives `app-center.exe` and `app-center-gui.exe`. The code has no
+Unix-only parts (the cache directory uses `%LOCALAPPDATA%` on Windows).

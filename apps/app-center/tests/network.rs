@@ -24,3 +24,27 @@ fn real_index_finds_7zip_and_its_installer() {
     assert!(choice.installer.url.ends_with(".exe"));
     let _ = std::fs::remove_dir_all(&src.cache_dir);
 }
+
+#[test]
+#[ignore = "needs the network"]
+fn featured_apps_exist_and_have_details() {
+    let src = source();
+    let (index, _) = src.index(true).unwrap();
+    let missing: Vec<&str> = app_center::ui::app::FEATURED
+        .iter()
+        .copied()
+        .filter(|id| index.get(id).is_none())
+        .collect();
+    let present = app_center::ui::app::FEATURED.len() - missing.len();
+    assert!(
+        present >= 10,
+        "only {present} featured apps; missing {missing:?}"
+    );
+    for id in ["Mozilla.Firefox", "IrfanSkiljan.IrfanView"] {
+        let pkg = index.get(id).unwrap();
+        let d = app_center::details::fetch(&src, pkg, None, &Preferences::default()).unwrap();
+        assert!(d.installer().is_some(), "{id}: {:?}", d.choice);
+        assert!(!d.versions.is_empty());
+    }
+    let _ = std::fs::remove_dir_all(&src.cache_dir);
+}

@@ -10,6 +10,7 @@
 //! ([`download`], [`hash`]).
 
 pub mod cli;
+pub mod details;
 pub mod download;
 pub mod error;
 pub mod hash;
@@ -20,6 +21,7 @@ pub mod search;
 pub mod select;
 pub mod source;
 pub mod sqlite;
+pub mod ui;
 pub mod util;
 pub mod version;
 pub mod zip;

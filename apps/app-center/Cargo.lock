@@ -15,6 +15,7 @@ dependencies = [
  "miniz_oxide",
  "sha2",
  "ureq",
+ "windows-sys",
  "yaml-rust2",
 ]
 

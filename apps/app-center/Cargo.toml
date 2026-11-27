@@ -23,3 +23,22 @@ yaml-rust2 = { version = "0.10", default-features = false }
 # rustls + ring + the Mozilla root store compiled in: no OpenSSL and no
 # dependency on the operating system's certificate store.
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+[[bin]]
+name = "app-center-gui"
+path = "src/bin/app-center-gui/main.rs"
+
+# Raw Win32 for the graphical front end: classic USER32/GDI32/SHELL32 only.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
