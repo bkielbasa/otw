@@ -29,7 +29,8 @@ pub struct State {
     /// NTDLL's export table has been filled in.
     pub exports_written: bool,
     /// Completion ports: queued (bytes, key, overlapped) packets.
-    pub ports: HashMap<u32, VecDeque<(u32, u64, u64)>>,
+    /// Completion ports' packets (bytes, key, overlapped, when queued).
+    pub ports: HashMap<u32, VecDeque<(u32, u64, u64, std::time::Instant)>>,
     /// Vectored exception handlers, first to call first.
     pub vectored: Vec<(u32, u64)>,
     next_vectored: u32,
@@ -716,7 +717,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 let mut shared = ctx.shared.borrow_mut();
                 match shared.nt.ports.get_mut(&p(0)) {
                     Some(queue) => {
-                        queue.push_back((p(1), arg(2), arg(3)));
+                        queue.push_back((p(1), arg(2), arg(3), std::time::Instant::now()));
                         true
                     }
                     None => {
@@ -741,7 +742,8 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             }
             let packet = ctx.shared.borrow_mut().nt.ports.get_mut(&port).and_then(VecDeque::pop_front);
             match packet {
-                Some((bytes, key, overlapped)) => {
+                Some((bytes, key, overlapped, queued)) => {
+                    crate::win32::kobj::note_port_wait(queued);
                     let _ = memory.write_u32(p(1), bytes);
                     let _ = memory.write_ptr(p(2), key);
                     let _ = memory.write_ptr(p(3), overlapped);

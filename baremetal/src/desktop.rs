@@ -180,7 +180,13 @@ impl Desktop {
         }
         self.dirty |= self.shell.clock_changed();
         static LAST_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        let now_s = apic::now_us() / 10_000_000;
+        // Every ten seconds (OTW_PROFILE_SECONDS for the profiler's).
+        static INTERVAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        if INTERVAL.load(Ordering::Relaxed) == 0 {
+            let seconds = otw_vm::platform::env::var("OTW_PROFILE_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0);
+            INTERVAL.store(seconds.unwrap_or(10), Ordering::Relaxed);
+        }
+        let now_s = apic::now_us() / (INTERVAL.load(Ordering::Relaxed) * 1_000_000);
         if LAST_REPORT.swap(now_s, Ordering::Relaxed) != now_s {
             crate::process::report();
             crate::process::profile_report();
@@ -356,6 +362,10 @@ impl Desktop {
         let mut shared = unsafe { &*r.shared }.borrow_mut();
         if let (RawInput::Move { .. }, Some(RawInput::Move { .. })) = (event, shared.gui.input.back()) {
             shared.gui.input.pop_back();
+        }
+        // The profiler's reports are easier to follow with Enter marked.
+        if crate::profile::on() && matches!(event, RawInput::Key { vk: 0x0D, down: true, .. }) {
+            log!("OTW kernel: [profile] Enter pressed");
         }
         shared.gui.input.push_back(event);
     }

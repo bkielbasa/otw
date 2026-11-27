@@ -30,7 +30,7 @@ make image      # build target/os/otw.img (40 MB, plus drive C:)
 make os         # boot it in QEMU
 ```
 
-`make os` opens a window in a desktop session; without one the screen is at `vnc://127.0.0.1:5901` (`VM_DISPLAY=gtk` or `sdl` to choose). The kernel's log goes to the serial port (`VM_SERIAL=file` to keep it). `VM_NIC=e1000`, `e1000e` or `igb` gives the machine an Intel card instead of virtio. A kernel built with `OTW_PROFILE=1` logs where the CPUs' time goes every ten seconds (idle, program code by module, the subsystem by call).
+`make os` opens a window in a desktop session; without one the screen is at `vnc://127.0.0.1:5901` (`VM_DISPLAY=gtk` or `sdl` to choose). The kernel's log goes to the serial port (`VM_SERIAL=file` to keep it). `VM_NIC=e1000`, `e1000e` or `igb` gives the machine an Intel card instead of virtio. A kernel built with `OTW_PROFILE=1` logs where the CPUs' time goes every ten seconds (idle, program code by module, the subsystem by call), how threads were woken and how long pipe data and completion packets waited (`OTW_KERNEL_ENV=OTW_PROFILE_SECONDS=1` for a report every second).
 
 On a real machine, write it to a USB stick and boot it with UEFI and Secure Boot off:
 

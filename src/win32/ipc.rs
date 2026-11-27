@@ -131,6 +131,12 @@ fn take(pipe: u64, side: usize, len: u32, peek: bool) -> Option<Result<Vec<u8>, 
         if !inbound.is_empty() {
             let n = (len as usize).min(inbound.len());
             let bytes: Vec<u8> = if peek { inbound.iter().take(n).copied().collect() } else { inbound.drain(..n).collect() };
+            if !peek {
+                if let Some(written) = p.written[side] {
+                    kobj::note_pipe_wait(written);
+                }
+                p.written[side] = (!p.inbound[side].is_empty()).then(std::time::Instant::now);
+            }
             return Some(Ok(bytes));
         }
         if p.closed[1 - side] || p.closed[side] {
@@ -152,7 +158,7 @@ fn pipe_end(ctx: &ApiContext, handle: u32) -> Option<(u64, usize)> {
 fn post(ctx: &ApiContext, port: u32, bytes: u32, key: u64, overlapped: u64) {
     let mut shared = ctx.shared.borrow_mut();
     if let Some(queue) = shared.nt.ports.get_mut(&port) {
-        queue.push_back((bytes, key, overlapped));
+        queue.push_back((bytes, key, overlapped, std::time::Instant::now()));
     }
     drop(shared);
     sync::signal(ctx, port);
@@ -473,13 +479,16 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 if p.closed[1 - side] {
                     return None;
                 }
+                if p.inbound[1 - side].is_empty() {
+                    p.written[1 - side] = Some(std::time::Instant::now());
+                }
                 p.inbound[1 - side].extend(bytes.iter().copied());
                 Some(bytes.len() as u32)
             });
             let Some(written) = written else {
                 return fail(ERROR_NO_DATA, 0);
             };
-            kobj::notify();
+            kobj::notify_pipe(pipe, 1 - side);
             if p(3) != 0 {
                 let _ = memory.write_u32(p(3), written);
             }
@@ -537,6 +546,15 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
                 crate::win32::nt::call(ctx, memory, "CreateIoCompletionPort", &[u32::MAX as u64, 0, 0, arg(3)])?.value as u32
             };
             ctx.shared.borrow_mut().ipc.ports.insert(p(0), (port, arg(2)));
+            // The writer of the other end wakes this port's threads.
+            if let Some((pipe, side)) = pipe_end(ctx, p(0)) {
+                let me = pid(ctx);
+                kobj::with(|k| {
+                    if let Some(pipe) = k.pipes.get_mut(&pipe) {
+                        pipe.ports[side] = Some((me, port));
+                    }
+                });
+            }
             ok(port as u64)
         }
         "SetFileCompletionNotificationModes" => {

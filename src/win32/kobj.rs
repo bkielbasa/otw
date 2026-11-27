@@ -58,6 +58,40 @@ pub struct Pipe {
     pub connected: bool,
     /// Ends that were opened and have since been closed for good.
     pub closed: [bool; 2],
+    /// When the oldest bytes waiting for each side were written.
+    pub written: [Option<std::time::Instant>; 2],
+    /// The completion port each side is tied to: (process, port handle).
+    pub ports: [Option<(u32, u32)>; 2],
+}
+
+/// How long pipe data waited to be read, for the profiler: reads, the
+/// sum and the longest wait in microseconds, reads that waited over 1 ms,
+/// over 5 ms and over 20 ms.
+pub static PIPE_WAITS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// The same for completion packets: from queued to taken.
+pub static PORT_WAITS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+pub fn note_port_wait(queued: std::time::Instant) {
+    note_wait(&PORT_WAITS, queued);
+}
+
+/// Note a read of pipe data written at `written`.
+pub fn note_pipe_wait(written: std::time::Instant) {
+    note_wait(&PIPE_WAITS, written);
+}
+
+fn note_wait(counts: &[std::sync::atomic::AtomicU64; 6], since: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let us = since.elapsed().as_micros() as u64;
+    counts[0].fetch_add(1, Relaxed);
+    counts[1].fetch_add(us, Relaxed);
+    counts[2].fetch_max(us, Relaxed);
+    for (index, limit) in [(3, 1_000), (4, 5_000), (5, 20_000)] {
+        if us > limit {
+            counts[index].fetch_add(1, Relaxed);
+        }
+    }
 }
 
 /// A process running alongside the others.
@@ -259,7 +293,6 @@ fn changes() -> &'static (Mutex<u64>, std::sync::Condvar) {
     CHANGES.get_or_init(|| (Mutex::new(0), std::sync::Condvar::new()))
 }
 
-/// Note a change and wake the processes waiting for one.
 /// Counts for the profiler: notifications, threads woken by them, wakes
 /// by key, parks, parks that ended woken.
 pub static COUNTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -268,12 +301,60 @@ fn count(index: usize, n: u64) {
     COUNTS[index].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Note a change and wake the processes waiting for one.
 pub fn notify() {
+    changed();
+    wake_shared();
+}
+
+fn changed() {
     count(0, 1);
     let (count, condvar) = changes();
     *count.lock().unwrap_or_else(|p| p.into_inner()) += 1;
     condvar.notify_all();
-    wake_shared();
+}
+
+/// Data was written for `side` of `pipe`: wake only the process that
+/// reads it. When the end is tied to a completion port, the threads
+/// waiting on that port: one of them takes the data in and finds its
+/// packet at once (rather than another thread taking it in and then
+/// waking the port's). Else one of its threads waiting on shared objects.
+pub fn notify_pipe(pipe: u64, side: usize) {
+    changed();
+    let (readers, port) = with(|k| {
+        let port = k.pipes.get(&pipe).and_then(|p| p.ports[side]);
+        let mut readers: Vec<u32> = k
+            .handles
+            .iter()
+            .filter(|(_, id)| matches!(k.objects.get(*id), Some(Object::PipeEnd { pipe: p, side: s }) if *p == pipe && *s == side))
+            .map(|(&(pid, _), _)| pid)
+            .collect();
+        readers.sort_unstable();
+        readers.dedup();
+        (readers, port)
+    });
+    if let Some((pid, port)) = port.filter(|(pid, _)| readers.contains(pid)) {
+        let parkers: Vec<Arc<Parker>> = registry().get(&(pid, KEY_HANDLE | port as u64)).cloned().unwrap_or_default();
+        if !parkers.is_empty() {
+            count(1, parkers.len() as u64);
+            for parker in parkers {
+                parker.unpark();
+            }
+            return;
+        }
+    }
+    if readers.is_empty() {
+        wake_shared();
+        return;
+    }
+    let parkers: Vec<Arc<Parker>> = {
+        let registry = registry();
+        readers.iter().filter_map(|&pid| registry.get(&(pid, KEY_SHARED)).and_then(|p| p.first().cloned())).collect()
+    };
+    count(1, parkers.len() as u64);
+    for parker in parkers {
+        parker.unpark();
+    }
 }
 
 /// The change count now.

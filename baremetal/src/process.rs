@@ -104,6 +104,15 @@ pub fn profile_report() {
         "OTW kernel: [profile] waits: {} notifications woke {} threads, {} woken by key, {} parks ({} woken)",
         counts[0], counts[1], counts[2], counts[3], counts[4]
     );
+    for (what, counts) in [("pipe data", &otw_vm::win32::kobj::PIPE_WAITS), ("completion packets", &otw_vm::win32::kobj::PORT_WAITS)] {
+        let c: Vec<u64> = counts.iter().map(|c| c.swap(0, core::sync::atomic::Ordering::Relaxed)).collect();
+        if c[0] > 0 {
+            log!(
+                "OTW kernel: [profile] {what}: {} taken, waited {} us on average, {} us at most; over 1 ms {}, over 5 ms {}, over 20 ms {}",
+                c[0], c[1] / c[0], c[2], c[3], c[4], c[5]
+            );
+        }
+    }
     let runners = RUNNERS.lock().unwrap();
     // Each program's address space and modules (copied under its lock).
     let mut spaces: Vec<(u64, String, Vec<(String, u64, u64, Vec<(u32, String)>)>)> = Vec::new();
