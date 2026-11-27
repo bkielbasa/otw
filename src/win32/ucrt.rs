@@ -94,7 +94,8 @@ pub fn arg_count(name: &str) -> Option<usize> {
     }
     Some(match name {
         "_get_initial_narrow_environment" | "_get_initial_wide_environment" | "__p___argc" | "__p___argv"
-        | "__p___wargv" | "__p__environ" | "__p__wenviron" | "__p__commode" | "_get_wide_winmain_command_line"
+        | "__p___wargv" | "__p__environ" | "__p__wenviron" | "__p__commode" | "__p__fmode" | "_fpreset"
+        | "_get_wide_winmain_command_line"
         | "_get_narrow_winmain_command_line" | "_initialize_narrow_environment" | "_initialize_wide_environment"
         | "_cexit" | "_c_exit" | "abort" | "terminate" | "_errno" | "__doserrno" | "_invalid_parameter_noinfo"
         | "_invalid_parameter_noinfo_noreturn" | "_purecall" | "localeconv" | "__pctype_func" | "___lc_codepage_func"
@@ -132,6 +133,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         | "_wcsnicmp" | "strncpy" | "wcsncpy" | "strncat" | "strtol" | "strtoul" | "strtoll" | "strtoull"
         | "_strtoui64" | "wcstol" | "wcstoul" | "wcstoull" | "_wcstoui64" | "_i64toa" | "_ui64toa" | "wcstombs"
         | "wcstok_s" | "_wcsicmp_l" | "strerror_s" | "_wfullpath" | "_fullpath" | "_read"
+        | "memcpy" | "memmove" | "memset" | "memcmp" | "memchr"
         | "_write" | "_lseek" | "_wgetdcwd" | "_fsopen" | "_wfsopen" | "freopen" | "fseek" | "_fseeki64" | "fgets"
         | "_wassert" | "_controlfp_s" | "lldiv" | "imaxdiv" | "_mbsdec"
         | "_open" | "_wopen" => 3,
@@ -1896,6 +1898,10 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(slot as u64)
         }
         "__p__commode" => ok(static_block(ctx, memory, "commode", 4) as u64),
+        // The default file mode (0: text), which MinGW's start-up sets.
+        "__p__fmode" => ok(static_block(ctx, memory, "fmode", 4) as u64),
+        // The x87 unit is as programs start with it.
+        "_fpreset" => ok(0),
         "_get_wide_winmain_command_line" | "_get_narrow_winmain_command_line" => {
             // The command line after the program's name.
             let line = command_line(ctx, memory);
@@ -2091,6 +2097,32 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             let wide = name.starts_with('w') || name.starts_with("_w");
             let (x, y) = (counted_units(memory, arg(0), arg(2), wide), counted_units(memory, arg(1), arg(2), wide));
             signed(compare_units(&x, &y, name.contains("icmp")) as i64)
+        }
+        // The memory functions (vcruntime's; MinGW's UCRT programs import
+        // them through api-ms-win-crt-private).
+        "memcpy" | "memmove" => {
+            let length = arg(2).min(1 << 30) as usize;
+            if let Some(bytes) = memory.read_bytes(p(1), length) {
+                let _ = memory.write_bytes(p(0), &bytes);
+            }
+            ok(arg(0))
+        }
+        "memset" => {
+            let length = arg(2).min(1 << 30) as usize;
+            let _ = memory.write_bytes(p(0), &vec![arg(1) as u8; length]);
+            ok(arg(0))
+        }
+        "memcmp" => {
+            let length = arg(2).min(1 << 30) as usize;
+            let a = memory.read_bytes(p(0), length).unwrap_or_default();
+            let b = memory.read_bytes(p(1), length).unwrap_or_default();
+            let order = a.iter().zip(&b).find(|(x, y)| x != y).map_or(0i64, |(x, y)| i64::from(*x) - i64::from(*y));
+            signed(order)
+        }
+        "memchr" => {
+            let length = arg(2).min(1 << 30) as usize;
+            let bytes = memory.read_bytes(p(0), length).unwrap_or_default();
+            ok(bytes.iter().position(|&b| b == arg(1) as u8).map_or(0, |i| arg(0) + i as u64))
         }
         "strcpy" | "wcscpy" => {
             let wide = name == "wcscpy";
@@ -3189,6 +3221,100 @@ mod tests {
         }
     }
 
+    /// Memory anywhere, made as it is written.
+    #[derive(Default)]
+    struct Sparse(std::collections::BTreeMap<u32, u8>);
+    impl GuestMemory for Sparse {
+        fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+            Some((0..len as u32).map(|i| self.0.get(&(va + i)).copied().unwrap_or(0)).collect())
+        }
+        fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+            for (i, &b) in bytes.iter().enumerate() {
+                self.0.insert(va + i as u32, b);
+            }
+            Some(())
+        }
+        fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+            self.write_bytes(va, &value.to_le_bytes())
+        }
+        fn ptr_size(&self) -> u32 {
+            8
+        }
+    }
+
+    #[test]
+    fn mingw_start_up_variables() {
+        // MinGW's start-up writes *__p__fmode(): a real variable, kept.
+        let ctx = ApiContext::default();
+        let mut memory = Sparse::default();
+        let fmode = call(&ctx, &mut memory, "__p__fmode", &[]).unwrap().wide.unwrap();
+        assert_ne!(fmode, 0);
+        assert_eq!(call(&ctx, &mut memory, "__p__fmode", &[]).unwrap().wide, Some(fmode));
+        assert!(arg_count("_fpreset").is_some());
+        assert!(call(&ctx, &mut memory, "_fpreset", &[]).is_some());
+    }
+
+    /// Run a native leaf on this CPU (x64 calling convention).
+    #[cfg(all(feature = "std", target_arch = "x86_64", target_os = "linux"))]
+    fn native_call(name: &str, a: u64, b: u64, c: u64) -> u64 {
+        let code = native_x64(name).unwrap();
+        // SAFETY: a fresh page, written then made executable, called with
+        // the x64 Windows convention the code is written for.
+        unsafe {
+            let page = libc::mmap(core::ptr::null_mut(), 4096, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+            assert_ne!(page, libc::MAP_FAILED);
+            core::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+            assert_eq!(libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC), 0);
+            let function: extern "win64" fn(u64, u64, u64) -> u64 = core::mem::transmute(page);
+            let result = function(a, b, c);
+            libc::munmap(page, 4096);
+            result
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "std", target_arch = "x86_64", target_os = "linux"))]
+    fn native_memory_functions() {
+        let mut buffer: Vec<u8> = (0..64).collect();
+        let base = buffer.as_mut_ptr() as u64;
+        // memcpy, no overlap.
+        assert_eq!(native_call("memcpy", base + 32, base, 8), base + 32);
+        assert_eq!(&buffer[32..40], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        // memmove forwards over itself (destination before the source).
+        let mut buffer: Vec<u8> = (0..64).collect();
+        let base = buffer.as_mut_ptr() as u64;
+        native_call("memmove", base, base + 4, 8);
+        assert_eq!(&buffer[0..8], &[4, 5, 6, 7, 8, 9, 10, 11]);
+        // memmove backwards (destination inside the source).
+        let mut buffer: Vec<u8> = (0..64).collect();
+        let base = buffer.as_mut_ptr() as u64;
+        native_call("memmove", base + 4, base, 8);
+        assert_eq!(&buffer[4..12], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(&buffer[0..4], &[0, 1, 2, 3]);
+        // memset.
+        let mut buffer = vec![0u8; 16];
+        let base = buffer.as_mut_ptr() as u64;
+        assert_eq!(native_call("memset", base + 2, 0x1AB, 5), base + 2);
+        assert_eq!(&buffer[0..8], &[0, 0, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0]);
+        // Zero bytes: nothing moves.
+        assert_eq!(native_call("memcpy", base, base + 8, 0), base);
+    }
+
+    #[test]
+    fn memory_functions() {
+        let ctx = ApiContext::default();
+        let mut m = Sparse::default();
+        let _ = m.write_bytes(0x1000, b"hello world");
+        assert_eq!(call(&ctx, &mut m, "memcpy", &[0x2000, 0x1000, 5]).unwrap().wide, Some(0x2000));
+        assert_eq!(m.read_bytes(0x2000, 5).unwrap(), b"hello");
+        call(&ctx, &mut m, "memset", &[0x2000, b'x' as u64, 2]);
+        assert_eq!(m.read_bytes(0x2000, 5).unwrap(), b"xxllo");
+        assert_eq!(call(&ctx, &mut m, "memchr", &[0x1000, b'w' as u64, 11]).unwrap().wide, Some(0x1006));
+        assert_eq!(call(&ctx, &mut m, "memchr", &[0x1000, b'z' as u64, 11]).unwrap().wide, Some(0));
+        assert_eq!(call(&ctx, &mut m, "memcmp", &[0x1000, 0x2000, 5]).unwrap().wide.map(|v| v as i64), Some(i64::from(b'h') - i64::from(b'x')));
+        assert_eq!(call(&ctx, &mut m, "memcmp", &[0x1002, 0x2002, 3]).unwrap().wide, Some(0));
+    }
+
     #[test]
     fn printf_reads_a_64_bit_va_list() {
         let mut memory = Flat(vec![0; 512]);
@@ -3265,6 +3391,44 @@ pub fn native_x64(name: &str) -> Option<&'static [u8]> {
             0x0F, 0x56, 0xCA, // orps xmm1, xmm2
             0xF3, 0x0F, 0x58, 0xC1, // addss xmm0, xmm1
             0x66, 0x0F, 0x3A, 0x0A, 0xC0, 0x0B, // roundss xmm0, xmm0, 11
+            0xC3,
+        ],
+        // memmove (and memcpy, the same code): rep movsb, backwards when
+        // the destination overlaps the source's end; rdi and rsi kept
+        // (callee-saved in the x64 convention) in r9 and r10.
+        "memmove" | "memcpy" => &[
+            0x48, 0x89, 0xC8, // mov rax, rcx
+            0x49, 0x89, 0xF9, // mov r9, rdi
+            0x49, 0x89, 0xF2, // mov r10, rsi
+            0x48, 0x89, 0xCF, // mov rdi, rcx
+            0x48, 0x89, 0xD6, // mov rsi, rdx
+            0x4C, 0x89, 0xC1, // mov rcx, r8
+            0x48, 0x39, 0xF7, // cmp rdi, rsi
+            0x76, 0x19, // jbe forward
+            0x4C, 0x8D, 0x1C, 0x0E, // lea r11, [rsi + rcx]
+            0x4C, 0x39, 0xDF, // cmp rdi, r11
+            0x73, 0x10, // jae forward
+            0x48, 0x8D, 0x7C, 0x0F, 0xFF, // lea rdi, [rdi + rcx - 1]
+            0x48, 0x8D, 0x74, 0x0E, 0xFF, // lea rsi, [rsi + rcx - 1]
+            0xFD, // std
+            0xF3, 0xA4, // rep movsb
+            0xFC, // cld
+            0xEB, 0x02, // jmp done
+            0xF3, 0xA4, // forward: rep movsb
+            0x4C, 0x89, 0xCF, // done: mov rdi, r9
+            0x4C, 0x89, 0xD6, // mov rsi, r10
+            0xC3,
+        ],
+        // memset: rep stosb with the byte in al.
+        "memset" => &[
+            0x49, 0x89, 0xF9, // mov r9, rdi
+            0x49, 0x89, 0xCA, // mov r10, rcx
+            0x48, 0x89, 0xCF, // mov rdi, rcx
+            0x89, 0xD0, // mov eax, edx
+            0x4C, 0x89, 0xC1, // mov rcx, r8
+            0xF3, 0xAA, // rep stosb
+            0x4C, 0x89, 0xCF, // mov rdi, r9
+            0x4C, 0x89, 0xD0, // mov rax, r10
             0xC3,
         ],
         // sqrtss/sqrtsd xmm0, xmm0; ret.

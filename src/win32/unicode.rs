@@ -1561,7 +1561,7 @@ mod tests {
     fn functions_7zip_file_manager_needs() {
         let ctx = ApiContext::default();
         let mut m = Flat(vec![0; 0x200]);
-        let mut call = |m: &mut Flat, name: &str, args: &[u32]| native(&ctx, m, "KERNEL32.dll", name, args, args.len(), 0).unwrap().value;
+        let call = |m: &mut Flat, name: &str, args: &[u32]| native(&ctx, m, "KERNEL32.dll", name, args, args.len(), 0).unwrap().value;
         // Directories are not watched: the program refreshes itself.
         assert_eq!(call(&mut m, "FindFirstChangeNotificationW", &[0x100, 0, 1]), u32::MAX);
         assert_eq!(call(&mut m, "FindCloseChangeNotification", &[u32::MAX]), 1);

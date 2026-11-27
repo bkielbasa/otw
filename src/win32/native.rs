@@ -77,6 +77,13 @@ const CURRENT_PROCESS: &[u8] = &[
     0xC3, // ret
 ];
 
+/// GetProcessHeap: the one heap's handle (kernel32's, 0x500001). Rust
+/// programs ask before every allocation.
+const PROCESS_HEAP: &[u8] = &[
+    0xB8, 0x01, 0x00, 0x50, 0x00, // mov eax, 0x500001
+    0xC3, // ret
+];
+
 const TLS_GET: &[u8] = &[
     0x89, 0xC9, // mov ecx, ecx
     0x83, 0xF9, 0x40, // cmp ecx, 64
@@ -298,6 +305,7 @@ pub fn kernel_native(name: &str) -> Option<Native> {
         "GetCurrentThreadId" => (CURRENT_THREAD_ID, false),
         "GetCurrentThread" => (CURRENT_THREAD, false),
         "GetCurrentProcess" => (CURRENT_PROCESS, false),
+        "GetProcessHeap" => (PROCESS_HEAP, false),
         "TlsGetValue" | "FlsGetValue" => (TLS_GET, false),
         "TlsSetValue" | "FlsSetValue" => (TLS_SET, false),
         "EnterCriticalSection" | "RtlEnterCriticalSection" => (ENTER_CRITICAL_SECTION, true),
@@ -566,5 +574,35 @@ mod tests {
         assert_eq!(code[code.len() - 5], 0xE9);
         assert!(kernel_native("strlen").is_none());
         assert!(is_kernel_dll("api-ms-win-core-synch-l1-2-0.dll") && is_kernel_dll("KERNEL32.dll") && !is_kernel_dll("user32.dll"));
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    /// Run a native leaf on this CPU (x64 calling convention).
+    #[cfg(all(feature = "std", target_arch = "x86_64", target_os = "linux"))]
+    fn run(code: &[u8]) -> u64 {
+        // SAFETY: a fresh page, written then made executable, called with
+        // the x64 Windows convention the code is written for.
+        unsafe {
+            let page = libc::mmap(core::ptr::null_mut(), 4096, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+            assert_ne!(page, libc::MAP_FAILED);
+            core::ptr::copy_nonoverlapping(code.as_ptr(), page as *mut u8, code.len());
+            assert_eq!(libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC), 0);
+            let function: extern "win64" fn() -> u64 = core::mem::transmute(page);
+            let result = function();
+            libc::munmap(page, 4096);
+            result
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "std", target_arch = "x86_64", target_os = "linux"))]
+    fn the_process_heap_is_kernel32s() {
+        let native = kernel_native("GetProcessHeap").unwrap();
+        assert!(!native.slow);
+        assert_eq!(run(native.code), 0x0050_0001);
     }
 }
