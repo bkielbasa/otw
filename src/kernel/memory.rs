@@ -201,6 +201,31 @@ pub trait GuestMemory {
         self.write_bytes(va, &value.to_le_bytes())
     }
 
+    /// Replace the 32-bit value at `va` with `new` if it is `current`, at
+    /// once for program code running on other CPUs too (locks the program
+    /// takes without system calls, see win32/native.rs): `Ok` with the old
+    /// value, or `Err` with the value found.
+    fn compare_exchange_u32(&mut self, va: u32, current: u32, new: u32) -> Option<Result<u32, u32>> {
+        let found = self.read_u32(va)?;
+        if found != current {
+            return Some(Err(found));
+        }
+        self.write_u32(va, new)?;
+        Some(Ok(found))
+    }
+
+    /// Change the 32-bit value at `va` with `change` (at once, as
+    /// `compare_exchange_u32`); returns the old value.
+    fn update_u32(&mut self, va: u32, change: &mut dyn FnMut(u32) -> u32) -> Option<u32> {
+        let mut current = self.read_u32(va)?;
+        loop {
+            match self.compare_exchange_u32(va, current, change(current))? {
+                Ok(old) => return Some(old),
+                Err(found) => current = found,
+            }
+        }
+    }
+
     /// The size of a pointer (and of handles and `*_PTR` values) in the
     /// process: 8 in a 64-bit one.
     fn ptr_size(&self) -> u32 {

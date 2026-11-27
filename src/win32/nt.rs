@@ -574,7 +574,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(0)
         }
         "RtlReleaseSRWLockExclusive" | "RtlReleaseSRWLockShared" => {
-            crate::win32::sync::srw_release(ctx, p(0), name.ends_with("Exclusive"));
+            crate::win32::sync::srw_release(ctx, memory, p(0), name.ends_with("Exclusive"));
             ok(0)
         }
         "RtlWakeAllConditionVariable" | "RtlWakeConditionVariable" | "WakeByAddressAll" | "WakeByAddressSingle" => {
@@ -592,7 +592,7 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             // (condition, lock, timeout*, flags)
             let timeout = if p(2) == 0 { u32::MAX } else { ((memory.read_u64(p(2)).unwrap_or(0) as i64).unsigned_abs() / 10_000).min(u32::MAX as u64 - 1) as u32 };
             let exclusive = p(3) & 1 == 0;
-            crate::win32::sync::srw_release(ctx, p(1), exclusive);
+            crate::win32::sync::srw_release(ctx, memory, p(1), exclusive);
             let woken = crate::win32::sync::sleep_on(ctx, memory, p(0), timeout);
             crate::win32::sync::srw_acquire(ctx, memory, p(1), exclusive);
             ok(if woken { STATUS_SUCCESS } else { 0x102 }) // STATUS_TIMEOUT

@@ -65,14 +65,6 @@ pub struct Wait {
     wake_count: u64,
 }
 
-/// A slim reader/writer lock that is held.
-#[derive(Clone, Copy, Debug, Default)]
-struct Srw {
-    /// The thread holding it exclusively, or 0.
-    exclusive: u32,
-    shared: u32,
-}
-
 /// Wake-ups of a condition variable or address: all waiters (a count),
 /// or single ones not yet taken.
 #[derive(Clone, Copy, Debug, Default)]
@@ -106,8 +98,6 @@ pub struct SyncState {
     waits: HashMap<u32, Wait>,
     /// Threads created suspended, not yet resumed.
     suspended: HashSet<u32>,
-    /// Slim reader/writer locks that are held, by address.
-    srw: HashMap<u32, Srw>,
     /// Wake-ups by address.
     wakes: HashMap<u32, Wakes>,
     /// Thread-local storage of threads other than the first, by (thread, slot).
@@ -124,6 +114,12 @@ pub struct SyncState {
     preempting: bool,
     /// The last error of each thread off the CPU.
     last_errors: HashMap<u32, u32>,
+    /// The TEB of each thread of a 64-bit process that made a call (which
+    /// hold their TLS slots).
+    pub tebs: HashMap<u32, u32>,
+    /// The number of threads waiting in the subsystem for each slim
+    /// reader/writer lock (while any do, the lock's waiters bit is set).
+    srw_waiters: HashMap<u32, u32>,
 }
 
 impl SyncState {
@@ -293,24 +289,53 @@ fn try_wait(sync: &mut SyncState, wait: &Wait, thread: u32) -> Option<u32> {
     Some(index as u32)
 }
 
-/// Take a slim reader/writer lock if it is free.
-fn srw_take(sync: &mut SyncState, lock: u32, exclusive: bool, thread: u32) -> bool {
-    let entry = sync.srw.entry(lock).or_default();
-    let free = entry.exclusive == 0 && (!exclusive || entry.shared == 0);
-    if free {
-        if exclusive {
-            entry.exclusive = thread;
-        } else {
-            entry.shared += 1;
+/// Take a slim reader/writer lock if it is free. The lock's word is
+/// shared with the program's own code for it (native.rs): bit 0 an
+/// exclusive owner, bit 1 waiters here, readers from bit 2.
+fn srw_take<M: GuestMemory + ?Sized>(memory: &mut M, lock: u32, exclusive: bool) -> bool {
+    use crate::win32::native::{SRW_EXCLUSIVE, SRW_READER};
+    let mut current = memory.read_u32(lock).unwrap_or(0);
+    loop {
+        if !srw_word_free(current, exclusive) {
+            return false;
         }
-    } else if entry.exclusive == 0 && entry.shared == 0 {
-        sync.srw.remove(&lock);
+        let new = if exclusive { current | SRW_EXCLUSIVE } else { current.wrapping_add(SRW_READER) };
+        match memory.compare_exchange_u32(lock, current, new) {
+            Some(Ok(_)) => return true,
+            Some(Err(found)) => current = found,
+            None => return false,
+        }
     }
-    free
 }
 
-fn srw_free(sync: &SyncState, lock: u32, exclusive: bool) -> bool {
-    sync.srw.get(&lock).is_none_or(|e| e.exclusive == 0 && (!exclusive || e.shared == 0))
+fn srw_word_free(word: u32, exclusive: bool) -> bool {
+    use crate::win32::native::{SRW_EXCLUSIVE, SRW_READER};
+    word & SRW_EXCLUSIVE == 0 && (!exclusive || word / SRW_READER == 0)
+}
+
+fn srw_free<M: GuestMemory + ?Sized>(memory: &mut M, lock: u32, exclusive: bool) -> bool {
+    srw_word_free(memory.read_u32(lock).unwrap_or(0), exclusive)
+}
+
+/// One more (`true`) or one fewer thread waits here for a lock: the
+/// lock's waiters bit is set while any do.
+fn srw_waiting<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, lock: u32, more: bool) {
+    use crate::win32::native::SRW_WAITERS;
+    let any = {
+        let mut shared = ctx.shared.borrow_mut();
+        let count = shared.sync.srw_waiters.entry(lock).or_default();
+        if more {
+            *count += 1;
+        } else {
+            *count = count.saturating_sub(1);
+        }
+        let any = *count > 0;
+        if !any {
+            shared.sync.srw_waiters.remove(&lock);
+        }
+        any
+    };
+    let _ = memory.update_u32(lock, &mut |word| if any { word | SRW_WAITERS } else { word & !SRW_WAITERS });
 }
 
 /// Whether a wake-up came for a wait (taking a single one).
@@ -333,35 +358,39 @@ fn woken(sync: &mut SyncState, wait: &Wait) -> bool {
 
 /// AcquireSRWLock*: take the lock, waiting while another holds it.
 pub fn srw_acquire<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, lock: u32, exclusive: bool) -> bool {
-    let thread = memory.current_thread();
-    if srw_take(&mut ctx.shared.borrow_mut().sync, lock, exclusive, thread) {
+    if srw_take(memory, lock, exclusive) {
         return true;
     }
+    // Set the waiters bit first, so that the holder's release (in the
+    // program) comes here to wake this thread; the wait looks at the lock
+    // again before it sleeps.
+    srw_waiting(ctx, memory, lock, true);
     let spec = Wait { srw: lock, srw_exclusive: exclusive, ..Wait::default() };
-    matches!(wait(ctx, memory, spec, INFINITE), Outcome::Signaled(_))
+    let taken = matches!(wait(ctx, memory, spec, INFINITE), Outcome::Signaled(_));
+    srw_waiting(ctx, memory, lock, false);
+    taken
 }
 
 /// TryAcquireSRWLock*.
-pub fn srw_try(ctx: &ApiContext, thread: u32, lock: u32, exclusive: bool) -> bool {
-    srw_take(&mut ctx.shared.borrow_mut().sync, lock, exclusive, thread)
+pub fn srw_try<M: GuestMemory + ?Sized>(memory: &mut M, lock: u32, exclusive: bool) -> bool {
+    srw_take(memory, lock, exclusive)
 }
 
 /// ReleaseSRWLock*.
-pub fn srw_release(ctx: &ApiContext, lock: u32, exclusive: bool) {
-    {
-        let mut shared = ctx.shared.borrow_mut();
-        if let Some(entry) = shared.sync.srw.get_mut(&lock) {
-            if exclusive {
-                entry.exclusive = 0;
-            } else {
-                entry.shared = entry.shared.saturating_sub(1);
-            }
-            if entry.exclusive == 0 && entry.shared == 0 {
-                shared.sync.srw.remove(&lock);
-            }
+pub fn srw_release<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, lock: u32, exclusive: bool) {
+    use crate::win32::native::{SRW_EXCLUSIVE, SRW_READER};
+    let _ = memory.update_u32(lock, &mut |word| {
+        if exclusive {
+            word & !SRW_EXCLUSIVE
+        } else if word / SRW_READER > 0 {
+            word - SRW_READER
+        } else {
+            word
         }
+    });
+    if ctx.shared.borrow().sync.srw_waiters.contains_key(&lock) {
+        wake_key(ctx, crate::win32::kobj::KEY_SRW | lock as u64);
     }
-    wake_key(ctx, crate::win32::kobj::KEY_SRW | lock as u64);
 }
 
 /// WakeConditionVariable / WakeByAddressSingle (`all` false) and the
@@ -389,7 +418,7 @@ pub fn sleep_on<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, key: 
 }
 
 fn section_free<M: GuestMemory + ?Sized>(memory: &mut M, section: u32, thread: u32) -> bool {
-    let owner = memory.read_u32(section + 12).unwrap_or(0);
+    let owner = memory.read_u32(section + crate::win32::native::CS_OWNER).unwrap_or(0);
     owner == 0 || owner == thread
 }
 
@@ -397,6 +426,64 @@ fn messages_waiting(ctx: &ApiContext, thread: u32) -> bool {
     let shared = ctx.shared.borrow();
     let now = shared.ticks();
     crate::win32::user::messages_for(&shared.gui, now, thread)
+}
+
+/// Thread-local storage of a 64-bit process: in each thread's TEB, where
+/// the program's own TlsGetValue and TlsSetValue keep it (native.rs).
+/// `teb` is the calling thread's.
+pub fn tls64(ctx: &ApiContext, memory: &mut dyn GuestMemory, teb: u32, name: &str, args: &crate::kernel::syscall::Args) -> Option<ApiOutcome> {
+    use crate::win32::native::{TEB_TLS_SLOTS, TLS_SLOTS};
+    let count = args.len();
+    let index = args.wide(0) as u32;
+    let slot = |teb: u32| (index < TLS_SLOTS).then(|| teb + TEB_TLS_SLOTS + index * 8);
+    let invalid = || {
+        ctx.shared.borrow_mut().last_error = 87; // ERROR_INVALID_PARAMETER
+        Some(ApiOutcome::new(0, count))
+    };
+    match name {
+        "TlsGetValue" | "FlsGetValue" => {
+            let Some(at) = slot(teb) else { return invalid() };
+            let value = memory.read_u64(at).unwrap_or(0);
+            ctx.shared.borrow_mut().last_error = 0;
+            Some(ApiOutcome::wide(value, count))
+        }
+        "TlsSetValue" | "FlsSetValue" => {
+            let Some(at) = slot(teb) else { return invalid() };
+            let _ = memory.write_u64(at, args.wide(1));
+            Some(ApiOutcome::new(1, count))
+        }
+        "TlsAlloc" | "FlsAlloc" => {
+            let (index, tebs) = {
+                let mut shared = ctx.shared.borrow_mut();
+                let Some(index) = shared.tls_slots.iter().position(Option::is_none) else {
+                    shared.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+                    return Some(ApiOutcome::new(u32::MAX, count));
+                };
+                shared.tls_slots[index] = Some(0);
+                shared.last_error = 0;
+                (index as u32, shared.sync.tebs.values().copied().chain([teb]).collect::<Vec<_>>())
+            };
+            // A new slot starts empty in every thread.
+            for teb in tebs {
+                let _ = memory.write_u64(teb + TEB_TLS_SLOTS + index * 8, 0);
+            }
+            Some(ApiOutcome::new(index, count))
+        }
+        "TlsFree" | "FlsFree" => {
+            let mut shared = ctx.shared.borrow_mut();
+            match shared.tls_slots.get_mut(index as usize) {
+                Some(slot @ Some(_)) => {
+                    *slot = None;
+                    Some(ApiOutcome::new(1, count))
+                }
+                _ => {
+                    drop(shared);
+                    invalid()
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Whether a thread that is off the CPU can go on.
@@ -423,7 +510,7 @@ fn ready<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, thread: u32,
         return section_free(memory, wait.section, thread);
     }
     if wait.srw != 0 {
-        return srw_free(&ctx.shared.borrow().sync, wait.srw, wait.srw_exclusive);
+        return srw_free(memory, wait.srw, wait.srw_exclusive);
     }
     if wait.wake_key != 0 {
         let wakes = ctx.shared.borrow().sync.wakes.get(&wait.wake_key).copied().unwrap_or_default();
@@ -493,6 +580,7 @@ pub fn thread_exited(ctx: &ApiContext, thread: u32, code: u32) {
         shared.sync.waits.remove(&thread);
         shared.sync.tls.retain(|(t, _), _| *t != thread);
         shared.sync.last_errors.remove(&thread);
+        shared.sync.tebs.remove(&thread);
         for object in shared.sync.objects.values_mut() {
             match object {
                 Object::Thread { id, exit } if *id == thread => *exit = Some(code),
@@ -875,7 +963,7 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         if wait.section != 0 && section_free(memory, wait.section, thread) {
             return Outcome::Signaled(0);
         }
-        if wait.srw != 0 && srw_take(&mut ctx.shared.borrow_mut().sync, wait.srw, wait.srw_exclusive, thread) {
+        if wait.srw != 0 && srw_take(memory, wait.srw, wait.srw_exclusive) {
             return Outcome::Signaled(0);
         }
         if woken(&mut ctx.shared.borrow_mut().sync, &wait) {
@@ -1292,39 +1380,63 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
         // CRITICAL_SECTION: debug info, lock count, recursion count, owning
         // thread, lock semaphore, spin count.
         "InitializeCriticalSection" | "InitializeCriticalSectionAndSpinCount" | "ReinitializeCriticalSection" => {
-            let mut section = vec![0u8; 24];
+            let mut section = vec![0u8; if memory.ptr_size() == 8 { 40 } else { 24 }];
             section[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
             let _ = memory.write_bytes(args[0], &section);
             ok(1)
         }
         "DeleteCriticalSection" => ok(0),
+        // The owner is taken and given back at once (compare-exchange):
+        // 64-bit programs do both in their own code (native.rs), coming
+        // here only to wait, or to wake the threads waiting here (counted
+        // at +16).
         "EnterCriticalSection" | "TryEnterCriticalSection" => {
+            use crate::win32::native::{cs_waiters, CS_OWNER, CS_RECURSION};
             let section = args[0];
-            if !section_free(memory, section, thread) {
-                if name == "TryEnterCriticalSection" {
-                    return ok(0);
+            let waiters = section + cs_waiters(memory.ptr_size());
+            loop {
+                match memory.compare_exchange_u32(section + CS_OWNER, 0, thread) {
+                    Some(Ok(_)) => {
+                        let _ = memory.write_u32(section + CS_RECURSION, 1);
+                        return ok(1);
+                    }
+                    Some(Err(owner)) if owner == thread => {
+                        let recursion = memory.read_u32(section + CS_RECURSION).unwrap_or(0);
+                        let _ = memory.write_u32(section + CS_RECURSION, recursion + 1);
+                        return ok(1);
+                    }
+                    Some(Err(_)) if name == "EnterCriticalSection" => {}
+                    _ => return ok(0),
                 }
+                // Counted as waiting before looking again, so that the
+                // owner giving it back (in the program) has this wake us.
+                let _ = memory.update_u32(waiters, &mut |n| n + 1);
                 let spec = Wait { section, ..Wait::default() };
-                if let Outcome::Suspended = wait(ctx, memory, spec, INFINITE) {
+                let outcome = wait(ctx, memory, spec, INFINITE);
+                let _ = memory.update_u32(waiters, &mut |n| n.saturating_sub(1));
+                if let Outcome::Suspended = outcome {
                     return ok(0);
                 }
             }
-            let recursion = memory.read_u32(section + 8).unwrap_or(0);
-            let _ = memory.write_u32(section + 8, recursion + 1);
-            let _ = memory.write_u32(section + 12, thread);
-            ok(1)
         }
         "LeaveCriticalSection" => {
+            use crate::win32::native::{cs_waiters, CS_OWNER, CS_RECURSION};
             let section = args[0];
-            if memory.read_u32(section + 12).unwrap_or(0) == thread {
-                let recursion = memory.read_u32(section + 8).unwrap_or(1).saturating_sub(1);
-                let _ = memory.write_u32(section + 8, recursion);
+            let mut released = false;
+            if memory.read_u32(section + CS_OWNER).unwrap_or(0) == thread {
+                let recursion = memory.read_u32(section + CS_RECURSION).unwrap_or(1).saturating_sub(1);
+                let _ = memory.write_u32(section + CS_RECURSION, recursion);
                 if recursion == 0 {
-                    let _ = memory.write_u32(section + 12, 0);
-                    if memory.others_running() {
-                        wake_key(ctx, crate::win32::kobj::KEY_SECTION | section as u64);
-                    }
+                    let _ = memory.compare_exchange_u32(section + CS_OWNER, thread, 0);
+                    released = true;
                 }
+            } else {
+                // The program gave it back itself and asks for the wake-up.
+                released = true;
+            }
+            let waiting = memory.read_u32(section + cs_waiters(memory.ptr_size())).unwrap_or(0) > 0;
+            if released && waiting {
+                wake_key(ctx, crate::win32::kobj::KEY_SECTION | section as u64);
             }
             ok(0)
         }
@@ -1353,5 +1465,115 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(1)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
+    use super::*;
+    use crate::win32::native::{SRW_EXCLUSIVE, SRW_READER, SRW_WAITERS};
+
+    /// A 64-bit process's memory, as thread `.1` sees it (TEB at `.2`).
+    struct Flat(Vec<u8>, u32, u32);
+    impl GuestMemory for Flat {
+        fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+            self.0.get(va as usize..va as usize + len).map(<[u8]>::to_vec)
+        }
+        fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+            self.0.get_mut(va as usize..va as usize + bytes.len())?.copy_from_slice(bytes);
+            Some(())
+        }
+        fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+            self.write_bytes(va, &value.to_le_bytes())
+        }
+        fn ptr_size(&self) -> u32 {
+            8
+        }
+        fn current_thread(&self) -> u32 {
+            self.1
+        }
+        fn current_tib(&self) -> u32 {
+            self.2
+        }
+    }
+
+    #[test]
+    fn slim_locks_share_their_word_with_the_program() {
+        let ctx = ApiContext::default();
+        let mut memory = Flat(vec![0; 0x100], 1, 0);
+        let lock = 0x40;
+        assert!(srw_acquire(&ctx, &mut memory, lock, false));
+        assert!(srw_try(&mut memory, lock, false));
+        assert_eq!(memory.read_u32(lock), Some(2 * SRW_READER));
+        assert!(!srw_try(&mut memory, lock, true));
+        srw_release(&ctx, &mut memory, lock, false);
+        srw_release(&ctx, &mut memory, lock, false);
+        assert_eq!(memory.read_u32(lock), Some(0));
+        // Taken in the program: not free here.
+        memory.write_u32(lock, SRW_EXCLUSIVE).unwrap();
+        assert!(!srw_try(&mut memory, lock, false));
+        // A waiter sets the waiters bit, the last one clears it; the bit
+        // does not hold the lock.
+        srw_waiting(&ctx, &mut memory, lock, true);
+        srw_waiting(&ctx, &mut memory, lock, true);
+        assert_eq!(memory.read_u32(lock), Some(SRW_EXCLUSIVE | SRW_WAITERS));
+        srw_release(&ctx, &mut memory, lock, true);
+        assert_eq!(memory.read_u32(lock), Some(SRW_WAITERS));
+        assert!(srw_try(&mut memory, lock, true));
+        assert_eq!(memory.read_u32(lock), Some(SRW_EXCLUSIVE | SRW_WAITERS));
+        srw_waiting(&ctx, &mut memory, lock, false);
+        assert_eq!(memory.read_u32(lock), Some(SRW_EXCLUSIVE | SRW_WAITERS));
+        srw_waiting(&ctx, &mut memory, lock, false);
+        assert_eq!(memory.read_u32(lock), Some(SRW_EXCLUSIVE));
+    }
+
+    #[test]
+    fn critical_sections_keep_owner_and_recursion_where_the_program_does() {
+        let ctx = ApiContext::default();
+        let mut memory = Flat(vec![0; 0x100], 3, 0);
+        let section = 0x40;
+        dispatch(&ctx, &mut memory, "InitializeCriticalSection", &[section]).unwrap();
+        assert_eq!(dispatch(&ctx, &mut memory, "EnterCriticalSection", &[section]).unwrap().value, 1);
+        assert_eq!(dispatch(&ctx, &mut memory, "TryEnterCriticalSection", &[section]).unwrap().value, 1);
+        assert_eq!(memory.read_u32(section + 8), Some(2));
+        assert_eq!(memory.read_u32(section + 12), Some(3));
+        // Another thread cannot have it.
+        memory.1 = 4;
+        assert_eq!(dispatch(&ctx, &mut memory, "TryEnterCriticalSection", &[section]).unwrap().value, 0);
+        dispatch(&ctx, &mut memory, "LeaveCriticalSection", &[section]).unwrap();
+        assert_eq!(memory.read_u32(section + 8), Some(2), "only the owner leaves it");
+        memory.1 = 3;
+        dispatch(&ctx, &mut memory, "LeaveCriticalSection", &[section]).unwrap();
+        dispatch(&ctx, &mut memory, "LeaveCriticalSection", &[section]).unwrap();
+        assert_eq!((memory.read_u32(section + 8), memory.read_u32(section + 12)), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn tls_of_64_bit_threads_is_in_their_tebs() {
+        use crate::kernel::syscall::Args;
+        use crate::win32::native::TEB_TLS_SLOTS;
+        let ctx = ApiContext::default();
+        let (first, second) = (0x1000, 0x3000);
+        let mut memory = Flat(vec![0; 0x5000], 1, first);
+        ctx.shared.borrow_mut().sync.tebs.insert(2, second);
+        let index = tls64(&ctx, &mut memory, first, "TlsAlloc", &Args::new(vec![], true)).unwrap().value;
+        assert!(index < 64);
+        let value = 0x7_0000_1234;
+        tls64(&ctx, &mut memory, first, "TlsSetValue", &Args::new(vec![index as u64, value], true)).unwrap();
+        assert_eq!(memory.read_u64(first + TEB_TLS_SLOTS + index * 8), Some(value));
+        assert_eq!(tls64(&ctx, &mut memory, first, "FlsGetValue", &Args::new(vec![index as u64], true)).unwrap().wide, Some(value));
+        assert_eq!(tls64(&ctx, &mut memory, second, "TlsGetValue", &Args::new(vec![index as u64], true)).unwrap().wide, Some(0));
+        // A slot given back and taken again starts empty in every thread.
+        memory.write_u64(second + TEB_TLS_SLOTS + index * 8, 5).unwrap();
+        assert_eq!(tls64(&ctx, &mut memory, first, "TlsFree", &Args::new(vec![index as u64], true)).unwrap().value, 1);
+        assert_eq!(tls64(&ctx, &mut memory, first, "TlsAlloc", &Args::new(vec![], true)).unwrap().value, index);
+        assert_eq!(memory.read_u64(first + TEB_TLS_SLOTS + index * 8), Some(0));
+        assert_eq!(memory.read_u64(second + TEB_TLS_SLOTS + index * 8), Some(0));
+        assert_eq!(tls64(&ctx, &mut memory, first, "TlsGetValue", &Args::new(vec![64], true)).unwrap().value, 0);
+        assert_eq!(ctx.shared.borrow().last_error, 87);
     }
 }

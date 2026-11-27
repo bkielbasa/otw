@@ -1,0 +1,68 @@
+# A bootable OTW disk image for each release.
+#
+# Builds the kernel (baremetal/) and target/os/otw.img with
+# scripts/build-os-image.sh: a GPT disk with the UEFI boot partition and
+# drive C: holding OTW's own test programs and free fonts (no third-party
+# programs: OTW_DRIVE_C is left empty). The image, compressed with xz, and
+# its checksum are attached to the release. Run by hand (workflow_dispatch),
+# it keeps them as a workflow artifact instead.
+name: Release image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust for UEFI
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-uefi
+          rustup default stable
+
+      - name: Fonts for drive C
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-dejavu-core fonts-liberation fonts-liberation2
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            baremetal/target
+          key: kernel-${{ hashFiles('baremetal/Cargo.lock', 'Cargo.lock') }}
+
+      - name: Build the disk image
+        env:
+          OTW_DRIVE_C: ""
+        run: scripts/build-os-image.sh
+
+      - name: Compress
+        id: pack
+        run: |
+          name="otw-${GITHUB_REF_NAME//\//-}.img"
+          mkdir -p dist
+          mv target/os/otw.img "dist/$name"
+          xz -T0 -9 "dist/$name"
+          (cd dist && sha256sum "$name.xz" > "$name.xz.sha256")
+          ls -l dist
+          echo "file=dist/$name.xz" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+
+      - name: Keep as an artifact
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: otw-image
+          path: dist/*

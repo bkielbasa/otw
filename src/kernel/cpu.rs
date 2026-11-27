@@ -2778,12 +2778,15 @@ fn build<'a>(
             let Some(native) = syscalls.native_x64(&entry.dll, &entry.name) else {
                 continue;
             };
-            let at = *placed.entry(native).or_insert_with(|| {
+            // Code with a slow path is placed once for each import (it
+            // jumps to that import's thunk).
+            let place = |code: &mut Vec<u8>| {
                 let at = thunk_end + code.len() as u32;
-                code.extend_from_slice(native);
+                code.extend_from_slice(&super::syscall::placed(native, at as u64, entry.thunk_va as u64));
                 code.resize((code.len() + 15) & !15, 0xCC);
                 at
-            });
+            };
+            let at = if native.slow { place(&mut code) } else { *placed.entry(native.code).or_insert_with(|| place(&mut code)) };
             bindings.push((entry.slot_va, at));
         }
         if !code.is_empty() {

@@ -54,36 +54,11 @@ pub struct State {
     seed: u32,
     started: Option<std::time::Instant>,
     strings: HashMap<String, u32>,
-    /// Native leaf functions placed in this process (`native_x64`): by
-    /// name, and the page they are written to (address, bytes used).
-    native: HashMap<String, u32>,
-    native_page: Option<(u32, u32)>,
-}
-
-/// The address of machine code for a C library leaf, written into the
-/// process on first use (for DLLs loaded at run time and GetProcAddress;
-/// the program's own imports are bound when it is loaded).
-pub fn native_address<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, dll: &str, name: &str) -> Option<u32> {
-    if memory.ptr_size() != 8 || !crate::win32::is_ucrt(crate::win32::api_set_host(dll).unwrap_or(dll)) {
-        return None;
-    }
-    let code = native_x64(name)?;
-    if let Some(&at) = ctx.shared.borrow().ucrt.native.get(name) {
-        return Some(at);
-    }
-    let (page, used) = match ctx.shared.borrow().ucrt.native_page {
-        Some(page) => page,
-        None => (memory.map_region(crate::kernel::memory::POOL_BASE, 0x1000)?, 0),
-    };
-    if used as usize + code.len() > 0x1000 {
-        return None;
-    }
-    let at = page + used;
-    memory.write_bytes(at, code)?;
-    let mut shared = ctx.shared.borrow_mut();
-    shared.ucrt.native_page = Some((page, (used + code.len() as u32 + 15) & !15));
-    shared.ucrt.native.insert(name.to_string(), at);
-    Some(at)
+    /// Native functions placed in this process at run time
+    /// (`native::address`): by name, and the page they are written to
+    /// (address, bytes used).
+    pub(crate) native: HashMap<String, u32>,
+    pub(crate) native_page: Option<(u32, u32)>,
 }
 
 /// The functions implemented here and how many arguments each takes.

@@ -38,6 +38,8 @@ On a real machine, write it to a USB stick and boot it with UEFI and Secure Boot
 sudo dd if=target/os/otw.img of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 
+Each GitHub release has a ready image attached (`otw-<tag>.img.xz`, built by `.github/workflows/release.yml`): the kernel, OTW's test programs and free fonts on drive C:, no third-party programs. Unpack and write it the same way (`xz -dc otw-<tag>.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress`). It is a GPT disk image, not an ISO: the kernel reads FAT32 partitions on NVMe and SATA disks, not CDs.
+
 Microsoft's files are not included. Tests that need them (copied into `binaries/win95/`) are skipped when they are missing.
 
 ## Layout

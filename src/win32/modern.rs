@@ -103,10 +103,9 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             let _ = memory.write_bytes(args[0], &[0u8; 16]);
             ok(0)
         }
-        // Slim reader/writer locks and condition variables. Threads only
-        // change hands when one waits, so a lock is never contended; a
-        // condition variable wait lets the other threads run and then
-        // returns (a spurious wake-up, which callers must handle anyway).
+        // Slim reader/writer locks (see sync.rs and native.rs: 64-bit
+        // programs take and give them back in their own code and come here
+        // to wait) and condition variables.
         "InitializeSRWLock" | "InitializeConditionVariable" => {
             let _ = memory.write_ptr(args[0], 0);
             ok(0)
@@ -116,7 +115,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(0)
         }
         "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared" => {
-            crate::win32::sync::srw_release(ctx, args[0], name.ends_with("Exclusive"));
+            crate::win32::sync::srw_release(ctx, memory, args[0], name.ends_with("Exclusive"));
             ok(0)
         }
         "WakeAllConditionVariable" | "WakeConditionVariable" => {
@@ -124,8 +123,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             ok(0)
         }
         "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" => {
-            let thread = memory.current_thread();
-            ok(u32::from(crate::win32::sync::srw_try(ctx, thread, args[0], name.ends_with("Exclusive"))))
+            ok(u32::from(crate::win32::sync::srw_try(memory, args[0], name.ends_with("Exclusive"))))
         }
         "SleepConditionVariableSRW" | "SleepConditionVariableCS" => {
             // (condition, lock, timeout[, flags]): give up the lock, sleep
@@ -135,7 +133,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
                 if name == "SleepConditionVariableCS" {
                     call(ctx, memory, "KERNEL32.dll", "LeaveCriticalSection", &[args[1]]);
                 } else {
-                    crate::win32::sync::srw_release(ctx, args[1], !shared_mode);
+                    crate::win32::sync::srw_release(ctx, memory, args[1], !shared_mode);
                 }
             }
             let woken = crate::win32::sync::sleep_on(ctx, memory, args[0], args[2]);

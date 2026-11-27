@@ -1052,6 +1052,17 @@ impl GuestMemory for NativeMemory<'_> {
         self.runner.write(va, bytes).then_some(())
     }
 
+    fn compare_exchange_u32(&mut self, va: u32, current: u32, new: u32) -> Option<Result<u32, u32>> {
+        let va = va as u64;
+        if va & 3 != 0 || !self.runner.touch(va, 4) {
+            return None;
+        }
+        let pointer = self.runner.space.translate(va)? as *mut u32;
+        // The program's other threads change it on other CPUs.
+        let atomic = unsafe { core::sync::atomic::AtomicU32::from_ptr(pointer) };
+        Some(atomic.compare_exchange(current, new, core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst))
+    }
+
     fn ptr_size(&self) -> u32 {
         if self.runner.x64 {
             8
@@ -1559,13 +1570,18 @@ fn run_process(shared: &Rc<RefCell<SharedState>>, path: &str, command_line: &str
         let mut bound = 0;
         for entry in runner.entries.iter().filter(|e| e.slot_va != 0) {
             let Some(native) = runner.syscalls.native_x64(&entry.dll, &entry.name) else { continue };
-            let at = match placed.iter().find(|(code, _)| core::ptr::eq(*code, native)) {
+            // Code with a slow path is placed once for each import (it
+            // jumps to that import's thunk).
+            let shared = (!native.slow).then(|| placed.iter().find(|(code, _)| core::ptr::eq(*code, native.code))).flatten();
+            let at = match shared {
                 Some(&(_, at)) => at,
                 None => {
                     let at = thunk_end + leaves.len() as u64;
-                    leaves.extend_from_slice(native);
+                    leaves.extend_from_slice(&otw_vm::kernel::syscall::placed(native, at, entry.thunk_va as u64));
                     leaves.resize((leaves.len() + 15) & !15, 0xCC);
-                    placed.push((native, at));
+                    if !native.slow {
+                        placed.push((native.code, at));
+                    }
                     at
                 }
             };

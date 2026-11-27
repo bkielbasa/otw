@@ -51,7 +51,7 @@ pub trait SystemCalls {
     /// that needs nothing of the subsystem (a C library leaf such as
     /// `strlen`), in a 64-bit process: called millions of times, it is far
     /// faster run by the CPU than dispatched.
-    fn native_x64(&self, _dll: &str, _name: &ImportName) -> Option<&'static [u8]> {
+    fn native_x64(&self, _dll: &str, _name: &ImportName) -> Option<Native> {
         None
     }
 
@@ -122,6 +122,28 @@ impl ImportPolicy for GenuineFirst {
     fn prefers_subsystem(&self, _dll: &str, _name: &ImportName) -> bool {
         false
     }
+}
+
+/// Machine code an import runs as in a 64-bit process (`native_x64`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Native {
+    pub code: &'static [u8],
+    /// The code ends with `jmp rel32` to the import's own system call (for
+    /// what it cannot finish alone); the last four bytes are its
+    /// displacement, filled in by [`placed`].
+    pub slow: bool,
+}
+
+/// `native`'s code as placed at `at`, its slow path jumping to `thunk`.
+pub fn placed(native: Native, at: u64, thunk: u64) -> Vec<u8> {
+    let mut code = native.code.to_vec();
+    if native.slow {
+        let end = at + code.len() as u64;
+        let displacement = thunk.wrapping_sub(end) as i64 as i32;
+        let len = code.len();
+        code[len - 4..].copy_from_slice(&displacement.to_le_bytes());
+    }
+    code
 }
 
 /// A 32-bit result as a 64-bit one: small negative values (error codes such

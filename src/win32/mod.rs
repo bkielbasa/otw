@@ -23,6 +23,7 @@ pub mod ucrt;
 pub mod tabs;
 pub mod rebar;
 pub mod modern;
+pub mod native;
 pub mod x64;
 pub mod catmgr;
 pub mod cab;
@@ -1181,18 +1182,23 @@ impl SystemCalls for ApiContext {
     ) -> Option<ApiOutcome> {
         let (dll, name) = self.resolve(dll, name)?;
         if args.x64() {
-            // Each thread has its own last error (threads of a 64-bit
-            // process run at once, taking turns in the system).
+            // Each thread has its own last error, in its TEB (where the
+            // program's own GetLastError and SetLastError read and write
+            // it, see native.rs).
             let thread = memory.current_thread();
+            let teb = memory.current_tib();
             {
+                let own = memory.read_u32(teb + native::TEB_LAST_ERROR).unwrap_or(0);
                 let mut shared = self.shared.borrow_mut();
-                let own = shared.sync.last_error_of(thread);
                 shared.last_error = own;
+                shared.sync.tebs.insert(thread, teb);
             }
-            let outcome = x64::call(self, memory, &dll, &name, args, caller);
-            let mut shared = self.shared.borrow_mut();
-            let error = shared.last_error;
-            shared.sync.set_last_error_of(thread, error);
+            let outcome = match name.as_str().and_then(|text| sync::tls64(self, memory, teb, text, args)) {
+                Some(outcome) => Some(outcome),
+                None => x64::call(self, memory, &dll, &name, args, caller),
+            };
+            let error = self.shared.borrow().last_error;
+            let _ = memory.write_u32(memory.current_tib() + native::TEB_LAST_ERROR, error);
             return outcome;
         }
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
@@ -1211,12 +1217,18 @@ impl SystemCalls for ApiContext {
         sync::thread_exited(self, id, code);
     }
 
-    fn native_x64(&self, dll: &str, name: &ImportName) -> Option<&'static [u8]> {
+    fn native_x64(&self, dll: &str, name: &ImportName) -> Option<crate::kernel::syscall::Native> {
         let (dll, name) = self.resolve(dll, name)?;
-        if !is_ucrt(api_set_host(&dll).unwrap_or(&dll)) {
-            return None;
+        let text = name.as_str()?;
+        if is_ucrt(api_set_host(&dll).unwrap_or(&dll)) {
+            return ucrt::native_x64(text).map(|code| crate::kernel::syscall::Native { code, slow: false });
         }
-        ucrt::native_x64(name.as_str()?)
+        // KERNEL32's own, when the subsystem has the function (the slow
+        // path is its system call).
+        if native::is_kernel_dll(&dll) && x64::arg_count(self, &dll, &name).is_some() {
+            return native::kernel_native(text);
+        }
+        None
     }
 
     fn describe(&self, dll: &str, name: &ImportName) -> String {

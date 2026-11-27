@@ -32,12 +32,17 @@ class Fat32:
         for spc in (1, 2, 4, 8, 16, 32, 64):
             if self.sectors // spc < 65525 * 2:
                 break
-        self.spc = spc
         self.reserved = 32
-        clusters = self.sectors // spc
-        self.fat_sectors = (clusters * 4 + SECTOR - 1) // SECTOR
-        self.data_start = self.reserved + 2 * self.fat_sectors
-        self.clusters = (self.sectors - self.data_start) // spc
+        while True:
+            clusters = self.sectors // spc
+            self.fat_sectors = (clusters * 4 + SECTOR - 1) // SECTOR
+            self.data_start = self.reserved + 2 * self.fat_sectors
+            self.clusters = (self.sectors - self.data_start) // spc
+            # Near the limit the FATs leave too few: smaller clusters.
+            if self.clusters >= 65525 or spc == 1:
+                break
+            spc //= 2
+        self.spc = spc
         if self.clusters < 65525:
             raise SystemExit(f"partition {label!r} is too small for FAT32 ({size_bytes // MIB} MiB)")
         self.cluster_bytes = spc * SECTOR
