@@ -131,17 +131,126 @@ fn start_menu_works_from_the_keyboard() {
         },
     );
     assert!(f.shell.menu_open());
-    press(&mut f.shell, Key::Char('p'));
+    // Arrows walk the menu: Down to Programs, Right into it, then
+    // Accessories and its first shortcut.
+    press(&mut f.shell, Key::Down);
     press(&mut f.shell, Key::Right);
-    press(&mut f.shell, Key::Char('p'));
+    press(&mut f.shell, Key::Right);
     press(&mut f.shell, Key::Enter);
+    assert!(f.shell.take_launch().is_some());
+    press(&mut f.shell, Key::Logo);
+    press(&mut f.shell, Key::Escape);
+    assert!(!f.shell.menu_open());
+}
+
+#[test]
+fn typing_in_the_menu_searches_and_enter_starts_the_best_match() {
+    let mut f = fixture("search");
+    press(&mut f.shell, Key::Logo);
+    assert_eq!(f.shell.search_text(), Some(""));
+    // Typing searches at once; the best match is highlighted.
+    type_text(&mut f.shell, "pain");
+    assert_eq!(f.shell.search_text(), Some("pain"));
+    let menu = &f.shell.menu.as_ref().unwrap().menu;
+    assert_eq!(menu.hot_label(), Some("Paint"));
+    assert!(!menu.labels().contains(&"&Programs"));
+    press(&mut f.shell, Key::Enter);
+    assert!(!f.shell.menu_open());
     assert_eq!(
         f.shell.take_launch().unwrap().path,
         "\\WINDOWS\\MSPAINT.EXE"
     );
+
+    // Backspace edits the search; with nothing left the usual items return.
     press(&mut f.shell, Key::Logo);
+    type_text(&mut f.shell, "no");
+    assert_eq!(f.shell.menu.as_ref().unwrap().menu.hot_label(), Some("Notepad"));
+    press(&mut f.shell, Key::Backspace);
+    press(&mut f.shell, Key::Backspace);
+    assert_eq!(f.shell.search_text(), Some(""));
+    assert!(f.shell.menu_item_rect("Programs").is_some());
+    press(&mut f.shell, Key::Backspace);
+    assert!(f.shell.menu_open());
+
+    // Arrows move between matches; Escape closes the menu.
+    type_text(&mut f.shell, "zzzz-nothing");
+    assert!(f.shell.menu_item_rect("No programs found").is_some());
+    press(&mut f.shell, Key::Enter);
+    assert!(f.shell.take_launch().is_none());
     press(&mut f.shell, Key::Escape);
     assert!(!f.shell.menu_open());
+
+    // The shell's own commands are found too.
+    press(&mut f.shell, Key::Logo);
+    type_text(&mut f.shell, "explorer");
+    press(&mut f.shell, Key::Enter);
+    assert_eq!(f.shell.explorer_path().as_deref(), Some("\\"));
+}
+
+#[test]
+fn search_finds_programs_anywhere_on_the_drive_once() {
+    let mut f = fixture("search-drive");
+    std::fs::create_dir_all(disk(&f, "Tools/Deep")).unwrap();
+    std::fs::write(disk(&f, "Tools/Deep/Zapper.exe"), b"MZ").unwrap();
+    std::fs::write(disk(&f, "Tools/zapper-notes.txt"), b"x").unwrap();
+    f.shell.refresh();
+    press(&mut f.shell, Key::Logo);
+    type_text(&mut f.shell, "zap");
+    let labels: Vec<String> = f
+        .shell
+        .menu
+        .as_ref()
+        .unwrap()
+        .menu
+        .labels()
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+    // Only programs, not other files.
+    assert_eq!(labels, vec!["Zapper".to_string()]);
+    press(&mut f.shell, Key::Enter);
+    assert_eq!(
+        f.shell.take_launch().unwrap().path,
+        "\\Tools\\Deep\\Zapper.exe"
+    );
+    // Notepad has a shortcut and a file in WINDOWS: it is listed once.
+    press(&mut f.shell, Key::Logo);
+    type_text(&mut f.shell, "notepad");
+    let menu = &f.shell.menu.as_ref().unwrap().menu;
+    assert_eq!(
+        menu.labels().iter().filter(|l| l.eq_ignore_ascii_case("notepad")).count(),
+        1,
+        "{:?}",
+        menu.labels()
+    );
+    // Down moves to the next match, Up back.
+    press(&mut f.shell, Key::Escape);
+    press(&mut f.shell, Key::Logo);
+    type_text(&mut f.shell, "a");
+    let first = f.shell.menu.as_ref().unwrap().menu.hot_label().map(String::from);
+    press(&mut f.shell, Key::Down);
+    let second = f.shell.menu.as_ref().unwrap().menu.hot_label().map(String::from);
+    assert_ne!(first, second);
+    press(&mut f.shell, Key::Up);
+    assert_eq!(f.shell.menu.as_ref().unwrap().menu.hot_label().map(String::from), first);
+}
+
+#[test]
+fn the_menu_button_and_clock_share_the_taskbar() {
+    let f = fixture("taskbar");
+    let start = f.shell.start_rect();
+    let tray = f.shell.tray_rect();
+    let clock = f.shell.clock_rect();
+    let tasks = f.shell.task_rects(3);
+    assert!(start.bottom <= 700 && start.top >= 700 - TASKBAR_HEIGHT);
+    assert!(tasks[0].left > start.right);
+    assert!(tasks[2].right <= tray.left);
+    assert!(clock.right <= 1024 && clock.left >= tray.left);
+    assert_eq!(
+        clock_texts(9, 5, 5, 27, 10),
+        ("09:05".to_string(), "Fri 27 Nov".to_string())
+    );
+    assert_eq!(long_date(5, 27, 10, 2026), "Friday, November 27, 2026");
 }
 
 #[test]
@@ -300,7 +409,8 @@ fn rename_rejects_invalid_and_duplicate_names() {
 fn run_dialog_starts_programs_with_arguments() {
     let mut f = fixture("run");
     f.shell.key(Key::Logo, Mods::default());
-    press(&mut f.shell, Key::Char('r'));
+    type_text(&mut f.shell, "run");
+    press(&mut f.shell, Key::Enter);
     assert_eq!(f.shell.dialog_title(), Some("Run"));
     type_text(&mut f.shell, "notepad C:\\README.TXT");
     press(&mut f.shell, Key::Enter);
@@ -378,18 +488,22 @@ fn every_layer_paints() {
             }],
         );
     }
-    // Desktop teal, taskbar face, and the Start menu's banner.
-    assert_eq!(surface.get(1000, 600), Some(0x008080));
-    assert_eq!(surface.get(600, 690), Some(0xC0C0C0));
-    let menu = f
-        .shell
-        .menu
-        .as_ref()
-        .unwrap()
-        .menu
-        .item_rect("Programs")
-        .unwrap();
-    assert_eq!(surface.get(menu.left - 10, menu.top + 2), Some(0x808080));
+    // The dark desktop, the black taskbar, and the menu with its search
+    // field.
+    assert_eq!(surface.get(1000, 600), Some(theme::desktop_shade(600, 700)));
+    assert_eq!(surface.get(600, 690), Some(theme::TASKBAR));
+    let open = &f.shell.menu.as_ref().unwrap().menu;
+    let programs = open.item_rect("Programs").unwrap();
+    assert_eq!(
+        surface.get(programs.right - 30, programs.top + 2),
+        Some(theme::SURFACE)
+    );
+    let search = open.search_rect().unwrap();
+    assert_eq!(surface.get(search.left + 60, search.top), Some(theme::ACCENT));
+    assert_eq!(
+        surface.get(search.right - 20, search.top + 5),
+        Some(theme::WELL)
+    );
     // The folder window shows Notepad's own icon (not the generic one).
     let e = f.shell.explorer.as_ref().unwrap();
     let row = e
@@ -500,7 +614,7 @@ fn tray_icons_report_clicks_and_show_tips() {
     let tray = f.shell.tray_rect();
     assert_eq!(
         surface.get(icon.0, tray.top - 20),
-        Some(0xFFFFE1),
+        Some(sys_color(24)),
         "tooltip background"
     );
 }

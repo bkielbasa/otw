@@ -1,6 +1,6 @@
-//! Cascading popup menus in the Win95 style: the Start menu, menu-bar
-//! dropdowns and context menus. Pure layout and interaction state; the
-//! shell paints them with [`paint`].
+//! Cascading popup menus: the Menu button's menu (with its search field),
+//! menu-bar dropdowns and context menus, drawn dark and flat. Pure layout
+//! and interaction state; the shell paints them with [`paint`].
 
 #[allow(unused_imports)]
 use crate::platform as std;
@@ -8,8 +8,8 @@ use crate::platform as std;
 use crate::platform::prelude::*;
 
 use crate::{
-    win32::gdi::sys_color,
-    win32::gfx::{self, Rect},
+    win32::gfx::Rect,
+    win32::theme,
     win32::user::{text_width, Painter},
 };
 
@@ -144,14 +144,19 @@ impl Item {
 pub enum Style {
     /// Rows with 16x16 icons.
     Icons,
-    /// The Start menu's top level: tall rows, large icons, side banner.
+    /// The Menu button's top level: a search field above tall rows.
     Start,
     /// Plain text rows, like an application's menus.
     Plain,
 }
 
-const SEPARATOR_HEIGHT: i32 = 8;
-const BANNER_WIDTH: i32 = 21;
+const SEPARATOR_HEIGHT: i32 = 9;
+/// Space above the rows of the Menu button's menu, for the search field.
+pub const SEARCH_HEADER: i32 = 46;
+/// Width of the Menu button's menu.
+pub const START_WIDTH: i32 = 320;
+/// Room between a level's outline and its rows.
+const PAD: i32 = 4;
 
 struct Level {
     items: Vec<Item>,
@@ -164,17 +169,17 @@ struct Level {
 
 fn row_height(style: Style) -> i32 {
     match style {
-        Style::Start => 32,
-        Style::Icons => 20,
-        Style::Plain => 18,
+        Style::Start => 28,
+        Style::Icons => 22,
+        Style::Plain => 20,
     }
 }
 
 fn label_x(style: Style) -> i32 {
     match style {
-        Style::Start => BANNER_WIDTH + 42,
-        Style::Icons => 26,
-        Style::Plain => 20,
+        Style::Start => PAD + 36,
+        Style::Icons => PAD + 28,
+        Style::Plain => PAD + 22,
     }
 }
 
@@ -191,31 +196,28 @@ impl Level {
             .max()
             .unwrap_or(0);
         let gap = if accel_width > 0 { 24 } else { 0 };
-        let mut width = 3 + label_x(style) + label_width + gap + accel_width + 22 + 3;
+        let mut width = label_x(style) + label_width + gap + accel_width + 24 + PAD;
+        let mut y = PAD;
         if style == Style::Start {
-            width = width.max(150);
+            width = width.max(START_WIDTH);
+            y += SEARCH_HEADER;
         }
-        let mut y = 3;
         let mut rows = Vec::with_capacity(items.len());
-        let left = if style == Style::Start {
-            3 + BANNER_WIDTH
-        } else {
-            3
-        };
+        let left = PAD;
         for item in &items {
             let height = if matches!(item.kind, Kind::Separator) {
                 SEPARATOR_HEIGHT
             } else {
                 row_height(style)
             };
-            rows.push(Rect::new(left, y, width - 3, y + height));
+            rows.push(Rect::new(left, y, width - PAD, y + height));
             y += height;
         }
         Self {
-            accel_x: 3 + label_x(style) + label_width + gap,
+            accel_x: label_x(style) + label_width + gap,
             items,
             style,
-            rect: Rect::sized(0, 0, width.max(80), y + 3),
+            rect: Rect::sized(0, 0, width.max(80), y + PAD),
             rows,
             hot: None,
         }
@@ -265,6 +267,8 @@ pub enum Outcome {
 pub struct Menu {
     levels: Vec<Level>,
     screen: (i32, i32),
+    /// What is typed in the search field of the Menu button's menu.
+    pub search: String,
 }
 
 impl Menu {
@@ -286,7 +290,44 @@ impl Menu {
         Self {
             levels: vec![level],
             screen,
+            search: String::new(),
         }
+    }
+
+    /// The search field of a Menu-button menu, in screen coordinates.
+    pub fn search_rect(&self) -> Option<Rect> {
+        let level = self.levels.first().filter(|l| l.style == Style::Start)?;
+        let r = level.rect;
+        Some(Rect::new(
+            r.left + 10,
+            r.top + 10,
+            r.right - 10,
+            r.top + SEARCH_HEADER - 6,
+        ))
+    }
+
+    /// The labels of the top level's items, for tests.
+    pub fn labels(&self) -> Vec<&str> {
+        self.levels[0]
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect()
+    }
+
+    /// Highlight the first item that can be chosen (a search's best match).
+    pub fn highlight_first(&mut self) {
+        let level = &mut self.levels[0];
+        level.hot = level
+            .items
+            .iter()
+            .position(|item| item.selectable() && item.enabled);
+        self.levels.truncate(1);
+    }
+
+    /// The level's screen rectangle, for tests.
+    pub fn rect(&self) -> Rect {
+        self.levels[0].rect
     }
 
     /// Whether a point is over any open level.
@@ -330,12 +371,12 @@ impl Menu {
         let parent_rect = parent.rect;
         let mut child = Level::new(items, Style::Icons);
         let (w, h) = (child.rect.width(), child.rect.height());
-        let x = if parent_rect.right - 3 + w <= self.screen.0 {
-            parent_rect.right - 3
+        let x = if parent_rect.right - 2 + w <= self.screen.0 {
+            parent_rect.right - 2
         } else {
-            (parent_rect.left - w + 3).max(0)
+            (parent_rect.left - w + 2).max(0)
         };
-        let y = (row.top - 3).min(self.screen.1 - h).max(0);
+        let y = (row.top - PAD).min(self.screen.1 - h).max(0);
         child.place(x, y);
         if highlight_first {
             child.hot = child.items.iter().position(Item::selectable);
@@ -513,106 +554,134 @@ impl Menu {
     }
 }
 
+/// A label without its `&` mnemonic marks (`&&` is a literal `&`).
+fn plain_label(label: &[u8]) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(label.len());
+    let mut bytes = label.iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == b'&' {
+            if bytes.peek() == Some(&b'&') {
+                bytes.next();
+                plain.push(b'&');
+            }
+        } else {
+            plain.push(byte);
+        }
+    }
+    plain
+}
+
 /// Draw every open level of a menu.
 pub fn paint(p: &mut Painter<'_>, menu: &Menu) {
-    for level in &menu.levels {
+    for (index, level) in menu.levels.iter().enumerate() {
         paint_level(p, level);
+        if index == 0 {
+            if let Some(rect) = menu.search_rect() {
+                paint_search(p, rect, &menu.search);
+            }
+        }
+    }
+}
+
+/// The search field: a magnifier, then what is typed (or a hint) and the
+/// caret.
+fn paint_search(p: &mut Painter<'_>, rect: Rect, query: &str) {
+    theme::rounded_box(p, rect, 4, theme::WELL, theme::ACCENT);
+    // Magnifier: a ring and a handle.
+    let (cx, cy) = (rect.left + 15, rect.top + rect.height() / 2 - 1);
+    for dy in -5..=5i32 {
+        for dx in -5..=5i32 {
+            let d = dx * dx + dy * dy;
+            if (13..=24).contains(&d) {
+                p.pixel(cx + dx, cy + dy, theme::TEXT_DIM);
+            }
+        }
+    }
+    for i in 0..4 {
+        p.pixel(cx + 4 + i, cy + 4 + i, theme::TEXT_DIM);
+        p.pixel(cx + 5 + i, cy + 4 + i, theme::TEXT_DIM);
+    }
+    let x = rect.left + 30;
+    let y = rect.top + (rect.height() - 13) / 2;
+    let text = super::bytes(query);
+    if query.is_empty() {
+        p.text(x, y, b"Type to search", theme::TEXT_DIM, false);
+        p.vline(x - 1, y - 1, y + 14, theme::TEXT);
+    } else {
+        let shown = super::fit(query, rect.width() - 40);
+        p.text(x, y, &shown, theme::TEXT, false);
+        let caret = x + text_width(&shown).min(text_width(&text));
+        p.vline(caret + 1, y - 1, y + 14, theme::TEXT);
     }
 }
 
 fn paint_level(p: &mut Painter<'_>, level: &Level) {
     let full = level.rect;
-    p.fill(full, sys_color(4));
-    p.raised(full);
-    if level.style == Style::Start {
-        let banner = Rect::new(
-            full.left + 3,
-            full.top + 3,
-            full.left + 3 + BANNER_WIDTH,
-            full.bottom - 3,
-        );
-        p.fill(banner, 0x808080);
-        vertical_text(
-            p,
-            banner.left + 3,
-            banner.bottom - 6,
-            b"OTW Desktop",
-            0xC0C0C0,
-        );
-    }
+    let radius = if level.style == Style::Start { 6 } else { 4 };
+    theme::rounded_box(p, full, radius, theme::SURFACE, theme::BORDER);
     for (index, item) in level.items.iter().enumerate() {
         let row = level.screen_row(index);
         if matches!(item.kind, Kind::Separator) {
-            let y = row.top + row.height() / 2 - 1;
-            p.hline(row.left + 1, row.right - 1, y, sys_color(16));
-            p.hline(row.left + 1, row.right - 1, y + 1, sys_color(20));
+            let y = row.top + row.height() / 2;
+            p.hline(row.left + 6, row.right - 6, y, theme::BORDER);
             continue;
         }
         let hot = level.hot == Some(index);
         if hot {
-            p.fill(row, sys_color(13));
+            theme::rounded(p, row, 3, theme::MENU_HOT);
+            if level.style == Style::Start {
+                // The match Enter starts: an accent mark at its left.
+                p.fill(
+                    Rect::new(row.left + 1, row.top + 7, row.left + 3, row.bottom - 7),
+                    theme::ACCENT,
+                );
+            }
         }
-        let color = if hot { sys_color(14) } else { sys_color(7) };
-        let (icon_size, icon_x) = match level.style {
-            Style::Start => (32, row.left + 4),
-            _ => (16, row.left + 3),
+        let color = if item.enabled {
+            theme::TEXT
+        } else {
+            theme::TEXT_DISABLED
+        };
+        let icon_x = match level.style {
+            Style::Start => row.left + 12,
+            _ => row.left + 6,
         };
         if let Some(icon) = &item.icon {
-            let icon_y = row.top + (row.height() - icon_size) / 2;
-            icons::draw(p, icon, icon_x, icon_y, icon_size, false);
+            let icon_y = row.top + (row.height() - 16) / 2;
+            icons::draw(p, icon, icon_x, icon_y, 16, false);
             if item.overlay {
-                icons::draw_shortcut_overlay(p, icon_x, icon_y, icon_size);
+                icons::draw_shortcut_overlay(p, icon_x, icon_y, 16);
             }
         }
         let text_x = full.left + label_x(level.style);
         let text_y = row.top + (row.height() - 13) / 2;
-        let label = item.label.as_bytes();
-        if !item.enabled {
-            if hot {
-                p.mnemonic_text(text_x, text_y, label, sys_color(16));
-            } else {
-                p.disabled_text(text_x, text_y, label);
-            }
-        } else if item.default {
+        let label = super::bytes(&item.label);
+        if item.default && item.enabled {
             // Default items (the double-click action) are bold.
-            let plain: Vec<u8> = label.iter().copied().filter(|b| *b != b'&').collect();
-            p.text(text_x, text_y, &plain, color, true);
+            p.text(text_x, text_y, &plain_label(&label), color, true);
+        } else if level.style == Style::Start {
+            // Typing searches here, so letters are not shortcuts: no
+            // underlines.
+            p.text(text_x, text_y, &plain_label(&label), color, false);
         } else {
-            p.mnemonic_text(text_x, text_y, label, color);
+            p.mnemonic_text(text_x, text_y, &label, color);
         }
         if !item.accel.is_empty() {
             p.text(
                 full.left + level.accel_x,
                 text_y,
                 item.accel.as_bytes(),
-                if item.enabled { color } else { sys_color(16) },
+                if item.enabled {
+                    theme::TEXT_DIM
+                } else {
+                    theme::TEXT_DISABLED
+                },
                 false,
             );
         }
         if matches!(item.kind, Kind::Submenu(_)) {
-            let ax = row.right - 10;
-            let ay = row.top + row.height() / 2;
-            for i in 0..4 {
-                p.vline(ax + i, ay - 3 + i, ay + 4 - i, color);
-            }
+            theme::chevron(p, row.right - 10, row.top + row.height() / 2, 3, color);
         }
-    }
-}
-
-/// Text rotated 90° counter-clockwise, reading bottom to top.
-fn vertical_text(p: &mut Painter<'_>, x: i32, bottom: i32, text: &[u8], color: u32) {
-    let face = gfx::pick_face(13, true);
-    let mut pen = bottom;
-    for &byte in text {
-        let advance = face.advance(byte);
-        for gy in 0..face.height {
-            for gx in 0..advance {
-                if face.pixel(byte, gx, gy) {
-                    p.pixel(x + gy, pen - gx, color);
-                }
-            }
-        }
-        pen -= advance;
     }
 }
 
@@ -647,6 +716,52 @@ mod tests {
         let menu = sample();
         assert_eq!(menu.levels[0].rect.bottom, 672);
         assert_eq!(menu.levels[0].rect.left, 2);
+        assert_eq!(menu.rect().width(), START_WIDTH);
+        // The search field is at the top, above the first row.
+        let search = menu.search_rect().unwrap();
+        let programs = menu.item_rect("Programs").unwrap();
+        assert!(search.bottom <= programs.top);
+        assert!(menu.rect().contains(search.left, search.top));
+    }
+
+    #[test]
+    fn other_menus_have_no_search_field() {
+        let menu = Menu::open(
+            vec![Item::command("&Open", Command::OpenSelection)],
+            Style::Icons,
+            Anchor::Point(10, 10),
+            (1024, 700),
+        );
+        assert!(menu.search_rect().is_none());
+    }
+
+    #[test]
+    fn plain_labels_drop_mnemonic_marks() {
+        assert_eq!(plain_label(b"Sh&ut Down..."), b"Shut Down...");
+        assert_eq!(plain_label(b"Tom && Jerry"), b"Tom & Jerry");
+        assert_eq!(plain_label(b"&"), b"");
+    }
+
+    #[test]
+    fn highlight_first_skips_disabled_items_and_closes_submenus() {
+        let mut menu = Menu::open(
+            vec![
+                Item::empty(),
+                Item::submenu("&Programs", vec![Item::command("Notepad", Command::Run)]),
+                Item::command("&Run...", Command::Run),
+            ],
+            Style::Start,
+            Anchor::Above(2, 672),
+            (1024, 700),
+        );
+        menu.key(Key::Down);
+        menu.key(Key::Down);
+        menu.key(Key::Right);
+        assert_eq!(menu.depth(), 2);
+        menu.highlight_first();
+        assert_eq!(menu.depth(), 1);
+        assert_eq!(menu.hot_label(), Some("&Programs"));
+        assert_eq!(menu.labels(), vec!["(Empty)", "&Programs", "&Run..."]);
     }
 
     #[test]

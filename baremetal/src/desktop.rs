@@ -436,6 +436,11 @@ impl Desktop {
                     0x38 => self.input.mods.alt = !released,
                     _ => {}
                 }
+                // The logo key opens (or closes) the Menu button's menu
+                // whoever has the keyboard; programs see neither edge.
+                if extended && matches!(scan, 0x5B | 0x5C) {
+                    return !released && self.shell.key(Key::Logo, self.input.mods);
+                }
                 let to_program = self.has_programs() && !self.shell.wants_keyboard();
                 if to_program {
                     if let Some(vk) = virtual_key(scan, extended) {

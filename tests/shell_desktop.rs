@@ -39,7 +39,11 @@ fn a_document_created_in_explorer_opens_and_saves_in_notepad() {
             ..Mods::default()
         },
     );
-    press(&mut shell, Key::Char('r'));
+    // Typing in the menu searches; Enter starts the best match, Run....
+    for ch in "run".chars() {
+        press(&mut shell, Key::Char(ch));
+    }
+    press(&mut shell, Key::Enter);
     for ch in "C:\\My Documents".chars() {
         press(&mut shell, Key::Char(ch));
     }
