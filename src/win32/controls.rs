@@ -1930,6 +1930,60 @@ const COMBOBOXEXITEM: crate::win32::x64::Layout = crate::win32::x64::Layout::new
 const CBEIF_TEXT: u32 = 0x1;
 const CBEIF_LPARAM: u32 = 0x20;
 
+/// Whether notifications sent to `parent` should be the UTF-16 kind: as
+/// the program's window that gets them in the end wants (controls of the
+/// system's own, a rebar say, pass them on to their parents).
+pub fn notifies_wide(ctx: &ApiContext, parent: u32) -> bool {
+    let mut hwnd = parent;
+    for _ in 0..16 {
+        let Some((proc_va, up)) = ctx.shared.borrow().gui.window(hwnd).map(|w| (w.wndproc, w.parent)) else {
+            return false;
+        };
+        if !ctx.procs.contains_key(&proc_va) {
+            return crate::win32::unicode::is_unicode_proc(ctx, proc_va);
+        }
+        hwnd = up;
+    }
+    false
+}
+
+/// Send CBEN_ENDEDITA/W (NMCBEENDEDIT: NMHDR, fChanged, iNewSelection,
+/// szText[260], iWhy) to the parent, in its character set.
+fn combo_ex_end_edit<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, why: u32) {
+    let (parent, id, text) = match ctx.shared.borrow().gui.window(hwnd) {
+        Some(w) if w.parent != 0 => (w.parent, w.id, w.text.clone()),
+        _ => return,
+    };
+    let wide = notifies_wide(ctx, parent);
+    let x64 = memory.ptr_size() == 8;
+    let header = crate::win32::x64::NMHDR.size(x64);
+    let chars = 260u32;
+    let size = header + 8 + chars * if wide { 2 } else { 1 } + 4;
+    let block = user::scratch(ctx, size);
+    if block == 0 {
+        return;
+    }
+    let _ = memory.write_bytes(block, &vec![0u8; size as usize]);
+    let nmhdr = crate::win32::x64::View::new(memory, &crate::win32::x64::NMHDR, block);
+    let code = if wide { -806i32 } else { -805i32 } as u32;
+    for (field, value) in [hwnd, id, code].into_iter().enumerate() {
+        nmhdr.set(memory, field, value);
+    }
+    let _ = memory.write_u32(block + header, 1); // fChanged
+    let _ = memory.write_u32(block + header + 4, u32::MAX); // iNewSelection: typed
+    let mut text = text;
+    text.truncate(chars as usize - 1);
+    let at = block + header + 8;
+    if wide {
+        crate::win32::unicode::write_wide(memory, at, &crate::win32::unicode::ansi_to_wide(&text), true);
+    } else {
+        let _ = write_cstr(memory, at, &text);
+    }
+    let _ = memory.write_u32(at + chars * if wide { 2 } else { 1 }, why);
+    send(ctx, memory, parent, 0x004E, id, block);
+    user::free_scratch(ctx, block);
+}
+
 /// The extended combo box (`ComboBoxEx32`): a combo box (its own edit
 /// field, which CBEM_GETEDITCONTROL hands out) taking COMBOBOXEXITEMs.
 /// Item images are not drawn.
@@ -2002,6 +2056,12 @@ pub fn combo_ex_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         0x0402 | 0x0403 | 0x0408 | 0x040E | 0x0409 | 0x040A | 0x2005 | 0x200B => 0,
         // CCM_GETUNICODEFORMAT
         0x2006 => 1,
+        // Enter in the edit field ends editing: CBEN_ENDEDIT tells the
+        // parent the text (7-Zip goes to the path typed).
+        WM_KEYDOWN if wparam == 0x0D => {
+            combo_ex_end_edit(ctx, memory, hwnd, 2); // CBENF_RETURN
+            0
+        }
         _ => combo_proc(ctx, memory, hwnd, msg, wparam, lparam),
     }
 }
@@ -2096,6 +2156,103 @@ fn listbox_proc<M: GuestMemory + ?Sized>(
         }
         WM_GETDLGCODE => 0x1 | 0x80,
         _ => def_window_proc(ctx, memory, hwnd, msg, wparam, lparam),
+    }
+}
+
+// ── Progress bar ─────────────────────────────────────────────────────────
+
+/// A progress bar's range and position (minimum, maximum, position, step),
+/// kept in its window's extra bytes.
+fn progress_state(ctx: &ApiContext, hwnd: u32) -> [i32; 4] {
+    let shared = ctx.shared.borrow();
+    let extra = shared.gui.window(hwnd).map(|w| w.extra.clone()).unwrap_or_default();
+    let field = |i: usize| extra.get(i * 4..i * 4 + 4).map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap()));
+    let state = [field(0), field(1), field(2), field(3)];
+    // A new bar: 0 to 100, steps of 10.
+    if state == [0; 4] { [0, 100, 0, 10] } else { state }
+}
+
+fn set_progress_state(ctx: &ApiContext, hwnd: u32, state: [i32; 4]) {
+    if let Some(w) = ctx.shared.borrow_mut().gui.window_mut(hwnd) {
+        w.extra.resize(16.max(w.extra.len()), 0);
+        for (i, value) in state.iter().enumerate() {
+            w.extra[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    redraw(ctx, hwnd);
+}
+
+/// The progress bar (`msctls_progress32`): a range, a position in it, drawn
+/// as the filled part of a sunken bar.
+pub fn progress_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, msg: u32, wparam: u32, lparam: u32) -> u32 {
+    let [min, max, pos, step] = progress_state(ctx, hwnd);
+    let clamp = |value: i32| value.clamp(min.min(max), max.max(min));
+    match msg {
+        // PBM_SETRANGE (16-bit bounds), PBM_SETRANGE32: the old range.
+        0x0401 | 0x0406 => {
+            let (low, high) = if msg == 0x0401 { ((lparam & 0xFFFF) as i16 as i32, (lparam >> 16) as i16 as i32) } else { (wparam as i32, lparam as i32) };
+            set_progress_state(ctx, hwnd, [low, high, pos.clamp(low.min(high), high.max(low)), step]);
+            (min as u32 & 0xFFFF) | (max as u32) << 16
+        }
+        // PBM_SETPOS, PBM_DELTAPOS, PBM_STEPIT: the old position.
+        0x0402 | 0x0403 | 0x0405 => {
+            let new = match msg {
+                0x0402 => wparam as i32,
+                0x0403 => pos + wparam as i32,
+                _ => {
+                    let next = pos + step;
+                    if next > max { min + (next - max) } else { next }
+                }
+            };
+            set_progress_state(ctx, hwnd, [min, max, clamp(new), step]);
+            pos as u32
+        }
+        // PBM_SETSTEP: the old step.
+        0x0404 => {
+            set_progress_state(ctx, hwnd, [min, max, pos, wparam as i32]);
+            step as u32
+        }
+        // PBM_GETRANGE(low wanted?, PBRANGE*), PBM_GETPOS
+        0x0407 => {
+            if lparam != 0 {
+                let _ = memory.write_u32(lparam, min as u32);
+                let _ = memory.write_u32(lparam + 4, max as u32);
+            }
+            (if wparam != 0 { min } else { max }) as u32
+        }
+        0x0408 => pos as u32,
+        // PBM_SETBARCOLOR, PBM_SETBKCOLOR, PBM_SETMARQUEE, PBM_SETSTATE:
+        // accepted (the bar keeps the system's colours).
+        0x0409 | 0x2001 | 0x040A | 0x0410 => 0,
+        0x0411 => 1, // PBM_GETSTATE: PBST_NORMAL
+        WM_PAINT => {
+            let ps = user::scratch(ctx, 80);
+            let hdc = user::begin_paint(ctx, memory, hwnd, ps);
+            let window = ctx.shared.borrow().gui.window(hwnd).cloned();
+            if let Some(window) = window {
+                let (width, height) = client_size(&window);
+                let span = (max - min).max(1) as i64;
+                let filled = ((pos - min).max(0) as i64 * (width - 4).max(0) as i64 / span) as i32;
+                with_client(ctx, hwnd, |p| {
+                    let bar = Rect::new(0, 0, width, height);
+                    p.fill(bar, sys_color(15));
+                    p.sunken(bar);
+                    // Blocks, as Windows draws them.
+                    let block = ((height - 4) * 2 / 3).max(4);
+                    let mut x = 2;
+                    while x < 2 + filled {
+                        let right = (x + block).min(2 + filled);
+                        p.fill(Rect::new(x, 2, right, height - 2), sys_color(13));
+                        x += block + 2;
+                    }
+                });
+            }
+            user::end_paint(ctx, hwnd, hdc);
+            user::free_scratch(ctx, ps);
+            0
+        }
+        WM_ERASEBKGND => 1,
+        _ => user::def_window_proc(ctx, memory, hwnd, msg, wparam, lparam),
     }
 }
 
@@ -2341,9 +2498,15 @@ fn combo_proc<M: GuestMemory + ?Sized>(
         WM_ERASEBKGND => 1,
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             set_focus(ctx, memory, hwnd);
-            if window_style(ctx, hwnd) & 0x3 != 1 {
+            // A drop-down combo box with an edit field (CBS_DROPDOWN) drops
+            // its list from the button only: the field takes typing.
+            let width = ctx.shared.borrow().gui.window(hwnd).map(|w| client_size(w).0).unwrap_or(0);
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let on_field = window_style(ctx, hwnd) & 0x3 == 2 && x < width - 18;
+            if window_style(ctx, hwnd) & 0x3 != 1 && !on_field {
                 combo_dropdown(ctx, memory, hwnd);
             }
+            redraw(ctx, hwnd);
             0
         }
         WM_CHAR => {
@@ -4413,6 +4576,34 @@ mod tests {
         fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
             self.write_bytes(va, &value.to_le_bytes())
         }
+    }
+
+    #[test]
+    fn progress_bars_keep_range_and_position() {
+        let ctx = ApiContext::default();
+        let mut memory = Sparse::default();
+        let hwnd = 0x300;
+        ctx.shared.borrow_mut().gui.windows.push(crate::win32::GuestWindow {
+            hwnd,
+            class: "msctls_progress32".into(),
+            width: 200,
+            height: 16,
+            extra: vec![0; 16],
+            ..Default::default()
+        });
+        let mut send = |msg: u32, wparam: u32, lparam: u32| progress_proc(&ctx, &mut memory, hwnd, msg, wparam, lparam);
+        assert_eq!(send(0x0408, 0, 0), 0); // PBM_GETPOS: a new bar is at 0
+        assert_eq!(send(0x0406, 0, 1000), 100 << 16); // PBM_SETRANGE32: the old range 0..100, packed
+        assert_eq!(send(0x0402, 250, 0), 0); // PBM_SETPOS
+        assert_eq!(send(0x0403, 50, 0), 250); // PBM_DELTAPOS
+        assert_eq!(send(0x0408, 0, 0), 300);
+        send(0x0404, 400, 0); // PBM_SETSTEP
+        send(0x0405, 0, 0); // PBM_STEPIT
+        assert_eq!(send(0x0408, 0, 0), 700);
+        send(0x0402, 5000, 0); // beyond the range: clamped
+        assert_eq!(send(0x0408, 0, 0), 1000);
+        assert_eq!(send(0x0407, 0, 0), 1000); // PBM_GETRANGE: the maximum
+        assert_eq!(send(0x0407, 1, 0), 0); // and the minimum
     }
 
     #[test]

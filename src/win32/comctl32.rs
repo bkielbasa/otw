@@ -769,6 +769,8 @@ const NM_DBLCLK: u32 = -3i32 as u32;
 const NM_RETURN: u32 = -4i32 as u32;
 /// An item opened: double-clicked, or Enter pressed on it.
 const LVN_ITEMACTIVATE: u32 = -114i32 as u32;
+/// A key went down in the list (NMLVKEYDOWN: the virtual key).
+const LVN_KEYDOWN: u32 = -155i32 as u32;
 const LVN_GETDISPINFOA: u32 = -150i32 as u32;
 const LVN_GETDISPINFOW: u32 = -177i32 as u32;
 /// The list asks its parent for every item (LVM_SETITEMCOUNT says how many).
@@ -860,8 +862,7 @@ fn display_text<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd:
         Some(window) if window.parent != 0 => (window.parent, window.id),
         _ => return Vec::new(),
     };
-    let parent_proc = ctx.shared.borrow().gui.window(parent).map(|w| w.wndproc).unwrap_or(0);
-    let wide = unicode::is_unicode_proc(ctx, parent_proc);
+    let wide = crate::win32::controls::notifies_wide(ctx, parent);
     // NMLVDISPINFO: NMHDR, then an LVITEM; and a buffer for the text.
     const CAPACITY: u32 = 260;
     let x64 = memory.ptr_size() == 8;
@@ -939,6 +940,28 @@ fn list_notify<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: 
     {
         view.set(memory, index, value);
     }
+    user::send(ctx, memory, parent, WM_NOTIFY, id, block);
+    ctx.shared.borrow_mut().heap.free(block);
+}
+
+/// Send LVN_KEYDOWN (NMLVKEYDOWN: NMHDR, WORD wVKey, UINT flags).
+fn list_key_down<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, key: u32) {
+    let (parent, id) = match ctx.shared.borrow().gui.window(hwnd) {
+        Some(window) if window.parent != 0 => (window.parent, window.id),
+        _ => return,
+    };
+    let x64 = memory.ptr_size() == 8;
+    let header = crate::win32::x64::NMHDR.size(x64);
+    let block = ctx.shared.borrow_mut().heap.alloc(header + 8).unwrap_or(0);
+    if block == 0 {
+        return;
+    }
+    let _ = memory.write_bytes(block, &vec![0u8; (header + 8) as usize]);
+    let nmhdr = crate::win32::x64::View::new(memory, &crate::win32::x64::NMHDR, block);
+    for (field, value) in [hwnd, id, LVN_KEYDOWN].into_iter().enumerate() {
+        nmhdr.set(memory, field, value);
+    }
+    let _ = memory.write_bytes(block + header, &(key as u16).to_le_bytes());
     user::send(ctx, memory, parent, WM_NOTIFY, id, block);
     ctx.shared.borrow_mut().heap.free(block);
 }
@@ -1427,8 +1450,11 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             invalidate_control(ctx, hwnd);
             0
         }
-        // WM_KEYDOWN: arrows move, Space toggles the checkbox.
+        // WM_KEYDOWN: the parent hears of every key (LVN_KEYDOWN: 7-Zip
+        // goes up a folder on Backspace); arrows move, Space toggles the
+        // checkbox, Enter opens.
         0x0100 => {
+            list_key_down(ctx, memory, hwnd, wparam);
             let total = count();
             if total == 0 {
                 return 0;

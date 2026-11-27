@@ -1217,6 +1217,12 @@ impl SystemCalls for ApiContext {
             let wide: Vec<u64> = args.iter().map(|&a| u64::from(a)).collect();
             return nt::call(self, memory, text, &wide);
         }
+        if let Some(text) = name.as_str().filter(|text| IPC_FOR_32_BIT.contains(text)) {
+            let wide: Vec<u64> = args.iter().map(|&a| u64::from(a)).collect();
+            if let Some(outcome) = ipc::call(self, memory, text, &wide) {
+                return Some(outcome);
+            }
+        }
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
     }
 
@@ -1303,6 +1309,7 @@ pub const BUILTIN_PROCS: &[&str] = &[
     "OTW_TabProc",
     "OTW_ListViewProc",
     "OTW_ComboBoxExProc",
+    "OTW_ProgressProc",
     "OTW_TreeViewProc",
     "OTW_TooltipProc",
     "OTW_RebarProc",
@@ -1439,7 +1446,13 @@ pub fn api_set_host(dll: &str) -> Option<&'static str> {
 
 /// Functions of the NT layer (`nt`, written for 64-bit programs) that
 /// 32-bit programs call too: their arguments are all one slot wide.
-const NT_FOR_32_BIT: &[&str] = &["GetFileInformationByHandle", "CreateHardLinkW"];
+const NT_FOR_32_BIT: &[&str] = &["GetFileInformationByHandle", "CreateHardLinkW", "GlobalMemoryStatusEx"];
+
+/// Shared memory between processes (`ipc`: named sections in the paging
+/// file) for 32-bit programs too: 7-Zip's File Manager hands 7zG.exe the
+/// files to compress that way. `ipc` answers for its own sections and
+/// handles; the rest goes on as before.
+const IPC_FOR_32_BIT: &[&str] = &["CreateFileMappingW", "OpenFileMappingW", "MapViewOfFile", "UnmapViewOfFile", "CloseHandle"];
 
 pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
     if msvcrt::is_msvcrt(dll) {
@@ -1447,6 +1460,9 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
     }
     if let Some(text) = name.as_str().filter(|text| NT_FOR_32_BIT.contains(text)) {
         return nt::arg_count(text);
+    }
+    if name.as_str() == Some("OpenFileMappingW") {
+        return ipc::arg_count("OpenFileMappingW");
     }
     let dll = api_set_host(dll).unwrap_or(dll);
     if is_ucrt(dll) {
@@ -2958,6 +2974,7 @@ mod tests {
         let by_name = |name: &str| super::arg_count("KERNEL32.dll", &super::ImportName::ByName(name.into()));
         assert_eq!(by_name("GetFileInformationByHandle"), Some(2));
         assert_eq!(by_name("CreateHardLinkW"), Some(3));
+        assert_eq!(by_name("GlobalMemoryStatusEx"), Some(1));
     }
 
     #[test]

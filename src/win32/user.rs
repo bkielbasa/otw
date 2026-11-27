@@ -1222,6 +1222,7 @@ fn builtin_proc<M: GuestMemory + ?Sized>(
         "OTW_TabProc" => crate::win32::comctl32::tab_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ListViewProc" => crate::win32::comctl32::listview_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ComboBoxExProc" => crate::win32::controls::combo_ex_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_ProgressProc" => crate::win32::controls::progress_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_TreeViewProc" => crate::win32::treeview::treeview_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_RebarProc" => crate::win32::rebar::rebar_proc(ctx, memory, hwnd, msg, wparam, lparam),
         // Tooltips: tools are accepted and never shown.
@@ -1493,7 +1494,8 @@ fn system_logfont(weight: u32) -> Vec<u8> {
 
 /// The common controls COMCTL32 provides; a genuine COMCTL32 registers
 /// its own.
-pub const COMMON_CONTROL_CLASSES: [&str; 8] = [
+pub const COMMON_CONTROL_CLASSES: [&str; 9] = [
+    "msctls_progress32",
     "ComboBoxEx32",
     "ToolbarWindow32",
     "msctls_statusbar32",
@@ -1532,7 +1534,8 @@ pub fn ensure_builtin_classes(ctx: &ApiContext) {
         return;
     }
     let builtin = |name: &str| ctx.builtin_proc(name);
-    let classes: [(&str, &str, u32, u32); 20] = [
+    let classes: [(&str, &str, u32, u32); 21] = [
+        ("msctls_progress32", "OTW_ProgressProc", 0x08, 16),
         ("ComboBoxEx32", "OTW_ComboBoxExProc", 0x08, 6),
         ("SysTreeView32", "OTW_TreeViewProc", 0x08, 0),
         ("ReBarWindow32", "OTW_RebarProc", 0x08, 0),
