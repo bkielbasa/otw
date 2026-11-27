@@ -214,10 +214,11 @@ impl Desktop {
             self.background_stale = true;
         }
         // Programs draw into their windows at any time: with any running,
-        // the screen follows (at most 30 times a second; only changed rows
-        // reach it).
+        // the screen follows when one changed what it shows (at most 30
+        // times a second; only changed rows reach it), and once a second in
+        // any case.
         let now = apic::now_us();
-        if running && now - self.last_frame >= 33_000 {
+        if running && now - self.last_frame >= 33_000 && (programs_changed() || now - self.last_frame >= 1_000_000) {
             self.dirty = true;
         }
         if self.dirty {
@@ -468,6 +469,22 @@ fn each_program(mut f: impl FnMut(&SharedState, &str) -> bool) {
             break;
         }
     }
+}
+
+/// Whether a program changed what it shows since the last look (its
+/// `gui.dirty`, set by drawing in a window and by changes to windows;
+/// cleared here).
+fn programs_changed() -> bool {
+    let running = RUNNING.lock().unwrap();
+    let mut changed = false;
+    for r in &running.0 {
+        let _hold = otw_vm::kernel::lock::Hold::new(&r.lock);
+        match unsafe { &*r.shared }.try_borrow_mut() {
+            Ok(mut shared) => changed |= core::mem::replace(&mut shared.gui.dirty, false),
+            Err(_) => changed = true,
+        }
+    }
+    changed
 }
 
 /// Copy `background` into `frame` outside the rectangles (x0, y0, x1, y1)

@@ -794,12 +794,14 @@ pub fn ensure_surface(shared: &mut SharedState, top: u32) {
         Some(surface) => {
             if surface.width != w || surface.height != h {
                 surface.resize(w, h, sys_color(15));
+                shared.gui.dirty = true;
             }
         }
         None => {
             let mut surface = Surface::new(w, h, 24);
             surface.pixels.fill(sys_color(15));
             shared.gdi.surfaces.insert(top, surface);
+            shared.gui.dirty = true;
         }
     }
 }
@@ -1857,6 +1859,7 @@ fn destroy_window_record(ctx: &ApiContext, hwnd: u32) {
     shared.gui.windows.retain(|w| w.hwnd != hwnd);
     shared.gdi.surfaces.remove(&hwnd);
     shared.gui.timers.retain(|t| t.hwnd != hwnd);
+    shared.gui.dirty = true;
 }
 
 pub fn destroy_window<M: GuestMemory + ?Sized>(
@@ -6600,6 +6603,7 @@ fn scroll_window(ctx: &ApiContext, hwnd: u32, dx: i32, dy: i32, rect: Option<Rec
                     }
                 }
             }
+            shared.gui.dirty = true;
         }
     }
     // Invalidate the uncovered strips.
