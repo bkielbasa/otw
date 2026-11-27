@@ -808,7 +808,7 @@ impl Canvas<'_, '_> {
                 app_center::ui::app::IndexState::Loading(_)
             );
         let b = ButtonView {
-            label: if busy { "Updating…" } else { "Refresh" }.into(),
+            label: if busy { "Updating..." } else { "Refresh" }.into(),
             action: Action::RefreshIndex,
             style: ButtonStyle::Secondary,
             enabled: !busy,
@@ -1187,7 +1187,7 @@ impl Canvas<'_, '_> {
         if v.loading {
             let pv = ProgressView {
                 fraction: None,
-                label: "Loading details…".into(),
+                label: "Loading details...".into(),
             };
             y += self.progress_bar(x, y, w.min(360), &pv, false) + 22;
         }

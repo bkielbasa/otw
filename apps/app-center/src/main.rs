@@ -9,6 +9,12 @@ use app_center::{download, resolve, search, Error, Result};
 use std::io::Write;
 use std::time::Instant;
 
+/// Allocations from big blocks of the program's own (see Cargo.toml), not
+/// a system heap call each.
+#[cfg(windows)]
+#[global_allocator]
+static ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
 fn main() {
     let opts = match cli::parse(std::env::args().skip(1)) {
         Ok(o) => o,

@@ -7,6 +7,12 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+/// Allocations from big blocks of the program's own (see Cargo.toml), not
+/// a system heap call each.
+#[cfg(windows)]
+#[global_allocator]
+static ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
 #[cfg(windows)]
 mod gdi;
 #[cfg(windows)]

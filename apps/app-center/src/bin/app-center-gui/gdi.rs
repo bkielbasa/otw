@@ -250,7 +250,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// One line in `r`, vertically centred, cut with "…" if too wide.
+    /// One line in `r`, vertically centred, cut with "..." if too wide.
     pub fn text_in(&self, r: Rect, text: &str, f: Font, color: u32, align: Align) {
         let fitted = app_center::ui::format::ellipsize(text, r.width(), |s| self.text_width(s, f));
         let w = self.text_width(&fitted, f);

@@ -42,3 +42,11 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+# On Windows the programs allocate from big blocks of their own (dlmalloc
+# over VirtualAlloc) instead of the system heap: a heap call for every
+# small allocation is slow where the system is OTW (each is a system
+# call), and the package index makes hundreds of thousands of them.
+[target.'cfg(windows)'.dependencies.dlmalloc]
+version = "0.2"
+features = ["global"]

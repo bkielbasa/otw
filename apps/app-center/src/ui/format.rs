@@ -56,12 +56,12 @@ pub fn eta_label(done: u64, total: Option<u64>, elapsed_ms: u64) -> Option<Strin
 /// What the index loader is doing, for the status line.
 pub fn index_progress_label(p: &IndexProgress) -> String {
     match p {
-        IndexProgress::ReadingCache => "Reading the package index…".into(),
+        IndexProgress::ReadingCache => "Reading the package index...".into(),
         IndexProgress::Downloading { done, total } => format!(
             "Downloading the package index: {}",
             progress_label(*done, *total)
         ),
-        IndexProgress::Unpacking => "Unpacking the package index…".into(),
+        IndexProgress::Unpacking => "Unpacking the package index...".into(),
     }
 }
 
@@ -149,17 +149,17 @@ pub fn versions_summary(versions: &[String], shown: usize) -> String {
     )
 }
 
-/// Cuts `text` so that it fits `max_width`, ending it with "…".
+/// Cuts `text` so that it fits `max_width`, ending it with "...".
 pub fn ellipsize(text: &str, max_width: i32, measure: impl Fn(&str) -> i32) -> String {
     if measure(text) <= max_width {
         return text.to_string();
     }
     let chars: Vec<char> = text.chars().collect();
-    // Longest prefix p such that prefix + "…" fits: binary search.
+    // Longest prefix p such that prefix + "..." fits: binary search.
     let (mut lo, mut hi) = (0usize, chars.len());
     while lo < hi {
         let mid = (lo + hi + 1) / 2;
-        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        let candidate: String = chars[..mid].iter().collect::<String>() + "...";
         if measure(&candidate) <= max_width {
             lo = mid;
         } else {
@@ -167,7 +167,7 @@ pub fn ellipsize(text: &str, max_width: i32, measure: impl Fn(&str) -> i32) -> S
         }
     }
     let prefix: String = chars[..lo].iter().collect();
-    format!("{}…", prefix.trim_end())
+    format!("{}...", prefix.trim_end())
 }
 
 /// Breaks `text` into lines no wider than `max_width`, at spaces where
@@ -237,7 +237,7 @@ pub fn wrap(
     }
     if truncated {
         if let Some(last) = lines.last_mut() {
-            *last = ellipsize(&format!("{last} …"), max_width, &measure);
+            *last = ellipsize(&format!("{last} ..."), max_width, &measure);
         }
     }
     lines
@@ -336,8 +336,8 @@ mod tests {
     #[test]
     fn ellipsizing() {
         assert_eq!(ellipsize("short", 100, w), "short");
-        assert_eq!(ellipsize("a long name here", 60, w), "a lon…");
-        assert_eq!(ellipsize("a b", 10, w), "…");
+        assert_eq!(ellipsize("a long name here", 60, w), "a l...");
+        assert_eq!(ellipsize("a b", 10, w), "...");
         assert!(w(&ellipsize("Mozilla Firefox Developer Edition", 155, w)) <= 155);
     }
 
@@ -361,7 +361,7 @@ mod tests {
         let lines = wrap("aa bb cc dd ee ff gg", 50, 2, w);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "aa bb");
-        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(lines[1].ends_with("..."), "{lines:?}");
         assert!(lines.iter().all(|l| w(l) <= 50), "{lines:?}");
     }
 }

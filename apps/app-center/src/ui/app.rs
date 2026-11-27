@@ -639,7 +639,7 @@ impl App {
                     self.refreshing = true;
                     self.status = Some(StatusLine {
                         kind: Kind::Info,
-                        text: "Updating the package index…".into(),
+                        text: "Updating the package index...".into(),
                     });
                 } else {
                     self.index_state = IndexState::Loading(None);
@@ -700,7 +700,7 @@ impl App {
         if self.index.is_none() {
             return match self.index_state {
                 IndexState::Failed(_) => "No package index".into(),
-                _ => "Loading…".into(),
+                _ => "Loading...".into(),
             };
         }
         match &self.searched {
@@ -725,7 +725,7 @@ impl App {
                 "Getting the catalogue ready".into(),
                 p.as_ref()
                     .map(format::index_progress_label)
-                    .unwrap_or_else(|| "Starting…".into()),
+                    .unwrap_or_else(|| "Starting...".into()),
                 Some(self.index_progress()),
             ),
             IndexState::Failed(m) => (m.title.clone(), m.detail.clone(), None),
@@ -787,7 +787,7 @@ impl App {
                 .unwrap_or_default();
             return StatusLine {
                 kind: Kind::Info,
-                text: format!("Downloading {}…{pct}", d.name),
+                text: format!("Downloading {}...{pct}", d.name),
             };
         }
         if let Some(s) = &self.status {
@@ -799,7 +799,7 @@ impl App {
                 text: p
                     .as_ref()
                     .map(format::index_progress_label)
-                    .unwrap_or_else(|| "Loading the package index…".into()),
+                    .unwrap_or_else(|| "Loading the package index...".into()),
             },
             IndexState::Failed(m) => StatusLine {
                 kind: Kind::Error,
@@ -913,7 +913,7 @@ impl App {
         if let Some(a) = ours {
             view.buttons.push(button(
                 if a.cancelling {
-                    "Cancelling…"
+                    "Cancelling..."
                 } else {
                     "Cancel"
                 },
@@ -923,7 +923,7 @@ impl App {
             ));
             let elapsed = self.now_ms.saturating_sub(a.started_ms);
             let mut label = if a.done == 0 && a.total.is_none() {
-                "Connecting…".to_string()
+                "Connecting...".to_string()
             } else {
                 format::progress_label(a.done, a.total)
             };
@@ -1182,7 +1182,7 @@ mod tests {
     fn loading_shows_progress_everywhere() {
         let (mut app, _) = App::new(PathBuf::from("d"), Preferences::default());
         assert!(app.busy());
-        assert_eq!(app.list_caption(), "Loading…");
+        assert_eq!(app.list_caption(), "Loading...");
         app.on_event(Event::IndexProgress(IndexProgress::Downloading {
             done: 1 << 20,
             total: Some(4 << 20),
@@ -1394,7 +1394,7 @@ mod tests {
 
         let v = package_view(&app);
         assert_eq!(labels(&v), vec!["Cancel"]);
-        assert_eq!(v.progress.unwrap().label, "Connecting…");
+        assert_eq!(v.progress.unwrap().label, "Connecting...");
 
         app.set_time(3_000);
         app.on_event(Event::DownloadProgress {
@@ -1411,7 +1411,7 @@ mod tests {
         );
         assert!(p.label.contains("512.0 KiB/s"), "{}", p.label);
         assert!(p.label.contains("s left"), "{}", p.label);
-        assert_eq!(app.status_line().text, "Downloading 7-Zip… 50%");
+        assert_eq!(app.status_line().text, "Downloading 7-Zip... 50%");
 
         let path = PathBuf::from("C:\\My Documents\\Downloads").join("7z2606-x64.exe");
         app.on_event(Event::DownloadFinished {
@@ -1470,7 +1470,7 @@ mod tests {
         assert_eq!(app.action(&Action::Cancel), vec![Effect::CancelDownload]);
         assert!(app.action(&Action::Cancel).is_empty());
         let v = package_view(&app);
-        assert_eq!(labels(&v), vec!["Cancelling…"]);
+        assert_eq!(labels(&v), vec!["Cancelling..."]);
         assert!(!v.buttons[0].enabled);
         app.on_event(Event::DownloadFinished {
             id: "7zip.7zip".into(),
