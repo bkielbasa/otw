@@ -857,6 +857,28 @@ fn rundll32<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, applicati
     Some(0)
 }
 
+/// The longest a waiting thread sleeps before looking at what it waits for
+/// again, when everything that ends its wait wakes it.
+const PARK_LIMIT_MS: u64 = 1000;
+
+/// Whether a wait is on a handle this process does not keep itself.
+fn waits_on_unknown(ctx: &ApiContext, wait: &Wait) -> bool {
+    let shared = ctx.shared.borrow();
+    wait.handles.iter().any(|h| !shared.sync.objects.contains_key(h))
+}
+
+/// The first due time (in ticks) of the waitable timers a wait is on.
+fn next_timer(ctx: &ApiContext, wait: &Wait) -> Option<u64> {
+    let shared = ctx.shared.borrow();
+    wait.handles
+        .iter()
+        .filter_map(|h| match shared.sync.objects.get(h) {
+            Some(Object::Timer { due, .. }) => *due,
+            _ => None,
+        })
+        .min()
+}
+
 /// How a wait ended.
 enum Outcome {
     /// The object at this index (or a message, one past the last).
@@ -1033,9 +1055,19 @@ fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wai
         if wait.messages {
             memory.pump(true);
         } else {
-            // With threads on other CPUs, the changes that end waits are
-            // announced (kobj::notify): wait longer between looks.
-            let cap = if memory.others_running() { 50 } else { 10 };
+            // With threads on other CPUs, the changes that end waits wake
+            // the thread (by key, or kobj::notify): it looks again only
+            // after a long while, in case. A waitable timer ends the wait
+            // at its due time; a handle the process does not keep itself
+            // (shared with other processes) is looked at often.
+            let cap = if !memory.others_running() {
+                10
+            } else if waits_on_unknown(ctx, &wait) {
+                50
+            } else {
+                PARK_LIMIT_MS
+            };
+            let cap = next_timer(ctx, &wait).map_or(cap, |due| due.saturating_sub(now).min(cap));
             let remaining = wait.deadline.map(|d| d.saturating_sub(now)).unwrap_or(cap).min(cap);
             // Until another process changes something, or a while.
             let _ = generation;
