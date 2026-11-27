@@ -1,12 +1,14 @@
-//! Minimal read-only FAT32 reader.
-//!
-//! The explorer backend needs to answer three questions about a raw disk
-//! image: what directories exist, what is in a directory, and how to read a
-//! file's cluster chain. This module implements only that surface. It does not
-//! write, mount through the host kernel, or emulate the Win32 file APIs.
+//! FAT32: directories, files and their cluster chains, read and (on a
+//! writable volume, `write`) written: files made, replaced, removed and
+//! renamed, directories made, with long names.
 //!
 //! It needs only `core` and `alloc`: the bare-metal kernel (`baremetal/`)
-//! builds it too, over a disk instead of an image in memory (`Volume`).
+//! builds it too, over a disk instead of an image in memory (`Volume`); its
+//! drive C: keeps what programs write there.
+
+mod write;
+
+pub use write::MemoryVolume;
 
 #[allow(unused_imports)]
 use crate::platform as std;
@@ -28,6 +30,18 @@ pub trait Volume: Send + Sync {
     fn size(&self) -> u64;
     /// Fill `buffer` from `offset`.
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<(), Fat32Error>;
+    /// Whether `write_at` can change it.
+    fn writable(&self) -> bool {
+        false
+    }
+    /// Put `data` at `offset`.
+    fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<(), Fat32Error> {
+        Err(Fat32Error::ReadOnly)
+    }
+    /// Make what was written stay (a disk's write cache written out).
+    fn flush(&self) -> Result<(), Fat32Error> {
+        Ok(())
+    }
 }
 
 impl Volume for Vec<u8> {
@@ -61,6 +75,16 @@ pub enum Fat32Error {
     NotADirectory(String),
     IsADirectory(String),
     InvalidFileSize(u32),
+    ReadOnly,
+    /// No free clusters left.
+    Full,
+    AlreadyExists(String),
+    DirectoryNotEmpty(String),
+    InvalidName(String),
+    /// Larger than a FAT32 file can be (4 GiB - 1).
+    TooLarge(u64),
+    /// The disk under the volume failed.
+    Io(&'static str),
 }
 
 impl core::fmt::Display for Fat32Error {
@@ -81,6 +105,13 @@ impl core::fmt::Display for Fat32Error {
             Self::NotADirectory(path) => write!(f, "FAT32 path is not a directory: {path}"),
             Self::IsADirectory(path) => write!(f, "FAT32 path is a directory: {path}"),
             Self::InvalidFileSize(size) => write!(f, "FAT32 file size {size} exceeds the image"),
+            Self::ReadOnly => write!(f, "the FAT32 volume is read-only"),
+            Self::Full => write!(f, "the FAT32 volume is full"),
+            Self::AlreadyExists(path) => write!(f, "FAT32 path exists: {path}"),
+            Self::DirectoryNotEmpty(path) => write!(f, "FAT32 directory is not empty: {path}"),
+            Self::InvalidName(name) => write!(f, "not a valid FAT32 name: {name:?}"),
+            Self::TooLarge(size) => write!(f, "{size} bytes is too large for a FAT32 file"),
+            Self::Io(message) => write!(f, "disk error: {message}"),
         }
     }
 }
@@ -95,6 +126,8 @@ pub struct Fat32Entry {
     pub attributes: u8,
     pub cluster: u32,
     pub size: u32,
+    /// When it was last written (Unix time; 0: not said).
+    pub modified: u64,
 }
 
 impl Fat32Entry {
@@ -124,6 +157,12 @@ pub struct Fat32FileSystem {
     data_start_sector: u32,
     cluster_count: u32,
     volume_label: String,
+    /// The FSInfo sector (0: none).
+    fsinfo_sector: u32,
+    /// What writers share: one writes at a time.
+    writer: Arc<std::sync::Mutex<write::WriteState>>,
+    /// The time to put on what is written (Unix seconds).
+    clock: fn() -> u64,
 }
 
 impl core::fmt::Debug for Fat32FileSystem {
@@ -173,6 +212,7 @@ impl Fat32FileSystem {
         let total_sectors = le_u32(&image, 32)?;
         let fat_sectors = le_u32(&image, 36)?;
         let root_cluster = le_u32(&image, 44)?;
+        let fsinfo_sector = le_u16(&image, 48)? as u32;
 
         if reserved_sectors == 0 {
             return Err(Fat32Error::InvalidBootSector(
@@ -261,7 +301,20 @@ impl Fat32FileSystem {
             data_start_sector,
             cluster_count,
             volume_label,
+            fsinfo_sector: if fsinfo_sector < reserved_sectors { fsinfo_sector } else { 0 },
+            writer: Arc::new(std::sync::Mutex::new(write::WriteState::default())),
+            clock: || 0,
         })
+    }
+
+    /// Where the time put on what is written comes from (Unix seconds).
+    pub fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = clock;
+    }
+
+    /// Whether files can be written.
+    pub fn writable(&self) -> bool {
+        self.volume.writable()
     }
 
     pub fn volume_label(&self) -> &str {
@@ -322,7 +375,8 @@ impl Fat32FileSystem {
 
     fn next_cluster(&self, cluster: u32) -> Result<Option<u32>, Fat32Error> {
         let next = self.fat_entry(cluster)?;
-        Ok((next >= 2 && next < END_OF_CHAIN).then_some(next))
+        // 0x0FFFFFF8 and up end a chain (0x0FFFFFF7: a bad cluster).
+        Ok((2..0x0FFF_FFF7).contains(&next).then_some(next))
     }
 
     fn cluster_chain(&self, start: u32) -> Result<Vec<u32>, Fat32Error> {
@@ -374,6 +428,9 @@ impl Fat32FileSystem {
             return Err(Fat32Error::InvalidFileSize(entry.size));
         }
         let mut contents = Vec::with_capacity(size);
+        if size == 0 {
+            return Ok(contents);
+        }
         for cluster in self.cluster_chain(entry.cluster)? {
             let cluster_data = self.read_cluster(cluster)?;
             let remaining = size - contents.len();
@@ -411,6 +468,7 @@ impl Fat32FileSystem {
             attributes: 0x10,
             cluster,
             size: 0,
+            modified: 0,
         };
         for (index, component) in components.iter().enumerate() {
             let entries = self.read_directory(cluster)?;
@@ -431,7 +489,15 @@ impl Fat32FileSystem {
     }
 
     fn read_directory(&self, cluster: u32) -> Result<Vec<Fat32Entry>, Fat32Error> {
+        Ok(self.read_directory_at(cluster)?.into_iter().map(|(entry, _)| entry).collect())
+    }
+
+    /// A directory's entries, each with where it is: the index of its
+    /// short entry among the directory's 32-byte slots, and how many long
+    /// name slots come before it.
+    fn read_directory_at(&self, cluster: u32) -> Result<Vec<(Fat32Entry, write::Place)>, Fat32Error> {
         let mut entries = Vec::new();
+        let mut slot = 0u32;
         let mut lfn: Vec<Option<LfnSlot>> = vec![None; 20];
         let mut lfn_len = 0usize;
 
@@ -441,6 +507,8 @@ impl Fat32FileSystem {
                 if offset + DIR_ENTRY_SIZE > data.len() {
                     break;
                 }
+                let index = slot;
+                slot += 1;
                 let raw = &data[offset..offset + DIR_ENTRY_SIZE];
                 match raw[0] {
                     0x00 => return Ok(entries),
@@ -484,25 +552,30 @@ impl Fat32FileSystem {
                 }
 
                 let short_name = decode_short_name(raw);
-                let name = if lfn_len == 0 {
-                    short_name.clone()
-                } else {
-                    build_long_name(&lfn, lfn_len, &raw[0..11])
-                        .unwrap_or_else(|| short_name.clone())
-                };
+                let long = (lfn_len != 0).then(|| build_long_name(&lfn, lfn_len, &raw[0..11])).flatten();
+                let lfn_slots = if long.is_some() { lfn_len as u32 } else { 0 };
+                let name = long.unwrap_or_else(|| short_name.clone());
                 lfn.clear();
                 lfn.resize(20, None);
                 lfn_len = 0;
 
                 let cluster_low = u16::from_le_bytes([raw[26], raw[27]]) as u32;
                 let cluster_high = u16::from_le_bytes([raw[20], raw[21]]) as u32;
-                entries.push(Fat32Entry {
-                    name,
-                    short_name,
-                    attributes: raw[11],
-                    cluster: cluster_low | (cluster_high << 16),
-                    size: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
-                });
+                let modified = write::unix_time(
+                    u16::from_le_bytes([raw[24], raw[25]]),
+                    u16::from_le_bytes([raw[22], raw[23]]),
+                );
+                entries.push((
+                    Fat32Entry {
+                        name,
+                        short_name,
+                        attributes: raw[11],
+                        cluster: cluster_low | (cluster_high << 16),
+                        size: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
+                        modified,
+                    },
+                    write::Place { slot: index, lfn_slots },
+                ));
             }
         }
         Ok(entries)
@@ -673,7 +746,7 @@ mod tests {
         }
     }
 
-    fn test_image() -> Vec<u8> {
+    pub(super) fn test_image() -> Vec<u8> {
         let mut image = vec![0u8; 64 * 512];
         image[0..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
         image[3..11].copy_from_slice(b"OTWTEST ");
@@ -812,6 +885,15 @@ mod tests {
             Fat32FileSystem::new(image),
             Err(Fat32Error::InvalidBootSector(_))
         ));
+    }
+
+    #[test]
+    fn any_end_of_chain_mark_ends_a_chain() {
+        // mkfs.fat ends the root's chain with 0x0FFFFFF8.
+        let mut image = test_image();
+        set_fat(&mut image, 2, 0x0fff_fff8);
+        let fs = Fat32FileSystem::new(image).unwrap();
+        assert_eq!(fs.list("/").unwrap().len(), 4);
     }
 
     #[test]
