@@ -76,10 +76,12 @@ fn listed(name: &str) -> Option<(bool, bool)> {
 fn own_arg_count(name: &str) -> Option<usize> {
     Some(match name {
         "__p__wcmdln" | "__p___initenv" | "__p___winitenv" | "_crt_debugger_hook" | "__lconv_init"
-        | "??1type_info@@UAE@XZ" => 0,
+        | "??1type_info@@UAE@XZ" | "_endthread" => 0,
         "__set_app_type" | "_amsg_exit" | "_lock" | "_unlock" | "atexit" | "_wcsupr" | "_wtol" => 1,
         "wcsstr" | "wcschr" | "wcsrchr" | "wcscat" | "wcsspn" | "wcscspn" => 2,
-        "mbstowcs" | "_itow" => 3,
+        "mbstowcs" | "_itow" | "_beginthread" => 3,
+        "_endthreadex" => 1,
+        "_beginthreadex" => 6,
         "__wgetmainargs" => 5,
         "vswprintf" => 3,
         "_vsnwprintf" => 4,
@@ -153,6 +155,30 @@ fn own(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, args: &[u32])
             let _ = memory.write_u32(args[1], globals.argv);
             let _ = memory.write_u32(args[2], globals.environment_block);
             ok(0)
+        }
+        // Threads: the system's (the older C library has none).
+        "_beginthreadex" | "_endthreadex" => {
+            let wide: Vec<u64> = args.iter().map(|&a| u64::from(a)).collect();
+            let outcome = ucrt::call(ctx, memory, name, &wide)?;
+            Some(ApiOutcome { arg_count: 0, ..outcome })
+        }
+        // _beginthread(start, stack size, argument): the handle closes
+        // itself when the thread ends on Windows; here it stays.
+        "_beginthread" => {
+            let handle = crate::win32::dispatch_with_memory(
+                ctx,
+                memory,
+                "KERNEL32.dll",
+                &ImportName::ByName("CreateThread".into()),
+                &[0, args[1], args[0], args[2], 0, 0],
+                0,
+            )
+            .map_or(0, |o| o.value);
+            ok(if handle == 0 { u32::MAX } else { handle })
+        }
+        "_endthread" => {
+            let outcome = ucrt::call(ctx, memory, "_endthreadex", &[0])?;
+            Some(ApiOutcome { arg_count: 0, ..outcome })
         }
         "vswprintf" | "_vsnwprintf" => {
             let (wide, counted) = listed(name)?;
@@ -385,6 +411,7 @@ mod tests {
         for name in [
             "??1type_info@@UAE@XZ", "_beginthreadex", "__CxxFrameHandler", "_CxxThrowException", "__dllonexit",
             "_onexit", "_purecall", "rand", "srand", "strcmp", "strlen", "?terminate@@YAXXZ", "wcscmp", "wcslen",
+            "_endthreadex", "_beginthread", "_endthread",
             "wcsstr", "wcschr", "wcsrchr", "wcsncpy", "wcscpy", "wcscat", "_wcsicmp", "_wcsnicmp", "towupper",
         ] {
             assert!(arg_count(name).is_some(), "{name}");

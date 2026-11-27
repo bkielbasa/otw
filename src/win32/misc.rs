@@ -57,6 +57,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "IsDBCSLeadByteEx" | "TerminateThread" | "UnhookWindowsHook" | "WaitForInputIdle" => 2,
         "OpenEventA" | "OpenEventW" | "OpenProcess" | "CharNextExA" | "CoGetInterfaceAndReleaseStream" => 3,
         "FormatMessageA" => 7,
+        "CharPrevExA" => 4,
         "WNetGetConnectionA" | "WNetGetConnectionW" | "QueryDosDeviceA" | "OpenProcessToken"
         | "LookupPrivilegeValueA" | "ModifyWorldTransform" => 3,
         "EqualSid" | "SetGraphicsMode" | "GetLogicalDriveStringsA" | "RegUnLoadKeyA" | "ExcludeUpdateRgn"
@@ -545,6 +546,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             let byte = memory.read_bytes(args[1], 1).unwrap_or_default();
             if byte.first().copied().unwrap_or(0) == 0 { args[1] } else { args[1] + 1 }
         }
+        // CharPrevExA(code page, start, current, flags): single-byte text.
+        "CharPrevExA" => if args[2] > args[1] { args[2] - 1 } else { args[1] },
         "UnhookWindowsHook" => 1,
         // An enhanced 101/102-key keyboard with 12 function keys.
         "GetKeyboardType" => match args[0] {
@@ -1043,6 +1046,27 @@ mod tests {
 
     fn id(text: &str) -> Vec<u8> {
         crate::win32::shell::parse_guid(text).unwrap().to_vec()
+    }
+
+    struct NoMemory;
+    impl GuestMemory for NoMemory {
+        fn read_bytes(&mut self, _va: u32, _len: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn write_bytes(&mut self, _va: u32, _bytes: &[u8]) -> Option<()> {
+            None
+        }
+        fn write_u32(&mut self, _va: u32, _value: u32) -> Option<()> {
+            None
+        }
+    }
+
+    #[test]
+    fn char_prev_ex_steps_back_one_byte() {
+        let ctx = ApiContext::default();
+        let prev = |start: u32, current: u32| dispatch(&ctx, &mut NoMemory, "CharPrevExA", &[0, start, current, 0]).unwrap().value;
+        assert_eq!(prev(0x1000, 0x1005), 0x1004);
+        assert_eq!(prev(0x1000, 0x1000), 0x1000);
     }
 
     #[test]

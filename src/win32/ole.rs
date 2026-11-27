@@ -172,23 +172,49 @@ fn ole32_args(name: &str) -> Option<usize> {
     })
 }
 
+/// A BSTR of `bytes` bytes, copied from `source` unless it is NULL: the
+/// length before it, two zero bytes after.
+fn alloc_bstr<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, source: u32, bytes: u32) -> u32 {
+    let block = ctx.shared.borrow_mut().heap.alloc(bytes.saturating_add(6)).unwrap_or(0);
+    if block == 0 {
+        return 0;
+    }
+    let _ = memory.write_u32(block, bytes);
+    let data = if source != 0 { memory.read_bytes(source, bytes as usize).unwrap_or_default() } else { vec![0; bytes as usize] };
+    let _ = memory.write_bytes(block + 4, &data);
+    let _ = memory.write_bytes(block + 4 + bytes, &[0, 0]);
+    block + 4
+}
+
+/// The length in characters of a NUL-terminated UTF-16 string.
+fn wide_length<M: GuestMemory + ?Sized>(memory: &mut M, va: u32) -> usize {
+    if va == 0 {
+        return 0;
+    }
+    (0..1 << 20).take_while(|i| memory.read_bytes(va + 2 * i, 2).is_some_and(|b| b != [0, 0])).count()
+}
+
 /// The ordinals of OLEAUT32's string functions, for programs that import
 /// them by name (64-bit ones do).
 fn oleaut32_ordinal(name: &str) -> Option<u16> {
     Some(match name {
         "SysAllocString" => 2,
+        "SysReAllocString" => 3,
         "SysAllocStringLen" => 4,
+        "SysReAllocStringLen" => 5,
         "SysFreeString" => 6,
         "SysStringLen" => 7,
+        "SysStringByteLen" => 149,
+        "SysAllocStringByteLen" => 150,
         _ => return None,
     })
 }
 
 fn oleaut32_args(ordinal: u16) -> Option<usize> {
     Some(match ordinal {
-        2 | 6 | 7 | 8 | 9 | 16 | 17 | 18 | 21 | 22 | 24 | 37 | 38 | 39 | 149 | 150 => 1,
-        4 | 10 | 11 | 23 | 27 | 36 | 40 => 2,
-        15 | 19 | 20 | 25 | 26 | 31 | 35 => 3,
+        2 | 6 | 7 | 8 | 9 | 16 | 17 | 18 | 21 | 22 | 24 | 37 | 38 | 39 | 149 => 1,
+        3 | 4 | 10 | 11 | 23 | 27 | 36 | 40 | 150 => 2,
+        5 | 15 | 19 | 20 | 25 | 26 | 31 | 35 => 3,
         12 | 29 | 32 | 33 => 4,
         28 => 5,
         30 => 8,
@@ -383,6 +409,25 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             } else {
                 memory.read_u32(args[0] - 4).unwrap_or(0) / 2
             }),
+            // SysStringByteLen
+            149 => ok(if args[0] == 0 { 0 } else { memory.read_u32(args[0] - 4).unwrap_or(0) }),
+            // SysAllocStringByteLen(bytes or NULL, length in bytes)
+            150 => ok(alloc_bstr(ctx, memory, args[0], args[1])),
+            // SysReAllocString(&bstr, text), SysReAllocStringLen(&bstr,
+            // text, length): a new string in place of the old.
+            3 | 5 => {
+                let length = if *ordinal == 5 { args[2] as usize } else { wide_length(memory, args[1]) };
+                let new = alloc_bstr(ctx, memory, args[1], length as u32 * 2);
+                if new == 0 {
+                    return ok(0);
+                }
+                let old = memory.read_u32(args[0]).unwrap_or(0);
+                if old != 0 {
+                    ctx.shared.borrow_mut().heap.free(old - 4);
+                }
+                let _ = memory.write_u32(args[0], new);
+                ok(1)
+            }
             8 => {
                 let _ = memory.write_bytes(args[0], &[0u8; 16]);
                 ok(0)
@@ -854,5 +899,39 @@ mod tests {
         assert_eq!(by_name("SysStringLen"), Some(1));
         assert_eq!(by_name("VariantInit"), None);
         assert_eq!(arg_count("OLE32.dll", &ImportName::ByName("SysAllocString".into())), None);
+    }
+
+    /// Memory anywhere, made as it is written.
+    #[derive(Default)]
+    struct Sparse(std::collections::BTreeMap<u32, u8>);
+    impl GuestMemory for Sparse {
+        fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+            Some((0..len as u32).map(|i| self.0.get(&(va + i)).copied().unwrap_or(0)).collect())
+        }
+        fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+            for (i, &b) in bytes.iter().enumerate() {
+                self.0.insert(va + i as u32, b);
+            }
+            Some(())
+        }
+        fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+            self.write_bytes(va, &value.to_le_bytes())
+        }
+    }
+
+    #[test]
+    fn byte_length_strings() {
+        assert_eq!(oleaut32_args(150), Some(2));
+        assert_eq!(oleaut32_args(5), Some(3));
+        let ctx = ApiContext::default();
+        let mut m = Sparse::default();
+        let _ = m.write_bytes(0x10, &[7, 0x7A, 1, 2]);
+        let bstr = alloc_bstr(&ctx, &mut m, 0x10, 4);
+        assert_ne!(bstr, 0);
+        assert_eq!(m.read_u32(bstr - 4), Some(4));
+        assert_eq!(m.read_bytes(bstr, 6), Some(vec![7, 0x7A, 1, 2, 0, 0]));
+        let _ = m.write_bytes(0x80, &[b'a', 0, b'b', 0, 0, 0]);
+        assert_eq!(wide_length(&mut m, 0x80), 2);
+        assert_eq!(wide_length(&mut m, 0), 0);
     }
 }

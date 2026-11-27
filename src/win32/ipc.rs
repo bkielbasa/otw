@@ -624,7 +624,8 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
         // ── Sections ──
         "CreateFileMappingW" => {
             // (file, attributes, protect, size high, size low, name)
-            if p(0) != u32::MAX || memory.ptr_size() != 8 {
+            // Sections in the paging file (a file's go to `xp`).
+            if p(0) != u32::MAX {
                 return None;
             }
             let size = (arg(3) << 32) | arg(4) & 0xFFFF_FFFF;
