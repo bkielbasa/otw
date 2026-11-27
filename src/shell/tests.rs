@@ -236,6 +236,24 @@ fn search_finds_programs_anywhere_on_the_drive_once() {
 }
 
 #[test]
+fn only_the_front_window_in_use_is_marked_on_the_taskbar() {
+    let mut f = fixture("tasks");
+    f.shell.focus_program();
+    let task = |label: &str| Task {
+        label: label.into(),
+        active: true,
+        program: String::new(),
+    };
+    let tasks = [task("Back"), task("Front")];
+    let mut surface = Surface::new(1024, 700, 24);
+    f.shell.paint(&mut surface, Layer::Top, &tasks);
+    let rects = f.shell.task_rects(2);
+    let mark = |r: Rect| surface.get(r.left + r.width() / 2, r.bottom - 1);
+    assert_ne!(mark(rects[0]), Some(theme::ACCENT));
+    assert_eq!(mark(rects[1]), Some(theme::ACCENT));
+}
+
+#[test]
 fn the_menu_button_and_clock_share_the_taskbar() {
     let f = fixture("taskbar");
     let start = f.shell.start_rect();

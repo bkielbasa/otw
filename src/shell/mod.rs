@@ -607,6 +607,12 @@ impl Shell {
         }
     }
 
+    /// Whether the desktop or the folder window (rather than a program) is
+    /// in use.
+    pub fn has_focus(&self) -> bool {
+        self.focus != Focus::Program
+    }
+
     pub fn foreground_explorer(&self) -> bool {
         self.focus == Focus::Explorer && self.explorer_visible()
     }
@@ -2983,7 +2989,7 @@ impl Shell {
             };
             // The default button is the accent; the others are quiet.
             let (fill, text) = if index == 0 {
-                (theme::ACCENT, 0xFFFFFF)
+                (theme::ACCENT_STRONG, 0xFFFFFF)
             } else {
                 (theme::RAISED, theme::TEXT)
             };

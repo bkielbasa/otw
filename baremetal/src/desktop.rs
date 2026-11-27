@@ -73,6 +73,8 @@ pub struct Desktop {
     height: i32,
     /// Programs were running at the last step.
     had_programs: bool,
+    /// The shell (desktop or folder window) was in use at the last step.
+    shell_focused: bool,
     last_frame: u64,
 }
 
@@ -108,6 +110,7 @@ pub fn run(system: &System) -> ! {
         width: width as i32,
         height: height as i32,
         had_programs: false,
+        shell_focused: true,
         last_frame: 0,
     }));
     DESKTOP.store(desktop, Ordering::SeqCst);
@@ -214,6 +217,15 @@ impl Desktop {
             self.dirty = true;
         }
         self.had_programs = running;
+        // When the shell takes the keyboard (its folder window or the
+        // desktop), the programs' windows are no longer the ones in use:
+        // their frames show it.
+        let shell_focused = self.shell.has_focus();
+        if shell_focused && !self.shell_focused && running {
+            deactivate_programs();
+            self.dirty = true;
+        }
+        self.shell_focused = shell_focused;
         // What the shell changed (rather than the programs) repaints the
         // background.
         if self.dirty && !dirty_before {
@@ -469,6 +481,19 @@ impl Desktop {
                     None => false,
                 }
             }
+        }
+    }
+}
+
+/// Make every program's active window inactive (each program's own thread
+/// sends the messages).
+fn deactivate_programs() {
+    let running = RUNNING.lock().unwrap();
+    for r in &running.0 {
+        let _hold = otw_vm::kernel::lock::Hold::new(&r.lock);
+        let mut shared = unsafe { &*r.shared }.borrow_mut();
+        if shared.gui.active_hwnd != 0 {
+            shared.gui.pending_deactivate = true;
         }
     }
 }

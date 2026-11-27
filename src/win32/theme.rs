@@ -20,6 +20,8 @@ pub const TASKBAR: Rgb = 0x0B0B0D;
 pub const TASKBAR_ACTIVE: Rgb = 0x2A2A30;
 /// The accent: the active window's outline, the task in use, focus.
 pub const ACCENT: Rgb = 0x4C8DFF;
+/// The accent as a fill under white text (a dialog's default button).
+pub const ACCENT_STRONG: Rgb = 0x2F6AD0;
 /// The desktop.
 pub const DESKTOP: Rgb = 0x14161B;
 /// Panels: the shell's windows, menus, dialogs.
@@ -362,6 +364,7 @@ mod tests {
         assert!(contrast(SURFACE, TEXT_DISABLED) >= 2.0);
         assert!(contrast(TASKBAR, TEXT) >= 15.0);
         assert!(contrast(SELECTION, TEXT) >= 4.5);
+        assert!(contrast(ACCENT_STRONG, 0xFFFFFF) >= 4.5);
     }
 
     #[test]
