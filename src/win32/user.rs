@@ -947,7 +947,25 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
         }
         let edge_rect = Rect::new(frame, y, w - frame, h - frame);
         if window.ex_style & WS_EX_CLIENTEDGE != 0 {
-            p.sunken(edge_rect);
+            // Two pixels: a top-level window's in its frame's colour; a
+            // control's a grey line and its own (window) colour inside.
+            let (outer, inner) = if window.style & WS_CHILD == 0 {
+                let fill = crate::win32::theme::caption(active);
+                (fill, fill)
+            } else {
+                (0x7A7A7A, sys_color(5))
+            };
+            p.outline(edge_rect, outer);
+            let inside = edge_rect.inflate(-1, -1);
+            p.outline(inside, inner);
+            // Scroll bars run up to the grey line.
+            let style = scroll_style(&window);
+            if style & WS_VSCROLL != 0 {
+                p.vline(inside.right - 1, inside.top, inside.bottom, crate::win32::theme::SCROLL_TRACK);
+            }
+            if style & WS_HSCROLL != 0 {
+                p.hline(inside.left, inside.right, inside.bottom - 1, crate::win32::theme::SCROLL_TRACK);
+            }
         } else if window.ex_style & WS_EX_STATICEDGE != 0 {
             p.hline(
                 edge_rect.left,
@@ -2221,6 +2239,10 @@ pub fn deactivate_program<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mu
     let mut shared = ctx.shared.borrow_mut();
     shared.gui.focus_hwnd = 0;
     shared.gui.active_hwnd = 0;
+    // Its frame is drawn again as inactive.
+    if let Some(window) = shared.gui.window_mut(previous) {
+        window.nc_dirty = true;
+    }
     shared.gui.dirty = true;
 }
 
