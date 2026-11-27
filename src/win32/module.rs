@@ -273,11 +273,54 @@ fn find_file(ctx: &ApiContext, requested: &str) -> Option<(Vec<u8>, Vec<u8>)> {
         let Some(host) = crt::host_path_in(ctx, &guest) else {
             continue;
         };
-        if let Ok(bytes) = std::fs::read(&host) {
+        if let Some(bytes) = read_dll(&host) {
             return Some((guest, bytes));
         }
     }
     None
+}
+
+/// Big DLLs as last read, by host path, with the size and time of the file
+/// they were read from.
+struct CachedFile {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// Files from this size up are kept once read; at most this much in all.
+const CACHE_FROM: u64 = 1 << 20;
+const CACHE_LIMIT: u64 = 1 << 30;
+
+fn file_cache() -> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, CachedFile>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CachedFile>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// A DLL's bytes. Each process loads its DLLs again (each of Firefox's
+/// content processes its 180 MB xul.dll, a quarter of a second to read):
+/// big ones are read once and copied from memory while the file is
+/// unchanged.
+fn read_dll(host: &std::path::Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::metadata(host).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let (len, modified) = (metadata.len(), metadata.modified().ok());
+    if len < CACHE_FROM {
+        return std::fs::read(host).ok();
+    }
+    if let Some(cached) = file_cache().get(host).filter(|c| c.len == len && c.modified == modified) {
+        let bytes = cached.bytes.clone();
+        return Some(bytes.as_ref().clone());
+    }
+    let bytes = std::fs::read(host).ok()?;
+    let mut cache = file_cache();
+    let used: u64 = cache.iter().filter(|(path, _)| path.as_path() != host).map(|(_, c)| c.len).sum();
+    if used + len <= CACHE_LIMIT {
+        cache.insert(host.to_path_buf(), CachedFile { len, modified, bytes: std::sync::Arc::new(bytes.clone()) });
+    }
+    Some(bytes)
 }
 
 /// An export of a genuine module, following forwarders.
@@ -345,4 +388,33 @@ pub fn module_path(ctx: &ApiContext, handle: u32) -> Option<Vec<u8>> {
         .iter()
         .find(|m| m.image_base == handle && !m.path.is_empty())
         .map(|m| m.path.clone())
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn big_dlls_are_read_once_while_unchanged() {
+        let dir = std::env::temp_dir().join(format!("otw-dll-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.dll");
+        let first = vec![1u8; CACHE_FROM as usize + 10];
+        std::fs::write(&path, &first).unwrap();
+        assert_eq!(read_dll(&path).unwrap(), first);
+        assert!(file_cache().contains_key(&path));
+        assert_eq!(read_dll(&path).unwrap(), first);
+        // A changed file (another size) is read again.
+        let second = vec![2u8; CACHE_FROM as usize + 20];
+        std::fs::write(&path, &second).unwrap();
+        assert_eq!(read_dll(&path).unwrap(), second);
+        // Small files are not kept.
+        let small = dir.join("small.dll");
+        std::fs::write(&small, b"MZ").unwrap();
+        assert_eq!(read_dll(&small).unwrap(), b"MZ");
+        assert!(!file_cache().contains_key(&small));
+        assert!(read_dll(&dir).is_none());
+        file_cache().remove(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
