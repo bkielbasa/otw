@@ -206,6 +206,7 @@ extern "sysv64" fn kernel_main2(regions: &Vec<Region>) -> ! {
     let tss = arch::load_cpu_tables();
     arch::load_idt();
     arch::load_page_attributes();
+    arch::enable_vector_state(true);
     // The firmware's boot services memory is free now (the kernel has its
     // own stack, tables and page tables).
     let mut reclaimed = 0;

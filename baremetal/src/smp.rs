@@ -138,6 +138,7 @@ extern "sysv64" fn cpu_main(start: &Start) -> ! {
     let tss = arch::load_cpu_tables();
     arch::load_idt_on_this_cpu();
     arch::load_page_attributes();
+    arch::enable_vector_state(false);
     apic::enable_on_this_cpu();
     apic::register_this_cpu();
     arch::register_tss(tss);

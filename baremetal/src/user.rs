@@ -41,13 +41,14 @@ pub struct UserRegs {
     pub error: u64,
     pub fault_address: u64,
     _pad: u64,
-    /// FXSAVE image (x87, SSE).
-    pub fx: [u8; 512],
+    /// FXSAVE image (x87, SSE), then XSAVE's header and AVX's upper
+    /// halves (when the kernel saves with XSAVE).
+    pub fx: [u8; arch::VECTOR_STATE_SIZE],
 }
 
 impl UserRegs {
     pub fn new(x64: bool, rip: u64, rsp: u64) -> Self {
-        let mut fx = [0u8; 512];
+        let mut fx = [0u8; arch::VECTOR_STATE_SIZE];
         // x87 control word as Windows sets it; MXCSR: all exceptions masked.
         fx[0..2].copy_from_slice(&(if x64 { 0x027Fu16 } else { 0x027Fu16 }).to_le_bytes());
         fx[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
@@ -100,7 +101,18 @@ global_asm!(
     "call {set_stack}",
     "mov rdi, [rsp]",
     "cli",
+    // XRSTOR takes the legacy area only for what the header says is in
+    // use: x87 and SSE always are (the kernel may have changed them).
+    "cmp byte ptr [rip + {xsave}], 0",
+    "je 2f",
+    "or byte ptr [rdi + 192 + 512], 3",
+    "mov eax, -1",
+    "mov edx, -1",
+    "xrstor64 [rdi + 192]",
+    "jmp 3f",
+    "2:",
     "fxrstor64 [rdi + 192]",
+    "3:",
     "mov ax, {data}",
     "mov ds, ax",
     "mov es, ax",
@@ -140,6 +152,7 @@ global_asm!(
     "ret",
     set_stack = sym set_entry_stack,
     data = const arch::USER_DATA,
+    xsave = sym arch::OTW_XSAVE,
 );
 
 extern "sysv64" fn set_entry_stack(rsp: u64) {
@@ -204,7 +217,7 @@ pub fn leave(frame: &Frame, fx: *const u8) -> ! {
     let cr2: u64;
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2) };
     regs.fault_address = cr2;
-    unsafe { core::ptr::copy_nonoverlapping(fx, regs.fx.as_mut_ptr(), 512) };
+    unsafe { core::ptr::copy_nonoverlapping(fx, regs.fx.as_mut_ptr(), arch::VECTOR_STATE_SIZE) };
     unsafe { otw_leave_user(slot) }
 }
 

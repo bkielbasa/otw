@@ -177,21 +177,77 @@ global_asm!(
     "mov rdi, rsp",
     // Keep the old pointer; make room for the floating point and vector
     // registers (the handler may use them) and save them there.
+    // XSAVE (with AVX's upper halves) where the CPU has it, else FXSAVE.
     "mov rbx, rsp",
-    "sub rsp, 512",
+    "sub rsp, {area}",
     "and rsp, -64",
+    "cmp byte ptr [rip + {xsave}], 0",
+    "je 2f",
+    // The header must be zero (but for what XSAVE writes).
+    "xor eax, eax",
+    "mov [rsp + 512], rax", "mov [rsp + 520], rax", "mov [rsp + 528], rax", "mov [rsp + 536], rax",
+    "mov [rsp + 544], rax", "mov [rsp + 552], rax", "mov [rsp + 560], rax", "mov [rsp + 568], rax",
+    "mov eax, -1",
+    "mov edx, -1",
+    "xsave64 [rsp]",
+    "jmp 3f",
+    "2:",
     "fxsave64 [rsp]",
+    "3:",
     "mov rsi, rsp",
     "cld",
     "call {handler}",
+    "cmp byte ptr [rip + {xsave}], 0",
+    "je 4f",
+    "mov eax, -1",
+    "mov edx, -1",
+    "xrstor64 [rsp]",
+    "jmp 5f",
+    "4:",
     "fxrstor64 [rsp]",
+    "5:",
     "mov rsp, rbx",
     "pop r15", "pop r14", "pop r13", "pop r12", "pop r11", "pop r10", "pop r9", "pop r8",
     "pop rbp", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx", "pop rax",
     "add rsp, 16",
     "iretq",
     handler = sym interrupt,
+    xsave = sym OTW_XSAVE,
+    area = const VECTOR_STATE_SIZE,
 );
+
+/// Bytes kept for a program's floating point and vector registers: the
+/// FXSAVE image, the XSAVE header, AVX's upper halves (832), rounded up.
+pub const VECTOR_STATE_SIZE: usize = 1024;
+
+/// Whether the vector registers are saved with XSAVE (x87, SSE and AVX
+/// enabled in XCR0); FXSAVE (x87, SSE) without.
+#[no_mangle]
+pub static mut OTW_XSAVE: u8 = 0;
+
+/// Let programs use AVX where the CPU has it: the OS saves its state
+/// (CR4.OSXSAVE, XCR0 = x87 | SSE | AVX). Each CPU, before interrupts;
+/// the boot CPU decides, the others follow.
+pub fn enable_vector_state(boot: bool) {
+    let features = core::arch::x86_64::__cpuid(1);
+    let has = features.ecx & (1 << 26) != 0 && features.ecx & (1 << 28) != 0;
+    if !has || (!boot && unsafe { (&raw const OTW_XSAVE).read() } == 0) {
+        return;
+    }
+    unsafe {
+        asm!("mov {0}, cr4", "or {0}, {1}", "mov cr4, {0}", out(reg) _, in(reg) 1u64 << 18);
+        core::arch::x86_64::_xsetbv(0, 0b111);
+    }
+    let size = core::arch::x86_64::__cpuid_count(0xD, 0).ebx as usize;
+    if size > VECTOR_STATE_SIZE {
+        // Cannot happen with only these three; keep FXSAVE to be safe.
+        return;
+    }
+    if boot {
+        unsafe { (&raw mut OTW_XSAVE).write(1) };
+        log!("OTW kernel: AVX on (XSAVE, {size} bytes)");
+    }
+}
 
 // Exceptions 8, 10-14, 17, 21, 29, 30 push an error code.
 stubs!(
