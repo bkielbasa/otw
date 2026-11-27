@@ -733,6 +733,9 @@ pub struct SharedState {
     pub gui: GuiState,
     /// A 64-bit process (see [`x64`]).
     pub x64: bool,
+    /// A 32-bit program that needs Windows NT: told Windows XP
+    /// (`unicode::needs_nt`).
+    pub needs_nt: bool,
     pub heap_next: u32,
     pub next_handle: u32,
     pub registered_messages: u32,
@@ -846,6 +849,7 @@ impl Default for SharedState {
         Self {
             gui: GuiState::default(),
             x64: false,
+            needs_nt: false,
             heap_next: HEAP_BASE,
             next_handle: 0x200,
             registered_messages: 0xC000,
@@ -1097,6 +1101,7 @@ impl ApiContext {
             shared.borrow_mut().heap.reserve(start, end);
         }
         shared.borrow_mut().x64 = image.main().is64;
+        shared.borrow_mut().needs_nt = !image.main().is64 && unicode::needs_nt(image.main());
         if image.main().is64 {
             shared.borrow_mut().heap.add_range(crate::kernel::memory::HEAP64_EXTRA_BASE, crate::kernel::memory::HEAP64_EXTRA_SIZE);
         }

@@ -261,6 +261,7 @@ fn plan(name: &str) -> Option<Plan> {
         "lstrcmpW" | "lstrcmpiW" | "lstrcpyW" | "lstrcatW" => Native(2),
         "lstrcpynW" => Native(3),
         "GetCommandLineW" | "GetEnvironmentStringsW" => Native(0),
+        "GetLogicalDriveStringsW" => Native(2),
         "FreeEnvironmentStringsW" | "GetStartupInfoW" | "GetVersionExW" | "GetVersionExA" => Native(1),
         "GetEnvironmentVariableW" | "GetEnvironmentVariableA" => Native(3),
         "SetEnvironmentVariableW" | "SetEnvironmentVariableA" => Native(2),
@@ -728,6 +729,20 @@ fn native<M: GuestMemory + ?Sized>(
             write_wide(memory, args[0], &text, true);
             args[0]
         }
+        // (buffer length in characters, buffer): "C:\\", "D:\\" when
+        // there is one, then an empty string; the length without the last
+        // zero, or what is needed when the buffer is too small.
+        "GetLogicalDriveStringsW" => {
+            let list: &str = if crate::win32::crt::drive_d_root().is_some() { "C:\\\0D:\\\0\0" } else { "C:\\\0\0" };
+            let units: Vec<u16> = list.encode_utf16().collect();
+            if args[0] as usize >= units.len() {
+                let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+                let _ = memory.write_bytes(args[1], &bytes);
+                (units.len() - 1) as u32
+            } else {
+                units.len() as u32
+            }
+        }
         "GetCommandLineW" => {
             let va = ctx.command_line_va;
             cached_wide(ctx, memory, "command line", |memory| ansi_to_wide(&read_cstr(memory, va)))
@@ -789,8 +804,8 @@ fn native<M: GuestMemory + ?Sized>(
             0
         }
         "GetVersionExW" | "GetVersionExA" => {
-            // OSVERSIONINFO: Windows 95 (4.0.950), or for 64-bit programs a
-            // 64-bit Windows (see `os_version`).
+            // OSVERSIONINFO: Windows 95 (4.0.950), XP for programs that
+            // need NT, Windows 10 for 64-bit ones (see `os_version`).
             let size = memory.read_u32(args[0]).unwrap_or(0);
             let version = os_version(ctx);
             for (offset, value) in [(4, version.major), (8, version.minor), (12, version.build), (16, version.platform)] {
@@ -1456,6 +1471,79 @@ mod tests {
     use crate::platform::prelude::*;
     use super::*;
 
+    fn hello() -> crate::kernel::pe::PeImage {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/binaries/guests/HELLO.EXE")).unwrap();
+        crate::kernel::pe::PeImage::parse(bytes).unwrap()
+    }
+
+    fn importing(dll: &str, name: &str) -> crate::kernel::pe::PeImage {
+        let mut image = hello();
+        image.imports.push(crate::kernel::pe::DllImport {
+            dll: dll.into(),
+            names: vec![crate::kernel::pe::ImportName::ByName(name.into())],
+            original_thunk_rva: 0,
+            first_thunk_rva: 0,
+        });
+        image
+    }
+
+    struct Flat(Vec<u8>);
+    impl GuestMemory for Flat {
+        fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+            self.0.get(va as usize..va as usize + len).map(<[u8]>::to_vec)
+        }
+        fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+            self.0.get_mut(va as usize..va as usize + bytes.len())?.copy_from_slice(bytes);
+            Some(())
+        }
+        fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+            self.write_bytes(va, &value.to_le_bytes())
+        }
+        fn ptr_size(&self) -> u32 {
+            4
+        }
+        fn current_thread(&self) -> u32 {
+            1
+        }
+        fn current_tib(&self) -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn logical_drive_strings_wide() {
+        if crate::win32::crt::drive_d_root().is_some() {
+            return;
+        }
+        let ctx = ApiContext::default();
+        let mut m = Flat(vec![0xAA; 0x200]);
+        let call = |m: &mut Flat, length: u32| native(&ctx, m, "KERNEL32.dll", "GetLogicalDriveStringsW", &[length, 0x100], 2, 0).unwrap().value;
+        // Too small: what is needed, nothing written.
+        assert_eq!(call(&mut m, 2), 5);
+        assert_eq!(m.0[0x100], 0xAA);
+        assert_eq!(call(&mut m, 5), 4);
+        let units: Vec<u16> = m.0[0x100..0x10A].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(units, "C:\\\0\0".encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unicode_programs_need_nt() {
+        assert!(!needs_nt(&hello()));
+        assert!(needs_nt(&importing("KERNEL32.dll", "CreateFileW")));
+        assert!(needs_nt(&importing("USER32.dll", "RegisterClassW")));
+        // Wide functions Windows 95 has do not count, nor other DLLs'.
+        assert!(!needs_nt(&importing("USER32.dll", "MessageBoxW")));
+        assert!(!needs_nt(&importing("MYLIB.dll", "CreateFileW")));
+    }
+
+    #[test]
+    fn a_header_asking_for_windows_2000_needs_nt() {
+        let mut image = hello();
+        let pe = u32::from_le_bytes(image.bytes[0x3C..0x40].try_into().unwrap()) as usize;
+        image.bytes[pe + 24 + 48..pe + 24 + 50].copy_from_slice(&5u16.to_le_bytes());
+        assert!(needs_nt(&image));
+    }
+
     #[test]
     fn every_wrapper_has_an_a_function() {
         // The Wrap plans must point at implemented A functions.
@@ -1498,6 +1586,42 @@ mod tests {
     }
 }
 
+/// Functions Windows 95 has only as stubs that fail: a program that
+/// imports one is a Unicode program, built for Windows NT (7-Zip and
+/// IrfanView, say, refuse to run on Windows 95).
+const NT_ONLY: &[&str] = &[
+    "CreateFileW",
+    "CreateProcessW",
+    "LoadLibraryW",
+    "RegisterClassW",
+    "RegisterClassExW",
+    "CreateWindowExW",
+    "DialogBoxParamW",
+    "CreateDialogParamW",
+    "GetMessageW",
+    "PeekMessageW",
+    "DispatchMessageW",
+];
+
+/// Whether a 32-bit program needs Windows NT: it says so in its header
+/// (subsystem version 5 or later: Windows 2000 and up), or it imports
+/// functions that only NT has (`NT_ONLY`).
+pub fn needs_nt(image: &crate::kernel::pe::PeImage) -> bool {
+    let header = |offset: usize| -> Option<u16> {
+        let pe = u32::from_le_bytes(image.bytes.get(0x3C..0x40)?.try_into().ok()?) as usize;
+        let at = pe + 24 + offset;
+        Some(u16::from_le_bytes(image.bytes.get(at..at + 2)?.try_into().ok()?))
+    };
+    // MajorSubsystemVersion, 48 bytes into the optional header.
+    if header(48).is_some_and(|major| major >= 5) {
+        return true;
+    }
+    image.imports.iter().any(|dll| {
+        let system = ["kernel32.dll", "user32.dll"].iter().any(|n| dll.dll.eq_ignore_ascii_case(n));
+        system && dll.names.iter().any(|name| name.as_str().is_some_and(|n| NT_ONLY.contains(&n)))
+    })
+}
+
 /// The Windows version programs are told.
 pub struct OsVersion {
     pub major: u32,
@@ -1507,12 +1631,16 @@ pub struct OsVersion {
     pub service_pack: u32,
 }
 
-/// Windows 95 (4.0.950) for 32-bit programs. A 64-bit program cannot run
-/// on Windows 95, so it is told Windows 10 (10.0.19045), which current
+/// Windows 95 (4.0.950) for 32-bit programs; Windows XP SP3 (5.1.2600)
+/// for those that need Windows NT (`needs_nt`). A 64-bit program cannot
+/// run on Windows 95, so it is told Windows 10 (10.0.19045), which current
 /// 64-bit programs require.
 pub fn os_version(ctx: &ApiContext) -> OsVersion {
-    if ctx.shared.borrow().x64 {
+    let shared = ctx.shared.borrow();
+    if shared.x64 {
         OsVersion { major: 10, minor: 0, build: 19045, platform: 2, service_pack: 0 }
+    } else if shared.needs_nt {
+        OsVersion { major: 5, minor: 1, build: 2600, platform: 2, service_pack: 3 }
     } else {
         OsVersion { major: 4, minor: 0, build: 950, platform: 1, service_pack: 0 }
     }
