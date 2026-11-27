@@ -1,7 +1,8 @@
 //! What the kernel gives OTW's library (`otw_vm::platform::System`): the
 //! clock, the log, configuration, waiting, and files — drive C: (the FAT32
-//! partition) at `/C`, with what programs write kept in memory on top of
-//! it until the kernel can write FAT32.
+//! partition) at `/C`. What programs write there goes to the disk and is
+//! there after a restart; on a disk that cannot be written it is kept in
+//! memory on top of the volume instead.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
@@ -46,11 +47,24 @@ pub struct Kernel {
     directories: SpinLock<BTreeSet<String>>,
 }
 
+/// The time at boot (Unix seconds), for what is written to the volume.
+static BOOT_UNIX_TIME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn now_unix() -> u64 {
+    BOOT_UNIX_TIME.load(core::sync::atomic::Ordering::Relaxed) + apic::now_us() / 1_000_000
+}
+
 impl Kernel {
-    pub fn new(drive: Option<Fat32FileSystem>) -> Self {
+    pub fn new(mut drive: Option<Fat32FileSystem>) -> Self {
+        let boot_unix_time = io::rtc_unix_time();
+        BOOT_UNIX_TIME.store(boot_unix_time, core::sync::atomic::Ordering::Relaxed);
+        if let Some(drive) = drive.as_mut() {
+            drive.set_clock(now_unix);
+            log!("OTW kernel: drive C: {}", if drive.writable() { "written to the disk" } else { "read-only, changes kept in memory" });
+        }
         Self {
             drive,
-            boot_unix_time: io::rtc_unix_time(),
+            boot_unix_time,
             files: SpinLock::new(BTreeMap::new()),
             directories: SpinLock::new(BTreeSet::new()),
         }
@@ -80,7 +94,22 @@ fn name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// What a failed write to the volume tells the log (not what programs
+/// try and expect to fail).
+fn note_failure(what: &str, path: &str, error: otw_vm::fat32::Fat32Error) -> bool {
+    use otw_vm::fat32::Fat32Error::*;
+    if !matches!(error, NotFound(_) | AlreadyExists(_) | DirectoryNotEmpty(_) | IsADirectory(_) | NotADirectory(_) | InvalidName(_)) {
+        log!("OTW kernel: {what} C:/{path}: {error}");
+    }
+    false
+}
+
 impl Kernel {
+    /// Drive C: when what is written goes to it.
+    fn writable_drive(&self) -> Option<&Fat32FileSystem> {
+        self.drive.as_ref().filter(|drive| drive.writable())
+    }
+
     /// The volume's entries in a directory, as file infos.
     fn volume_list(&self, path: &str) -> Option<Vec<FileInfo>> {
         let drive = self.drive.as_ref()?;
@@ -89,7 +118,12 @@ impl Kernel {
             entries
                 .into_iter()
                 .filter(|e| e.name != "." && e.name != "..")
-                .map(|e| FileInfo { directory: e.is_directory(), size: e.size as u64, name: e.name, modified: self.boot_unix_time })
+                .map(|e| FileInfo {
+                    directory: e.is_directory(),
+                    size: e.size as u64,
+                    name: e.name,
+                    modified: if e.modified != 0 { e.modified } else { self.boot_unix_time },
+                })
                 .collect(),
         )
     }
@@ -175,6 +209,9 @@ impl System for Kernel {
 
     fn write_file(&self, path: &str, data: &[u8]) -> bool {
         let Some(path) = on_drive(path) else { return false };
+        if let Some(drive) = self.writable_drive() {
+            return drive.write_file(&path, data).map_or_else(|e| note_failure("writing", &path, e), |()| true);
+        }
         if path.is_empty() || self.info(&alloc::format!("{DRIVE_C}/{}", parent(&path))).is_none_or(|i| !i.directory) {
             return false;
         }
@@ -227,6 +264,9 @@ impl System for Kernel {
 
     fn create_dir(&self, path: &str) -> bool {
         let Some(path) = on_drive(path) else { return false };
+        if let Some(drive) = self.writable_drive() {
+            return drive.create_dir(&path).map_or_else(|e| note_failure("making directory", &path, e), |()| true);
+        }
         if self.info(&alloc::format!("{DRIVE_C}/{path}")).is_some() {
             return false;
         }
@@ -236,6 +276,9 @@ impl System for Kernel {
 
     fn remove(&self, path: &str) -> bool {
         let Some(drive_path) = on_drive(path) else { return false };
+        if let Some(drive) = self.writable_drive() {
+            return drive.remove(&drive_path).map_or_else(|e| note_failure("removing", &drive_path, e), |()| true);
+        }
         let Some(info) = self.info(path) else { return false };
         if info.directory {
             self.directories.lock().remove(&key(&drive_path));
@@ -246,6 +289,10 @@ impl System for Kernel {
     }
 
     fn rename(&self, from: &str, to: &str) -> bool {
+        if let Some(drive) = self.writable_drive() {
+            let (Some(from), Some(to)) = (on_drive(from), on_drive(to)) else { return false };
+            return drive.rename(&from, &to).map_or_else(|e| note_failure("renaming", &from, e), |()| true);
+        }
         let Some(data) = self.read_file(from) else { return false };
         self.write_file(to, &data) && self.remove(from)
     }

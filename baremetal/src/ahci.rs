@@ -1,5 +1,5 @@
 //! SATA disks behind an AHCI controller (most PCs of the last fifteen
-//! years), one command slot per port, polled.
+//! years), one command slot per port, polled; read and written.
 
 use alloc::format;
 use alloc::string::String;
@@ -38,13 +38,16 @@ fn set(address: u64, value: u32) {
 }
 
 impl Port {
-    /// Run an ATA command reading `bytes` into the buffer.
-    fn command(&mut self, ata: u8, lba: u64, count: u16, bytes: usize) -> Result<(), &'static str> {
+    /// Run an ATA command moving `bytes` between the disk and the buffer
+    /// (to the disk with `write`; none for 0).
+    fn command(&mut self, ata: u8, lba: u64, count: u16, bytes: usize, write: bool) -> Result<(), &'static str> {
         let r = self.registers;
-        // Command header 0: FIS length 5 dwords, read, one PRD entry.
+        // Command header 0: FIS length 5 dwords, the direction, one PRD
+        // entry (none without data).
         let header = self.command_list.pointer as *mut u32;
+        let prds = if bytes == 0 { 0 } else { 1 << 16 };
         unsafe {
-            write_volatile(header, 5 | (1 << 16));
+            write_volatile(header, 5 | if write { 1 << 6 } else { 0 } | prds);
             write_volatile(header.add(1), 0);
             write_volatile(header.add(2), self.table.address() as u32);
             write_volatile(header.add(3), (self.table.address() >> 32) as u32);
@@ -60,7 +63,7 @@ impl Port {
             let prd = table.add(0x80) as *mut u32;
             write_volatile(prd, self.buffer.address() as u32);
             write_volatile(prd.add(1), (self.buffer.address() >> 32) as u32);
-            write_volatile(prd.add(3), (bytes as u32 - 1) & 0x3F_FFFF);
+            write_volatile(prd.add(3), (bytes as u32).saturating_sub(1) & 0x3F_FFFF);
         }
         set(r + 0x10, u32::MAX); // clear interrupt status
         let deadline = apic::now_us() + 2_000_000;
@@ -129,7 +132,7 @@ pub fn probe(device: &pci::Device) -> Vec<Arc<dyn Disk>> {
         set(r + 0x18, get(r + 0x18) | 0x10); // receive FISes
         set(r + 0x18, get(r + 0x18) | 0x01); // start
         // IDENTIFY DEVICE: the size (LBA48 sectors) and model.
-        if port.command(0xEC, 0, 0, 512).is_err() {
+        if port.command(0xEC, 0, 0, 512, false).is_err() {
             continue;
         }
         let id = port.buffer.slice();
@@ -165,10 +168,33 @@ impl Disk for SataDisk {
         while done < buffer.len() {
             let n = (buffer.len() - done).min(MAX_READ);
             let count = n.div_ceil(512);
-            port.command(0x25, lba + (done / 512) as u64, count as u16, count * 512)?; // READ DMA EXT
+            port.command(0x25, lba + (done / 512) as u64, count as u16, count * 512, false)?; // READ DMA EXT
             buffer[done..done + n].copy_from_slice(&port.buffer.slice()[..n]);
             done += n;
         }
         Ok(())
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn write(&self, lba: u64, data: &[u8]) -> Result<(), &'static str> {
+        if data.len() % 512 != 0 {
+            return Err("a write of part of a sector");
+        }
+        let mut port = self.port.lock();
+        let mut done = 0;
+        while done < data.len() {
+            let n = (data.len() - done).min(MAX_READ);
+            unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), port.buffer.pointer, n) };
+            port.command(0x35, lba + (done / 512) as u64, (n / 512) as u16, n, true)?; // WRITE DMA EXT
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), &'static str> {
+        self.port.lock().command(0xEA, 0, 0, 0, false) // FLUSH CACHE EXT
     }
 }

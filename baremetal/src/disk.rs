@@ -1,5 +1,6 @@
 //! Disks: what a driver offers (whole sectors), the partitions on them
-//! (GPT), and a partition as a FAT32 volume, read through a cache.
+//! (GPT), and a partition as a FAT32 volume, read through a cache and
+//! written through it to the disk.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -17,6 +18,18 @@ pub trait Disk: Send + Sync {
     fn sectors(&self) -> u64;
     /// Read `buffer.len() / sector_size` sectors from `lba`.
     fn read(&self, lba: u64, buffer: &mut [u8]) -> Result<(), &'static str>;
+    /// Whether `write` works.
+    fn writable(&self) -> bool {
+        false
+    }
+    /// Write `data` (whole sectors) from `lba`.
+    fn write(&self, _lba: u64, _data: &[u8]) -> Result<(), &'static str> {
+        Err("the disk cannot be written")
+    }
+    /// Have what was written reach the medium (out of the disk's cache).
+    fn flush(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
 }
 
 pub struct Partition {
@@ -66,12 +79,36 @@ pub fn partitions(disk: &Arc<dyn Disk>) -> Vec<Partition> {
 const BLOCK: u64 = 64 * 1024;
 const CACHE_BLOCKS: usize = 512; // 32 MiB
 
-/// A partition as bytes, read a block at a time and kept in a cache.
+/// A partition as bytes, read a block at a time and kept in a cache;
+/// writes go to the disk at once (and to the cache).
 pub struct PartitionVolume {
     disk: Arc<dyn Disk>,
     offset: u64,
     size: u64,
-    cache: SpinLock<(BTreeMap<u64, (u64, Arc<Vec<u8>>)>, u64)>,
+    cache: SpinLock<Cache>,
+}
+
+struct Cache {
+    /// Blocks by index: when last used, the bytes.
+    blocks: BTreeMap<u64, (u64, Arc<Vec<u8>>)>,
+    clock: u64,
+    /// Writes so far: a block read from the disk while one was made may
+    /// be old, and is not kept.
+    writes: u64,
+}
+
+impl Cache {
+    fn insert(&mut self, index: u64, data: Arc<Vec<u8>>) {
+        if !self.blocks.contains_key(&index) && self.blocks.len() >= CACHE_BLOCKS {
+            // Drop the least recently used block.
+            if let Some(oldest) = self.blocks.iter().min_by_key(|(_, (used, _))| *used).map(|(&k, _)| k) {
+                self.blocks.remove(&oldest);
+            }
+        }
+        self.clock += 1;
+        let clock = self.clock;
+        self.blocks.insert(index, (clock, data));
+    }
 }
 
 impl PartitionVolume {
@@ -81,37 +118,39 @@ impl PartitionVolume {
             disk: partition.disk.clone(),
             offset: partition.first_lba * sector,
             size: (partition.last_lba + 1 - partition.first_lba) * sector,
-            cache: SpinLock::new((BTreeMap::new(), 0)),
+            cache: SpinLock::new(Cache { blocks: BTreeMap::new(), clock: 0, writes: 0 }),
         }
     }
 
+    /// A block's length in bytes (the last may be shorter), whole sectors.
+    fn block_length(&self, index: u64) -> usize {
+        let sector = self.disk.sector_size() as u64;
+        (BLOCK.min(self.size - index * BLOCK).div_ceil(sector) * sector) as usize
+    }
+
     fn block(&self, index: u64) -> Result<Arc<Vec<u8>>, fat32::Fat32Error> {
-        {
+        let writes = {
             let mut cache = self.cache.lock();
-            cache.1 += 1;
-            let clock = cache.1;
-            if let Some(entry) = cache.0.get_mut(&index) {
+            cache.clock += 1;
+            let clock = cache.clock;
+            if let Some(entry) = cache.blocks.get_mut(&index) {
                 entry.0 = clock;
                 return Ok(entry.1.clone());
             }
-        }
+            cache.writes
+        };
         let sector = self.disk.sector_size() as u64;
         let start = index * BLOCK;
-        let length = BLOCK.min(self.size - start).div_ceil(sector) * sector;
-        let mut data = vec![0u8; length as usize];
+        let length = self.block_length(index);
+        let mut data = vec![0u8; length];
         self.disk
             .read((self.offset + start) / sector, &mut data)
-            .map_err(|_| fat32::Fat32Error::OutOfBounds(start, length as usize))?;
+            .map_err(|_| fat32::Fat32Error::OutOfBounds(start, length))?;
         let data = Arc::new(data);
         let mut cache = self.cache.lock();
-        if cache.0.len() >= CACHE_BLOCKS {
-            // Drop the least recently used block.
-            if let Some(oldest) = cache.0.iter().min_by_key(|(_, (used, _))| *used).map(|(&k, _)| k) {
-                cache.0.remove(&oldest);
-            }
+        if cache.writes == writes {
+            cache.insert(index, data.clone());
         }
-        let clock = cache.1;
-        cache.0.insert(index, (clock, data.clone()));
         Ok(data)
     }
 }
@@ -135,6 +174,53 @@ impl fat32::Volume for PartitionVolume {
             done += n;
         }
         Ok(())
+    }
+
+    fn writable(&self) -> bool {
+        self.disk.writable()
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), fat32::Fat32Error> {
+        if offset + data.len() as u64 > self.size {
+            return Err(fat32::Fat32Error::OutOfBounds(offset, data.len()));
+        }
+        let sector = self.disk.sector_size();
+        let mut done = 0;
+        while done < data.len() {
+            let at = offset + done as u64;
+            let index = at / BLOCK;
+            let within = (at % BLOCK) as usize;
+            let length = self.block_length(index);
+            let n = (data.len() - done).min(length - within);
+            // The block with the new bytes in: read first unless all new.
+            let mut block = if within == 0 && n == length {
+                Vec::new()
+            } else {
+                self.block(index)?.as_ref().clone()
+            };
+            block.resize(length, 0);
+            block[within..within + n].copy_from_slice(&data[done..done + n]);
+            // The sectors that changed go to the disk.
+            let first = within / sector * sector;
+            let end = (within + n).div_ceil(sector) * sector;
+            let lba = (self.offset + index * BLOCK + first as u64) / sector as u64;
+            {
+                let mut cache = self.cache.lock();
+                cache.writes += 1;
+            }
+            self.disk.write(lba, &block[first..end]).map_err(fat32::Fat32Error::Io)?;
+            {
+                let mut cache = self.cache.lock();
+                cache.writes += 1;
+                cache.insert(index, Arc::new(block));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), fat32::Fat32Error> {
+        self.disk.flush().map_err(fat32::Fat32Error::Io)
     }
 }
 

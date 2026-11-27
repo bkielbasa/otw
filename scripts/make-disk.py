@@ -7,7 +7,7 @@ with no root rights and nothing but the standard library.
 Each PARTITION is KIND:LABEL:SIZE_MIB:DIRECTORY, KIND being "esp" (an EFI
 system partition: what UEFI boots, EFI/BOOT/BOOTX64.EFI) or "data" (a basic
 data partition). SIZE_MIB "auto" makes room for the directory and a quarter
-more. Long file names are kept (VFAT long name entries).
+more; "auto+N" for N MiB more besides (free space for what is written). Long file names are kept (VFAT long name entries).
 """
 
 import os
@@ -251,8 +251,9 @@ def main():
         kind, label, size, directory = spec.split(":", 3)
         if kind not in ("esp", "data"):
             raise SystemExit(f"unknown partition kind {kind!r}")
-        if size == "auto":
-            size_mib = max(64, (tree_bytes(directory) * 5 // 4) // MIB + 32)
+        if size == "auto" or size.startswith("auto+"):
+            extra = int(size[5:]) if size.startswith("auto+") else 0
+            size_mib = max(64, (tree_bytes(directory) * 5 // 4) // MIB + 32) + extra
         else:
             size_mib = int(size)
         sectors = size_mib * MIB // SECTOR

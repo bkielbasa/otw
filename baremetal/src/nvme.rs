@@ -1,5 +1,5 @@
 //! NVMe disks (most new PCs): one admin queue pair, one I/O queue pair,
-//! polled for completions.
+//! polled for completions; read and written.
 
 use alloc::format;
 use alloc::string::String;
@@ -109,6 +109,38 @@ impl Controller {
     }
 }
 
+impl Controller {
+    /// Read (0x02) or write (0x01) `count` sectors at `lba` through the
+    /// buffer.
+    fn transfer(&mut self, opcode: u32, lba: u64, count: usize, sector_size: usize) -> Result<(), &'static str> {
+        let address = self.buffer.address();
+        let mut command = [0u32; 16];
+        command[0] = opcode;
+        command[1] = 1;
+        command[6] = address as u32;
+        command[7] = (address >> 32) as u32;
+        // More than two pages: the second pointer is a list of the rest.
+        let pages = (count * sector_size).div_ceil(4096);
+        let second = if pages <= 1 {
+            0
+        } else if pages == 2 {
+            address + 4096
+        } else {
+            let list = self.prp_list.pointer as *mut u64;
+            for page in 1..pages {
+                unsafe { write_volatile(list.add(page - 1), address + page as u64 * 4096) };
+            }
+            self.prp_list.address()
+        };
+        command[8] = second as u32;
+        command[9] = (second >> 32) as u32;
+        command[10] = lba as u32;
+        command[11] = (lba >> 32) as u32;
+        command[12] = count as u32 - 1;
+        self.run(true, command).map(|_| ())
+    }
+}
+
 pub fn probe(device: &pci::Device) -> Option<Nvme> {
     device.enable();
     let (base, size) = device.bar(0);
@@ -213,36 +245,39 @@ impl Disk for Nvme {
         let mut done = 0;
         while done < buffer.len() {
             let n = (buffer.len() - done).min(MAX_READ);
-            let count = n.div_ceil(self.sector_size);
             let first = lba + (done / self.sector_size) as u64;
-            let address = controller.buffer.address();
-            let mut command = [0u32; 16];
-            command[0] = 0x02;
-            command[1] = 1;
-            command[6] = address as u32;
-            command[7] = (address >> 32) as u32;
-            // More than two pages: the second pointer is a list of the rest.
-            let pages = (count * self.sector_size).div_ceil(4096);
-            let second = if pages <= 1 {
-                0
-            } else if pages == 2 {
-                address + 4096
-            } else {
-                let list = controller.prp_list.pointer as *mut u64;
-                for page in 1..pages {
-                    unsafe { write_volatile(list.add(page - 1), address + page as u64 * 4096) };
-                }
-                controller.prp_list.address()
-            };
-            command[8] = second as u32;
-            command[9] = (second >> 32) as u32;
-            command[10] = first as u32;
-            command[11] = (first >> 32) as u32;
-            command[12] = count as u32 - 1;
-            controller.run(true, command)?;
+            controller.transfer(0x02, first, n.div_ceil(self.sector_size), self.sector_size)?;
             buffer[done..done + n].copy_from_slice(&controller.buffer.slice()[..n]);
             done += n;
         }
         Ok(())
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn write(&self, lba: u64, data: &[u8]) -> Result<(), &'static str> {
+        if data.len() % self.sector_size != 0 {
+            return Err("a write of part of a sector");
+        }
+        let mut controller = self.controller.lock();
+        let mut done = 0;
+        while done < data.len() {
+            let n = (data.len() - done).min(MAX_READ);
+            unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), controller.buffer.pointer, n) };
+            let first = lba + (done / self.sector_size) as u64;
+            controller.transfer(0x01, first, n / self.sector_size, self.sector_size)?;
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), &'static str> {
+        let mut controller = self.controller.lock();
+        let mut command = [0u32; 16];
+        command[0] = 0x00; // FLUSH
+        command[1] = 1;
+        controller.run(true, command).map(|_| ())
     }
 }

@@ -2,7 +2,9 @@
 # Build target/os/otw.img: a bootable (UEFI) disk image of OTW running on
 # the machine by itself (baremetal/: no other operating system underneath).
 # Drive C: is a second partition (OTW-C) filled from OTW_DRIVE_C (default
-# ~/.otw/C); OTW_DRIVE_C= (empty) leaves it out.
+# ~/.otw/C); OTW_DRIVE_C= (empty) leaves it out. It has OTW_DRIVE_C_FREE MiB
+# (default 2048) free for what is saved and downloaded there: the kernel
+# writes it to the disk, so it stays until the image is built again.
 # Write it to a USB stick or disk for a real machine
 # (sudo dd if=target/os/otw.img of=/dev/sdX bs=4M conv=fsync status=progress)
 # and boot it with UEFI and Secure Boot off; or try it with `make os`.
@@ -32,10 +34,11 @@ for dir in /usr/share/fonts/truetype/dejavu /usr/share/fonts/truetype/liberation
   [[ -d "$dir" ]] && cp "$dir"/*.ttf "$EXTRA/WINDOWS/FONTS/" 2>/dev/null || true
 done
 DRIVE_C="${OTW_DRIVE_C-$HOME/.otw/C}"
+FREE="${OTW_DRIVE_C_FREE:-2048}"
 if [[ -n "$DRIVE_C" && -d "$DRIVE_C" ]]; then
-  partitions+=("data:OTW-C:auto:$DRIVE_C+$EXTRA")
+  partitions+=("data:OTW-C:auto+$FREE:$DRIVE_C+$EXTRA")
 else
-  partitions+=("data:OTW-C:auto:$EXTRA")
+  partitions+=("data:OTW-C:auto+$FREE:$EXTRA")
 fi
 echo "==> making the disk"
 python3 -I "$ROOT/scripts/make-disk.py" "${OS_IMAGE:-$OUT/otw.img}" "${partitions[@]}"
