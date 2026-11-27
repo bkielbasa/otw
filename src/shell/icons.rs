@@ -101,18 +101,18 @@ const PICTURE: &str = "\
 const PROGRAM: &str = "\
 ................\
 ................\
-kkkkkkkkkkkkkkkk\
-kbbbbbbbbbbbbbbk\
-kbwbbbbbbbbbbbbk\
-kkkkkkkkkkkkkkkk\
-kwwwwwwwwwwwwwwk\
-kwwwwwwwwwwwwwwk\
-kwwwwwwwwwwwwwwk\
-kwwwwwwwwwwwwwwk\
-kwwwwwwwwwwwwwwk\
-kwwwwwwwwwwwwwwk\
-kwwwwwwwwwwwwwwk\
-kkkkkkkkkkkkkkkk\
+.LLLLLLLLLLLLLL.\
+LaaaaaaaaaaaaaaL\
+LaaaaaaaaaawawaL\
+LaaaaaaaaaaaaaaL\
+LddddddddddddddL\
+LddddddddddddddL\
+LddddddddddddddL\
+LddddddddddddddL\
+LddddddddddddddL\
+LddddddddddddddL\
+LddddddddddddddL\
+.LLLLLLLLLLLLLL.\
 ................\
 ................";
 
@@ -205,8 +205,13 @@ fn color(code: u8) -> Option<Rgb> {
         b'w' => 0xFFFFFF,
         b'g' => 0x808080,
         b'l' => 0xC0C0C0,
-        b'y' => 0xFFFF00,
-        b'o' => 0x808000,
+        // Folders: a warm amber rather than Win95's pure yellow.
+        b'y' => 0xF4C752,
+        b'o' => 0xB8862B,
+        // The generic program: a dark window with an accent title bar.
+        b'a' => 0x4C8DFF,
+        b'd' => 0x2C2C31,
+        b'L' => 0xB4B4BC,
         b'b' => 0x000080,
         b'c' => 0x00FFFF,
         b'B' => 0x0000FF,
@@ -250,8 +255,8 @@ pub fn draw(p: &mut Painter<'_>, bitmap: &Bitmap, x: i32, y: i32, size: i32, sel
                 continue;
             };
             if selected && (dx + dy) % 2 == 0 {
-                // Win95 dithers selected icons with the highlight colour.
-                rgb = 0x000080;
+                // Selected icons are dithered with the accent.
+                rgb = crate::win32::theme::ACCENT;
             }
             p.pixel(x + dx, y + dy, rgb);
         }

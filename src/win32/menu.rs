@@ -408,25 +408,21 @@ fn popup_layout(menu: &GuestMenu) -> PopupLayout {
 }
 
 fn draw_popup(p: &mut Painter<'_>, menu: &GuestMenu, layout: &PopupLayout, hot: i32) {
+    use crate::win32::theme;
     let full = Rect::new(0, 0, layout.width, layout.height);
     p.fill(full, sys_color(4));
-    p.raised(full);
+    p.outline(full, theme::BORDER);
     for (index, (item, row)) in menu.items.iter().zip(&layout.rows).enumerate() {
         if item.flags & MF_SEPARATOR != 0 {
-            let y = row.top + row.height() / 2 - 1;
-            p.hline(row.left + 1, row.right - 1, y, sys_color(16));
-            p.hline(row.left + 1, row.right - 1, y + 1, sys_color(20));
+            let y = row.top + row.height() / 2;
+            p.hline(row.left + 4, row.right - 4, y, theme::BORDER);
             continue;
         }
         let disabled = item.flags & (MF_GRAYED | MF_DISABLED) != 0;
         let highlighted = index as i32 == hot;
-        let text_color = if highlighted {
-            sys_color(14)
-        } else {
-            sys_color(7)
-        };
+        let text_color = sys_color(7);
         if highlighted {
-            p.fill(*row, sys_color(13));
+            theme::rounded(p, *row, 2, theme::MENU_HOT);
         }
         let mut parts = item.text.splitn(2, |b| *b == b'\t');
         let label = parts.next().unwrap_or(&[]).to_vec();
@@ -435,7 +431,7 @@ fn draw_popup(p: &mut Painter<'_>, menu: &GuestMenu, layout: &PopupLayout, hot: 
         if item.flags & MF_CHECKED != 0 {
             let cx = row.left + 6;
             let cy = row.top + 5;
-            let color = if disabled { sys_color(16) } else { text_color };
+            let color = if disabled { theme::TEXT_DISABLED } else { text_color };
             for i in 0..3 {
                 p.vline(cx + i, cy + 2 + i, cy + 5 + i, color);
             }
@@ -443,13 +439,8 @@ fn draw_popup(p: &mut Painter<'_>, menu: &GuestMenu, layout: &PopupLayout, hot: 
                 p.vline(cx + 3 + i, cy + 3 - i, cy + 6 - i, color);
             }
         }
-        if disabled && !highlighted {
-            p.disabled_text(row.left + 17, ty, &label);
-            if let Some(accel) = &accel {
-                p.disabled_text(layout.accel_x - 3, ty, accel);
-            }
-        } else {
-            let color = if disabled { sys_color(16) } else { text_color };
+        {
+            let color = if disabled { theme::TEXT_DISABLED } else { text_color };
             p.mnemonic_text(row.left + 17, ty, &label, color);
             if let Some(accel) = &accel {
                 p.mnemonic_text(layout.accel_x - 3, ty, accel, color);

@@ -21,6 +21,7 @@ pub mod vmem;
 pub mod nt;
 pub mod ucrt;
 pub mod tabs;
+pub mod theme;
 pub mod rebar;
 pub mod modern;
 pub mod native;

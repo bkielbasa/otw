@@ -1,6 +1,7 @@
-//! The desktop shell: desktop icons, the taskbar and Start menu, a folder
-//! (Explorer) window with a menu bar, context menus, dialogs, and the file
-//! operations behind them, in the style of the Windows 95 shell.
+//! The desktop shell: desktop icons, the taskbar with its Menu button (a
+//! menu with a search field) and clock, a folder (Explorer) window with a
+//! menu bar, context menus, dialogs, and the file operations behind them.
+//! Drawn in OTW's dark, flat theme (`win32::theme`).
 //!
 //! The shell is host-side Rust, independent of the display backend: it
 //! takes pointer and key input, paints into a [`Surface`] the size of the
@@ -16,6 +17,7 @@ use crate::platform::prelude::*;
 pub mod icons;
 pub mod launch;
 pub mod popup;
+pub mod search;
 pub mod setup;
 pub mod volume;
 
@@ -30,6 +32,7 @@ use crate::{
     win32::gdi::sys_color,
     win32::lnk,
     win32::gfx::{Rect, Region, Surface},
+    win32::theme,
     win32::user::{self, text_width, Painter},
 };
 use icons::{Bitmap, Builtin};
@@ -42,10 +45,19 @@ const CELL_WIDTH: i32 = 75;
 const CELL_HEIGHT: i32 = 70;
 const ROW_HEIGHT: i32 = 17;
 const CAPTION: i32 = 18;
+/// Width of a flat caption button.
+const CAPTION_BUTTON: i32 = 26;
 const MENU_BAR: i32 = 19;
 const TOOLBAR: i32 = 28;
 const STATUS_BAR: i32 = 20;
 const BAR_MENUS: [&str; 4] = ["&File", "&Edit", "&View", "&Help"];
+/// Room for each notification-area icon.
+const TRAY_SLOT: i32 = 22;
+
+/// Width of bold text (the clock).
+fn gfx_bold_width(text: &[u8]) -> i32 {
+    crate::win32::gfx::pick_face(13, true).text_width(text)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
@@ -414,16 +426,17 @@ pub struct Shell {
     launch: Option<LaunchRequest>,
     screen: (i32, i32),
     icon_cache: RefCell<HashMap<String, Option<Bitmap>>>,
+    /// What the Menu button's search can find, gathered when first needed.
+    search_index: RefCell<Option<Vec<search::Candidate>>>,
     /// Names of the programs running, kept up to date by the window system.
     pub running: Vec<String>,
     /// Set when the user confirms Shut Down.
     pub quit: bool,
 }
 
+/// Text in the font's code page (Windows-1252: dashes, quotes, the euro).
 fn bytes(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
-        .collect()
+    crate::win32::unicode::string_to_ansi(text)
 }
 
 fn stem(name: &str) -> &str {
@@ -520,6 +533,7 @@ impl Shell {
             launch: None,
             screen: (1024, 700),
             icon_cache: RefCell::new(HashMap::new()),
+            search_index: RefCell::new(None),
             running: Vec::new(),
             quit: false,
         };
@@ -593,6 +607,12 @@ impl Shell {
         }
     }
 
+    /// Whether the desktop or the folder window (rather than a program) is
+    /// in use.
+    pub fn has_focus(&self) -> bool {
+        self.focus != Focus::Program
+    }
+
     pub fn foreground_explorer(&self) -> bool {
         self.focus == Focus::Explorer && self.explorer_visible()
     }
@@ -635,6 +655,7 @@ impl Shell {
     /// Reload the desktop and the folder window from the volume.
     pub fn refresh(&mut self) {
         self.icon_cache.borrow_mut().clear();
+        self.search_index.borrow_mut().take();
         let mut icons = Vec::new();
         if self.volume.is_some() {
             icons.push(DesktopIcon {
@@ -1403,14 +1424,52 @@ impl Shell {
         }
     }
 
+    /// Open the Menu button's menu with `query` in its search field: the
+    /// usual items while it is empty, else the best matches with the first
+    /// one highlighted (Enter starts it).
+    fn open_start(&mut self, query: String) {
+        let searching = !query.trim().is_empty();
+        let items = if searching {
+            self.search_items(&query)
+        } else {
+            self.start_items()
+        };
+        let mut menu = Menu::open(items, Style::Start, self.start_anchor(), self.screen);
+        menu.search = query;
+        if searching {
+            menu.highlight_first();
+        }
+        self.menu = Some(OpenMenu {
+            menu,
+            owner: MenuOwner::Start,
+        });
+    }
+
+    fn start_anchor(&self) -> Anchor {
+        Anchor::Above(self.start_rect().left, self.screen.1 - TASKBAR_HEIGHT - 4)
+    }
+
+    /// What is typed in the Menu button's search field, if it is open.
+    pub fn search_text(&self) -> Option<&str> {
+        self.menu
+            .as_ref()
+            .filter(|m| m.owner == MenuOwner::Start)
+            .map(|m| m.menu.search.as_str())
+    }
+
     fn open_menu(&mut self, owner: MenuOwner, at: Option<(i32, i32)>, highlight_first: bool) {
         self.commit_rename();
+        if owner == MenuOwner::Start {
+            self.open_start(String::new());
+            if highlight_first {
+                if let Some(open) = &mut self.menu {
+                    open.menu.key(Key::Down);
+                }
+            }
+            return;
+        }
         let (items, style, anchor) = match owner {
-            MenuOwner::Start => (
-                self.start_items(),
-                Style::Start,
-                Anchor::Above(2, self.screen.1 - TASKBAR_HEIGHT + 2),
-            ),
+            MenuOwner::Start => unreachable!(),
             MenuOwner::Bar(index) => {
                 let rect = self.bar_rects().get(index).copied().unwrap_or_default();
                 (self.bar_items(index), Style::Plain, Anchor::Below(rect))
@@ -1525,16 +1584,21 @@ impl Shell {
     }
 
     fn close_rect(e: &Explorer) -> Rect {
-        Rect::sized(e.rect.right - 5 - 16, e.rect.top + 5, 16, 14)
+        Rect::sized(
+            e.rect.right - 3 - CAPTION_BUTTON,
+            e.rect.top + 3,
+            CAPTION_BUTTON,
+            CAPTION,
+        )
     }
 
     /// Maximize (or restore) and minimize buttons, left of close.
     fn max_rect(e: &Explorer) -> Rect {
-        Self::close_rect(e).offset(-18, 0)
+        Self::close_rect(e).offset(-CAPTION_BUTTON, 0)
     }
 
     fn min_rect(e: &Explorer) -> Rect {
-        Self::max_rect(e).offset(-16, 0)
+        Self::max_rect(e).offset(-CAPTION_BUTTON, 0)
     }
 
     /// The caption icon, which opens the window menu.
@@ -1659,21 +1723,27 @@ impl Shell {
         }
     }
 
-    /// The notification area: icons, then the clock, at the right.
+    /// The notification area: icons, then the clock (date and time), at
+    /// the right.
     fn tray_rect(&self) -> Rect {
-        let width = 8 + self.tray.len() as i32 * 20 + text_width(b"88:88") + 12;
+        let width = 8 + self.tray.len() as i32 * TRAY_SLOT + Self::clock_width();
         Rect::new(
-            self.screen.0 - 3 - width,
-            self.screen.1 - TASKBAR_HEIGHT + 4,
-            self.screen.0 - 3,
-            self.screen.1 - 2,
+            self.screen.0 - 4 - width,
+            self.screen.1 - TASKBAR_HEIGHT + 3,
+            self.screen.0 - 4,
+            self.screen.1 - 3,
         )
+    }
+
+    /// Room for the clock: the widest short date, a gap, the time.
+    fn clock_width() -> i32 {
+        text_width(b"Wed 30 May") + 10 + gfx_bold_width(b"88:88") + 16
     }
 
     fn tray_icon_rect(&self, index: usize) -> Rect {
         let tray = self.tray_rect();
         Rect::sized(
-            tray.left + 4 + index as i32 * 20,
+            tray.left + 6 + index as i32 * TRAY_SLOT,
             tray.top + (tray.height() - 16) / 2,
             16,
             16,
@@ -1682,12 +1752,7 @@ impl Shell {
 
     fn clock_rect(&self) -> Rect {
         let tray = self.tray_rect();
-        Rect::new(
-            tray.left + 4 + self.tray.len() as i32 * 20,
-            tray.top,
-            tray.right,
-            tray.bottom,
-        )
+        Rect::new(tray.right - Self::clock_width(), tray.top, tray.right, tray.bottom)
     }
 
     /// Replace the notification-area icons.
@@ -1707,23 +1772,25 @@ impl Shell {
     }
 
     fn task_rects(&self, count: usize) -> Vec<Rect> {
-        let top = self.screen.1 - TASKBAR_HEIGHT + 4;
-        let available = self.tray_rect().left - 4 - 66;
+        let top = self.screen.1 - TASKBAR_HEIGHT + 3;
+        let first = self.start_rect().right + 8;
+        let available = self.tray_rect().left - 8 - first;
         let width = if count == 0 {
             0
         } else {
-            (available / count as i32).min(160)
+            (available / count as i32).min(180)
         };
         (0..count)
-            .map(|i| Rect::sized(66 + i as i32 * width, top, width - 3, TASKBAR_HEIGHT - 6))
+            .map(|i| Rect::sized(first + i as i32 * width, top, width - 4, TASKBAR_HEIGHT - 6))
             .collect()
     }
 
+    /// The Menu button, at the left of the taskbar.
     fn start_rect(&self) -> Rect {
         Rect::sized(
-            2,
-            self.screen.1 - TASKBAR_HEIGHT + 4,
-            60,
+            4,
+            self.screen.1 - TASKBAR_HEIGHT + 3,
+            76,
             TASKBAR_HEIGHT - 6,
         )
     }
@@ -1747,6 +1814,15 @@ impl Shell {
             .enumerate()
             .map(|(i, b)| (*b, Rect::sized(start + i as i32 * 81, top, 75, 23)))
             .collect()
+    }
+
+    fn dialog_close_rect(dialog: &Dialog) -> Rect {
+        Rect::sized(
+            dialog.rect.right - 3 - CAPTION_BUTTON,
+            dialog.rect.top + 3,
+            CAPTION_BUTTON,
+            CAPTION,
+        )
     }
 
     fn dialog_edit_rect(dialog: &Dialog) -> Rect {
@@ -1824,9 +1900,7 @@ impl Shell {
                     .find(|(_, r)| r.contains(x, y))
                 {
                     self.dialog_choice(choice);
-                } else if Rect::sized(dialog.rect.right - 21, dialog.rect.top + 5, 16, 14)
-                    .contains(x, y)
-                {
+                } else if Self::dialog_close_rect(dialog).contains(x, y) {
                     let cancel = if matches!(dialog.kind, DialogKind::Message) {
                         DialogButton::Ok
                     } else {
@@ -2172,6 +2246,26 @@ impl Shell {
             }
             return true;
         }
+        if let Some(open) = self.menu.as_ref().filter(|m| m.owner == MenuOwner::Start) {
+            if !mods.ctrl && !mods.alt {
+                let mut query = open.menu.search.clone();
+                let edited = match key {
+                    Key::Char(ch) => {
+                        query.push(ch);
+                        true
+                    }
+                    Key::Backspace => query.pop().is_some(),
+                    _ => false,
+                };
+                if edited {
+                    self.open_start(query);
+                    return true;
+                }
+                if key == Key::Backspace {
+                    return true;
+                }
+            }
+        }
         if let Some(open) = &mut self.menu {
             let outcome = if key == Key::F10 || (key == Key::Char(' ') && mods.alt) {
                 Outcome::Dismiss
@@ -2348,23 +2442,35 @@ impl Shell {
     }
 
     fn paint_desktop(&self, p: &mut Painter<'_>) {
-        p.fill(Rect::new(0, 0, self.screen.0, self.screen.1), sys_color(1));
+        // A quiet vertical gradient, darker towards the taskbar.
+        let height = self.screen.1.max(1);
+        for y in 0..self.screen.1 {
+            p.hline(0, self.screen.0, y, theme::desktop_shade(y, height));
+        }
         for (index, icon) in self.icons.iter().enumerate() {
             let cell = self.icon_cell(index);
             let selected = self.desktop_selected == Some(index);
+            let lines = Self::label_lines(&icon.label);
+            if selected {
+                let hit = self.icon_hit(index);
+                let bottom = cell.top + 38 + lines.len() as i32 * 13 + 4;
+                theme::rounded(
+                    p,
+                    Rect::new(hit.left, hit.top, hit.right, bottom.min(hit.bottom)),
+                    4,
+                    if self.focus == Focus::Desktop {
+                        theme::DESKTOP_SELECTION
+                    } else {
+                        theme::DESKTOP_SELECTION_INACTIVE
+                    },
+                );
+            }
             let (image, overlay) = match &icon.target {
                 Target::Computer => (icons::builtin(Builtin::Computer), false),
                 Target::Path(path) => self.icon_for(path, icon.is_dir, 32, 0),
             };
             let (ix, iy) = (cell.left + (CELL_WIDTH - 32) / 2, cell.top + 2);
-            icons::draw(
-                p,
-                &image,
-                ix,
-                iy,
-                32,
-                selected && self.focus == Focus::Desktop,
-            );
+            icons::draw(p, &image, ix, iy, 32, false);
             if overlay {
                 icons::draw_shortcut_overlay(p, ix, iy, 32);
             }
@@ -2375,22 +2481,14 @@ impl Shell {
             {
                 continue;
             }
-            for (line_index, line) in Self::label_lines(&icon.label).iter().enumerate() {
+            for (line_index, line) in lines.iter().enumerate() {
                 let text = bytes(line);
                 let width = text_width(&text);
                 let x = cell.left + (CELL_WIDTH - width) / 2;
                 let y = cell.top + 38 + line_index as i32 * 13;
-                if selected {
-                    p.fill(
-                        Rect::new(x - 1, y, x + width + 1, y + 13),
-                        if self.focus == Focus::Desktop {
-                            sys_color(13)
-                        } else {
-                            sys_color(1)
-                        },
-                    );
-                }
-                p.text(x, y, &text, 0xFFFFFF, false);
+                // A shadow keeps labels readable on any background.
+                p.text(x + 1, y + 1, &text, 0x000000, false);
+                p.text(x, y, &text, theme::TEXT, false);
             }
         }
         if let Some(rename) = self.rename.as_ref().filter(|r| r.place == Place::Desktop) {
@@ -2405,6 +2503,50 @@ impl Shell {
         paint_edit_box(p, rect, &rename.edit, border);
     }
 
+    /// A window's frame and caption, as the window system draws programs'
+    /// windows: a one-pixel outline (the accent while in use), the caption
+    /// the frame's colour, flat buttons.
+    fn paint_frame(
+        p: &mut Painter<'_>,
+        r: Rect,
+        caption: Rect,
+        title: &str,
+        icon: Option<&Bitmap>,
+        active: bool,
+        buttons: &[(Rect, u8)],
+    ) {
+        p.fill(r, theme::SURFACE);
+        let fill = theme::caption(active);
+        p.fill(
+            Rect::new(r.left, r.top, r.right, caption.bottom),
+            fill,
+        );
+        p.outline(Rect::new(r.left + 1, r.top + 1, r.right - 1, r.bottom - 1), fill);
+        p.outline(Rect::new(r.left + 2, r.top + 2, r.right - 2, r.bottom - 2), fill);
+        p.outline(r, theme::frame_outline(active));
+        let mut text_x = caption.left + 6;
+        if let Some(icon) = icon {
+            icons::draw(p, icon, caption.left + 2, caption.top + 1, 16, false);
+            text_x = caption.left + 23;
+        }
+        let limit = buttons
+            .iter()
+            .map(|(rect, _)| rect.left)
+            .min()
+            .unwrap_or(caption.right);
+        let shown = fit(title, limit - text_x - 6);
+        p.text(
+            text_x,
+            caption.top + (caption.height() - 13) / 2,
+            &shown,
+            theme::caption_text(active),
+            false,
+        );
+        for (rect, glyph) in buttons {
+            theme::caption_button(p, *rect, *glyph, active, false);
+        }
+    }
+
     fn paint_explorer(&self, p: &mut Painter<'_>) {
         let Some(e) = self.explorer.as_ref().filter(|e| !e.minimized) else {
             return;
@@ -2412,41 +2554,30 @@ impl Shell {
         let volume = self.volume.as_ref();
         let active = self.focus == Focus::Explorer;
         let r = e.rect;
-        p.fill(r, sys_color(15));
-        p.raised(r);
-        // Caption.
-        let caption = Self::caption_rect(e);
-        p.fill(
-            Rect::new(caption.left, caption.top, caption.right, caption.bottom - 1),
-            if active { sys_color(2) } else { sys_color(3) },
-        );
-        icons::draw(
-            p,
-            &icons::builtin(Builtin::Folder),
-            caption.left + 2,
-            caption.top + 1,
-            16,
-            false,
-        );
         let title = match e.path.last() {
             Some(name) => name.clone(),
             None => volume.map(Volume::label).unwrap_or_default(),
         };
-        let shown = fit(&title, caption.width() - 80);
-        p.text(
-            caption.left + 21,
-            caption.top + 2,
-            &shown,
-            if active { sys_color(9) } else { sys_color(19) },
-            true,
-        );
-        user::caption_button(p, Self::close_rect(e), 0);
-        user::caption_button(
+        Self::paint_frame(
             p,
-            Self::max_rect(e),
-            if e.restore.is_some() { 3 } else { 1 },
+            r,
+            Self::caption_rect(e),
+            &title,
+            Some(&icons::builtin(Builtin::Folder)),
+            active,
+            &[
+                (Self::close_rect(e), theme::GLYPH_CLOSE),
+                (
+                    Self::max_rect(e),
+                    if e.restore.is_some() {
+                        theme::GLYPH_RESTORE
+                    } else {
+                        theme::GLYPH_MAXIMIZE
+                    },
+                ),
+                (Self::min_rect(e), theme::GLYPH_MINIMIZE),
+            ],
         );
-        user::caption_button(p, Self::min_rect(e), 2);
         // Menu bar.
         let hot_bar = match self.menu.as_ref().map(|m| m.owner) {
             Some(MenuOwner::Bar(index)) => Some(index),
@@ -2454,36 +2585,33 @@ impl Shell {
         };
         for (index, (rect, label)) in self.bar_rects().iter().zip(BAR_MENUS).enumerate() {
             if hot_bar == Some(index) {
-                p.fill(*rect, sys_color(13));
-                p.mnemonic_text(rect.left + 6, rect.top + 2, &crate::win32::unicode::string_to_ansi(label), sys_color(14));
-            } else {
-                p.mnemonic_text(rect.left + 6, rect.top + 2, &crate::win32::unicode::string_to_ansi(label), sys_color(7));
+                theme::rounded(p, *rect, 3, theme::MENU_HOT);
             }
+            p.mnemonic_text(
+                rect.left + 6,
+                rect.top + 2,
+                &crate::win32::unicode::string_to_ansi(label),
+                theme::TEXT,
+            );
         }
-        let toolbar_top = r.top + 3 + CAPTION + MENU_BAR;
-        p.hline(r.left + 3, r.right - 3, toolbar_top, sys_color(16));
-        p.hline(r.left + 3, r.right - 3, toolbar_top + 1, sys_color(20));
         // Up button and address box.
         let up = Self::up_rect(e);
         let can_go_up = !e.path.is_empty();
-        p.raised_button(up);
-        icons::draw(
-            p,
-            &icons::builtin(Builtin::Folder),
-            up.left + 4,
-            up.top + 3,
-            16,
-            false,
-        );
-        let arrow = if can_go_up { 0x000000 } else { 0x808080 };
-        for i in 0..4 {
-            p.hline(up.left + 13 - i, up.left + 14 + i, up.top + 6 + i, arrow);
+        theme::rounded(p, up, 3, theme::RAISED);
+        let arrow = if can_go_up {
+            theme::TEXT
+        } else {
+            theme::TEXT_DISABLED
+        };
+        let (ax, ay) = (up.left + up.width() / 2, up.top + 6);
+        for i in 0..5 {
+            p.pixel(ax - i, ay + i, arrow);
+            p.pixel(ax + i, ay + i, arrow);
         }
-        p.vline(up.left + 13, up.top + 9, up.top + 14, arrow);
-        p.text(r.left + 40, up.top + 4, b"Address", sys_color(18), false);
+        p.vline(ax, ay, ay + 11, arrow);
+        p.text(r.left + 40, up.top + 4, b"Address", theme::TEXT_DIM, false);
         let address = Self::address_rect(e);
-        p.fill(address, 0xFFFFFF);
-        p.sunken(address);
+        theme::rounded_box(p, address, 3, theme::WELL, theme::BORDER);
         let address_text = volume.map(|v| v.guest_path(&e.path)).unwrap_or_default();
         with_clip(p, address.inflate(-3, -2), |p| {
             icons::draw(
@@ -2493,23 +2621,23 @@ impl Shell {
                 } else {
                     Builtin::Folder
                 }),
-                address.left + 3,
+                address.left + 4,
                 address.top + 2,
                 16,
                 false,
             );
             p.text(
-                address.left + 22,
+                address.left + 24,
                 address.top + 4,
                 &bytes(&address_text),
-                0x000000,
+                theme::TEXT,
                 false,
             );
         });
         // List view.
         let list = Self::list_rect(e);
-        p.fill(list, 0xFFFFFF);
-        p.sunken(list);
+        p.fill(list, theme::WELL);
+        p.hline(list.left, list.right, list.top, theme::BORDER);
         let inner = list.inflate(-2, -2);
         let rows = self.rows_rect(e);
         let name_width = self.name_width(e);
@@ -2520,18 +2648,19 @@ impl Shell {
             ("Type", rows.left + name_width + 80, rows.right),
         ];
         with_clip(p, inner, |p| {
-            for (label, left, right) in columns {
-                let cell = Rect::new(left, header.top, right, header.bottom);
-                p.fill(cell, sys_color(15));
-                p.raised_button(cell);
+            for (index, (label, left, _right)) in columns.into_iter().enumerate() {
+                if index > 0 {
+                    p.vline(left, header.top + 3, header.bottom - 3, theme::BORDER);
+                }
                 p.text(
-                    left + 5,
+                    left + 6,
                     header.top + 2,
                     &crate::win32::unicode::string_to_ansi(label),
-                    sys_color(18),
+                    theme::TEXT_DIM,
                     false,
                 );
             }
+            p.hline(header.left, header.right, header.bottom - 1, theme::BORDER);
         });
         with_clip(p, rows, |p| {
             for (row, index) in (e.scroll..e.entries.len()).enumerate() {
@@ -2540,62 +2669,50 @@ impl Shell {
                 if top >= rows.bottom {
                     break;
                 }
-                let path = join(&e.path, &entry.name);
-                let (icon, overlay) = self.icon_for(&path, entry.is_dir, 16, 0);
-                icons::draw(p, &icon, rows.left + 2, top, 16, false);
-                if overlay {
-                    icons::draw_shortcut_overlay(p, rows.left + 2, top, 16);
-                }
                 let renaming = self
                     .rename
                     .as_ref()
                     .is_some_and(|r| r.place == Place::Explorer && r.index == index);
                 let selected = e.selected == Some(index);
+                if selected {
+                    // The whole row is selected.
+                    theme::rounded(
+                        p,
+                        Rect::new(rows.left, top, rows.right - 2, top + ROW_HEIGHT),
+                        3,
+                        if active {
+                            theme::SELECTION
+                        } else {
+                            theme::SELECTION_INACTIVE
+                        },
+                    );
+                }
+                let path = join(&e.path, &entry.name);
+                let (icon, overlay) = self.icon_for(&path, entry.is_dir, 16, 0);
+                icons::draw(p, &icon, rows.left + 3, top, 16, false);
+                if overlay {
+                    icons::draw_shortcut_overlay(p, rows.left + 3, top, 16);
+                }
                 let name = fit(&entry.name, name_width - 26);
                 if !renaming {
-                    let width = text_width(&name);
-                    let color = if selected && active {
-                        p.fill(
-                            Rect::new(
-                                rows.left + 20,
-                                top + 1,
-                                rows.left + 24 + width,
-                                top + ROW_HEIGHT - 1,
-                            ),
-                            sys_color(13),
-                        );
-                        sys_color(14)
-                    } else {
-                        if selected {
-                            p.fill(
-                                Rect::new(
-                                    rows.left + 20,
-                                    top + 1,
-                                    rows.left + 24 + width,
-                                    top + ROW_HEIGHT - 1,
-                                ),
-                                sys_color(15),
-                            );
-                        }
-                        0x000000
-                    };
-                    p.text(rows.left + 22, top + 2, &name, color, false);
+                    p.text(rows.left + 23, top + 2, &name, theme::TEXT, false);
                 }
+                let dim = if selected { theme::TEXT } else { theme::TEXT_DIM };
                 if !entry.is_dir {
                     let size = bytes(&size_text(entry.size));
                     p.text(
                         rows.left + name_width + 74 - text_width(&size),
                         top + 2,
                         &size,
-                        0x000000,
+                        dim,
                         false,
                     );
                 }
                 p.text(
-                    rows.left + name_width + 85,
+                    rows.left + name_width + 86,
                     top + 2,
                     &fit(&type_name(entry), rows.right - rows.left - name_width - 90),
-                    0x000000,
+                    dim,
                     false,
                 );
             }
@@ -2623,6 +2740,7 @@ impl Shell {
             r.right - 3,
             r.bottom - 3,
         );
+        p.hline(status.left, status.right, status.top, theme::BORDER);
         let left = Rect::new(
             status.left,
             status.top + 2,
@@ -2630,12 +2748,7 @@ impl Shell {
             status.bottom,
         );
         let right = Rect::new(left.right + 2, status.top + 2, status.right, status.bottom);
-        for panel in [left, right] {
-            p.hline(panel.left, panel.right, panel.top, sys_color(16));
-            p.vline(panel.left, panel.top, panel.bottom, sys_color(16));
-            p.hline(panel.left, panel.right, panel.bottom - 1, sys_color(20));
-            p.vline(panel.right - 1, panel.top, panel.bottom, sys_color(20));
-        }
+        p.vline(right.left - 1, right.top + 2, right.bottom - 2, theme::BORDER);
         let (count_text, size) = match e.selected.and_then(|i| e.entries.get(i)) {
             Some(entry) => (
                 "1 object(s) selected".to_string(),
@@ -2657,19 +2770,19 @@ impl Shell {
         };
         with_clip(p, left.inflate(-2, -1), |p| {
             p.text(
-                left.left + 4,
+                left.left + 6,
                 left.top + 2,
                 &bytes(&count_text),
-                0x000000,
+                theme::TEXT_DIM,
                 false,
             );
         });
         with_clip(p, right.inflate(-2, -1), |p| {
             p.text(
-                right.left + 4,
+                right.left + 6,
                 right.top + 2,
                 &bytes(&size),
-                0x000000,
+                theme::TEXT_DIM,
                 false,
             );
         });
@@ -2686,13 +2799,6 @@ impl Shell {
 
     fn paint_tray(&self, p: &mut Painter<'_>) {
         let tray = self.tray_rect();
-        p.edge(
-            tray,
-            sys_color(16),
-            sys_color(15),
-            sys_color(20),
-            sys_color(15),
-        );
         for (index, item) in self.tray.iter().enumerate() {
             let rect = self.tray_icon_rect(index);
             match &item.icon {
@@ -2710,44 +2816,23 @@ impl Shell {
         let (hour, minute, weekday, day, month, year) = local_time();
         self.clock_minute.set(minute);
         let clock = self.clock_rect();
-        let text = format!("{hour:02}:{minute:02}");
-        let width = text_width(&crate::win32::unicode::string_to_ansi(&text));
+        let (time, date) = clock_texts(hour, minute, weekday, day, month);
+        let time = bytes(&time);
+        let date = bytes(&date);
+        let y = clock.top + (clock.height() - 13) / 2;
+        let time_x = clock.right - 8 - text_width(&time);
+        p.text(time_x, y, &time, theme::TEXT, true);
         p.text(
-            clock.left + (clock.width() - width) / 2,
-            clock.top + (clock.height() - 13) / 2,
-            &crate::win32::unicode::string_to_ansi(&text),
-            0x000000,
+            time_x - 10 - text_width(&date),
+            y,
+            &date,
+            theme::TEXT_DIM,
             false,
         );
 
         // Tooltip: the icon's tip, or the date over the clock.
         let tip = match self.hover_target() {
-            Some(usize::MAX) => {
-                const DAYS: [&str; 7] = [
-                    "Sunday",
-                    "Monday",
-                    "Tuesday",
-                    "Wednesday",
-                    "Thursday",
-                    "Friday",
-                    "Saturday",
-                ];
-                const MONTHS: [&str; 12] = [
-                    "January",
-                    "February",
-                    "March",
-                    "April",
-                    "May",
-                    "June",
-                    "July",
-                    "August",
-                    "September",
-                    "October",
-                    "November",
-                    "December",
-                ];
-                format!("{}, {} {day}, {year}", DAYS[weekday], MONTHS[month])
-            }
+            Some(usize::MAX) => long_date(weekday, day, month, year),
             Some(index) => self
                 .tray
                 .get(index)
@@ -2757,12 +2842,11 @@ impl Shell {
         };
         if let (false, Some((x, _))) = (tip.is_empty(), self.hover) {
             let text = bytes(&tip);
-            let width = text_width(&text) + 8;
+            let width = text_width(&text) + 16;
             let left = (x - width / 2).clamp(2, self.screen.0 - width - 2);
-            let rect = Rect::sized(left, tray.top - 24, width, 19);
-            p.fill(rect, sys_color(24));
-            p.edge(rect, 0x000000, sys_color(24), 0x000000, sys_color(24));
-            p.text(rect.left + 4, rect.top + 3, &text, sys_color(23), false);
+            let rect = Rect::sized(left, tray.top - 30, width, 23);
+            theme::rounded_box(p, rect, 4, sys_color(24), theme::BORDER);
+            p.text(rect.left + 8, rect.top + 5, &text, sys_color(23), false);
         }
     }
 
@@ -2770,40 +2854,27 @@ impl Shell {
         let top = self.screen.1 - TASKBAR_HEIGHT;
         p.fill(
             Rect::new(0, top, self.screen.0, self.screen.1),
-            sys_color(15),
+            theme::TASKBAR,
         );
-        p.hline(0, self.screen.0, top, sys_color(22));
-        p.hline(0, self.screen.0, top + 1, sys_color(20));
+        p.hline(0, self.screen.0, top, theme::TASKBAR_EDGE);
+        // The Menu button: four squares and its name.
         let start = self.start_rect();
-        let pressed = self
+        let open = self
             .menu
             .as_ref()
             .is_some_and(|m| m.owner == MenuOwner::Start);
-        if pressed {
-            p.edge(
-                start,
-                sys_color(21),
-                sys_color(16),
-                sys_color(20),
-                sys_color(22),
-            );
-        } else {
-            p.raised_button(start);
+        if open {
+            theme::rounded(p, start, 4, theme::TASKBAR_ACTIVE);
         }
-        let shift = i32::from(pressed);
-        icons::draw(
-            p,
-            &icons::builtin(Builtin::Program),
-            start.left + 4 + shift,
-            start.top + 3 + shift,
-            16,
-            false,
-        );
+        let (gx, gy) = (start.left + 9, start.top + start.height() / 2 - 5);
+        for (dx, dy) in [(0, 0), (6, 0), (0, 6), (6, 6)] {
+            p.fill(Rect::sized(gx + dx, gy + dy, 5, 5), theme::ACCENT);
+        }
         p.text(
-            start.left + 23 + shift,
-            start.top + 4 + shift,
-            b"Start",
-            0x000000,
+            start.left + 28,
+            start.top + (start.height() - 13) / 2,
+            b"Menu",
+            theme::TEXT,
             true,
         );
 
@@ -2832,49 +2903,45 @@ impl Shell {
                 program,
             ));
         }
+        // Each program has a window in use of its own; only the front one
+        // (the last) is the window in use on the screen.
+        if let Some(front) = buttons.iter().rposition(|(_, active, _)| *active) {
+            for (index, button) in buttons.iter_mut().enumerate() {
+                button.1 &= index == front;
+            }
+        }
         for ((label, active, icon), rect) in buttons.iter().zip(self.task_rects(buttons.len())) {
             if *active {
-                // Pressed, with the dithered face Win95 uses for the active task.
-                for y in rect.top..rect.bottom {
-                    for x in rect.left..rect.right {
-                        p.pixel(
-                            x,
-                            y,
-                            if (x + y) % 2 == 0 {
-                                0xFFFFFF
-                            } else {
-                                sys_color(15)
-                            },
-                        );
-                    }
-                }
-                p.edge(
-                    rect,
-                    sys_color(21),
-                    sys_color(16),
-                    sys_color(20),
-                    sys_color(22),
+                theme::rounded(p, rect, 4, theme::TASKBAR_ACTIVE);
+                // The window in use: an accent line under its button.
+                let mid = rect.left + rect.width() / 2;
+                p.fill(
+                    Rect::new(mid - 8, rect.bottom - 2, mid + 8, rect.bottom),
+                    theme::ACCENT,
                 );
             } else {
-                p.fill(rect, sys_color(15));
-                p.raised_button(rect);
+                // Running, not in use: a short grey line.
+                let mid = rect.left + rect.width() / 2;
+                p.fill(
+                    Rect::new(mid - 3, rect.bottom - 2, mid + 3, rect.bottom),
+                    theme::TEXT_DISABLED,
+                );
             }
-            let shift = i32::from(*active);
             icons::draw(
                 p,
                 icon,
-                rect.left + 4 + shift,
-                rect.top + 3 + shift,
+                rect.left + 7,
+                rect.top + (rect.height() - 16) / 2,
                 16,
                 false,
             );
-            with_clip(p, rect.inflate(-3, -2), |p| {
+            with_clip(p, rect.inflate(-3, 0), |p| {
                 p.text(
-                    rect.left + 23 + shift,
-                    rect.top + 4 + shift,
-                    &fit(label, rect.width() - 28),
-                    0x000000,
-                    *active,
+                    rect.left + 29,
+                    rect.top + (rect.height() - 13) / 2,
+                    &fit(label, rect.width() - 36),
+                    if *active { theme::TEXT } else { theme::TEXT_DIM },
+                    false,
                 );
             });
         }
@@ -2893,26 +2960,24 @@ impl Shell {
 
     fn paint_dialog(&self, p: &mut Painter<'_>, dialog: &Dialog) {
         let r = dialog.rect;
-        p.fill(r, sys_color(15));
-        p.raised(r);
-        let caption = Rect::new(r.left + 3, r.top + 3, r.right - 3, r.top + 3 + CAPTION - 1);
-        p.fill(caption, sys_color(2));
-        p.text(
-            caption.left + 4,
-            caption.top + 2,
-            &bytes(&dialog.title),
-            sys_color(9),
+        let caption = Rect::new(r.left + 3, r.top + 3, r.right - 3, r.top + 3 + CAPTION);
+        Self::paint_frame(
+            p,
+            r,
+            caption,
+            &dialog.title,
+            None,
             true,
+            &[(Self::dialog_close_rect(dialog), theme::GLYPH_CLOSE)],
         );
-        user::caption_button(p, Rect::sized(r.right - 21, r.top + 5, 16, 14), 0);
         let mut y = r.top + 3 + CAPTION + 14;
         for line in &dialog.lines {
-            p.text(r.left + 16, y, &bytes(line), 0x000000, false);
+            p.text(r.left + 16, y, &bytes(line), theme::TEXT, false);
             y += 15;
         }
         if let DialogKind::Run(edit) = &dialog.kind {
             let rect = Self::dialog_edit_rect(dialog);
-            p.mnemonic_text(r.left + 16, rect.top + 4, b"&Open:", 0x000000);
+            p.mnemonic_text(r.left + 16, rect.top + 4, b"&Open:", theme::TEXT);
             paint_edit_box(p, rect, edit, false);
         }
         for (index, (button, rect)) in Self::dialog_buttons(dialog).into_iter().enumerate() {
@@ -2922,47 +2987,86 @@ impl Shell {
                 DialogButton::Yes => b"&Yes",
                 DialogButton::No => b"&No",
             };
-            p.fill(rect, sys_color(15));
-            if index == 0 {
-                // The default button has a black outer frame.
-                p.edge(rect, 0x000000, 0x000000, 0x000000, 0x000000);
-                p.raised_button(rect.inflate(-1, -1));
+            // The default button is the accent; the others are quiet.
+            let (fill, text) = if index == 0 {
+                (theme::ACCENT_STRONG, 0xFFFFFF)
             } else {
-                p.raised_button(rect);
+                (theme::RAISED, theme::TEXT)
+            };
+            if index == 0 {
+                theme::rounded(p, rect, 4, fill);
+            } else {
+                theme::rounded_box(p, rect, 4, fill, theme::BORDER);
             }
             let width = text_width(label);
             p.mnemonic_text(
                 rect.left + (rect.width() - width) / 2,
                 rect.top + 5,
                 label,
-                0x000000,
+                text,
             );
         }
     }
 }
 
-/// A white text box with a caret; selected text is highlighted.
+/// The clock's texts: the time, and the short date beside it.
+fn clock_texts(hour: i32, minute: i32, weekday: usize, day: i32, month: usize) -> (String, String) {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    (
+        format!("{hour:02}:{minute:02}"),
+        format!("{} {day} {}", DAYS[weekday % 7], MONTHS[month % 12]),
+    )
+}
+
+/// The date in full, for the clock's tooltip.
+fn long_date(weekday: usize, day: i32, month: usize, year: i32) -> String {
+    const DAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    format!("{}, {} {day}, {year}", DAYS[weekday % 7], MONTHS[month % 12])
+}
+
+/// A dark text box with a caret; selected text is highlighted.
 fn paint_edit_box(p: &mut Painter<'_>, rect: Rect, edit: &Edit, border: bool) {
-    p.fill(rect, 0xFFFFFF);
-    if border {
-        p.edge(rect, 0x000000, 0xFFFFFF, 0x000000, 0xFFFFFF);
-    } else {
-        p.sunken(rect);
-    }
+    let radius = if border { 2 } else { 3 };
+    theme::rounded_box(p, rect, radius, theme::WELL, theme::ACCENT);
     let text = bytes(&edit.text);
-    let x = rect.left + 4;
+    let x = rect.left + 5;
     let y = rect.top + (rect.height() - 13) / 2;
     with_clip(p, rect.inflate(-2, -1), |p| {
         if edit.all && !text.is_empty() {
             p.fill(
                 Rect::new(x - 1, y, x + text_width(&text) + 1, y + 13),
-                sys_color(13),
+                theme::SELECTION,
             );
-            p.text(x, y, &text, sys_color(14), false);
+            p.text(x, y, &text, theme::TEXT, false);
         } else {
-            p.text(x, y, &text, 0x000000, false);
+            p.text(x, y, &text, theme::TEXT, false);
             let caret = x + text_width(&bytes(&edit.text[..edit.caret]));
-            p.vline(caret, y - 1, y + 14, 0x000000);
+            p.vline(caret, y - 1, y + 14, theme::TEXT);
         }
     });
 }

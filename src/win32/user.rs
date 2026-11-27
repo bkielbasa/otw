@@ -507,13 +507,14 @@ pub fn caption_buttons(window: &GuestWindow) -> (Option<Rect>, Option<Rect>, Opt
     }
     let frame = frame_width(window.style, window.ex_style);
     let tool = window.ex_style & WS_EX_TOOLWINDOW != 0;
-    let (bw, bh) = if tool { (13, 11) } else { (16, 14) };
-    let top = frame + 2;
-    let close = Rect::sized(window.width - frame - 2 - bw, top, bw, bh);
+    // Flat buttons as tall as the caption, side by side at its right.
+    let (bw, bh) = if tool { (18, 14) } else { (26, CAPTION_HEIGHT - 1) };
+    let top = frame;
+    let close = Rect::sized(window.width - frame - bw, top, bw, bh);
     if tool || window.style & (WS_MAXIMIZEBOX | WS_MINIMIZEBOX) == 0 {
         return (Some(close), None, None);
     }
-    let max = Rect::sized(close.left - 2 - bw, top, bw, bh);
+    let max = Rect::sized(close.left - bw, top, bw, bh);
     let min = Rect::sized(max.left - bw, top, bw, bh);
     (Some(close), Some(max), Some(min))
 }
@@ -684,34 +685,25 @@ impl Painter<'_> {
         self.vline(right - 2, top + 1, bottom - 1, br_inner);
     }
 
+    /// A flat one-pixel outline in `color` just inside `rect`.
+    pub fn outline(&mut self, rect: Rect, color: Rgb) {
+        crate::win32::theme::outline(self, rect, color);
+    }
+
+    /// The edge of a panel. Flat: a one-pixel outline.
     pub fn raised(&mut self, rect: Rect) {
-        self.edge(
-            rect,
-            sys_color(22),
-            sys_color(20),
-            sys_color(21),
-            sys_color(16),
-        );
+        self.outline(rect, sys_color(16));
     }
 
+    /// The edge of a button. Flat: a one-pixel outline.
     pub fn raised_button(&mut self, rect: Rect) {
-        self.edge(
-            rect,
-            sys_color(20),
-            sys_color(22),
-            sys_color(21),
-            sys_color(16),
-        );
+        self.outline(rect, sys_color(16));
     }
 
+    /// The edge of a field. Flat: a one-pixel outline, darker than a
+    /// button's.
     pub fn sunken(&mut self, rect: Rect) {
-        self.edge(
-            rect,
-            sys_color(16),
-            sys_color(21),
-            sys_color(20),
-            sys_color(22),
-        );
+        self.outline(rect, 0x7A7A7A);
     }
 
     pub fn text(&mut self, x: i32, y: i32, text: &[u8], color: Rgb, bold: bool) -> i32 {
@@ -745,10 +737,9 @@ impl Painter<'_> {
         pen - x
     }
 
-    /// Embossed (disabled) text, as Win95 draws greyed menu items.
+    /// Disabled (greyed) text: flat, in the grey-text colour.
     pub fn disabled_text(&mut self, x: i32, y: i32, text: &[u8]) {
-        self.mnemonic_text(x + 1, y + 1, text, sys_color(20));
-        self.mnemonic_text(x, y, text, sys_color(16));
+        self.mnemonic_text(x, y, text, sys_color(17));
     }
 }
 
@@ -853,14 +844,16 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
         let frame = frame_width(window.style, window.ex_style);
         let mut y = 0;
         if frame >= 3 {
-            p.raised(Rect::new(0, 0, w, h));
-            for inset in 2..frame {
-                let rect = Rect::new(inset, inset, w - inset, h - inset);
-                p.hline(rect.left, rect.right, rect.top, sys_color(15));
-                p.hline(rect.left, rect.right, rect.bottom - 1, sys_color(15));
-                p.vline(rect.left, rect.top, rect.bottom, sys_color(15));
-                p.vline(rect.right - 1, rect.top, rect.bottom, sys_color(15));
+            // Flat and dark: a one-pixel outline (the accent while the
+            // window is in use), the rest of the frame the caption's colour.
+            let fill = crate::win32::theme::caption(active);
+            for inset in 1..frame {
+                p.outline(Rect::new(inset, inset, w - inset, h - inset), fill);
             }
+            p.outline(
+                Rect::new(0, 0, w, h),
+                crate::win32::theme::frame_outline(active),
+            );
             y = frame;
         } else if frame == 1 {
             p.hline(0, w, 0, sys_color(6));
@@ -872,9 +865,8 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
         if window.style & WS_CAPTION == WS_CAPTION {
             let tool = window.ex_style & WS_EX_TOOLWINDOW != 0;
             let caption = if tool { 15 } else { CAPTION_HEIGHT };
-            let bar = Rect::new(frame, y, w - frame, y + caption - 1);
+            let bar = Rect::new(frame, y, w - frame, y + caption);
             p.fill(bar, if active { sys_color(2) } else { sys_color(3) });
-            p.hline(frame, w - frame, y + caption - 1, sys_color(15));
             let text_color = if active { sys_color(9) } else { sys_color(19) };
             let mut text_x = frame + 3;
             if window.style & WS_SYSMENU != 0 && !tool {
@@ -899,7 +891,7 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
                 .map(|r| r.left - 2)
                 .unwrap_or(w - frame);
             let title = &crate::win32::unicode::string_to_ansi(&window.title)[..];
-            let face = gfx::pick_face(13, true);
+            let face = gfx::pick_face(13, false);
             let mut shown = title.to_vec();
             while !shown.is_empty() && text_x + face.text_width(&shown) > limit {
                 shown.pop();
@@ -910,10 +902,10 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
             }
             p.text(
                 text_x,
-                y + (caption - 1 - face.height) / 2,
+                y + (caption - face.height) / 2,
                 &shown,
                 text_color,
-                true,
+                false,
             );
             for (rect, glyph) in [
                 (close, 0u8),
@@ -921,7 +913,7 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
                 (min, 2),
             ] {
                 if let Some(rect) = rect {
-                    caption_button(p, rect, glyph);
+                    crate::win32::theme::caption_button(p, rect, glyph, active, false);
                 }
             }
             y += caption;
@@ -941,21 +933,39 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
                 let item_rect = Rect::new(x - 6, y + 1, x - 6 + width, y + MENU_HEIGHT - 1);
                 let disabled = item.flags & 0x3 != 0;
                 if hot == Some(index as i32) {
-                    p.fill(item_rect, sys_color(13));
-                    p.mnemonic_text(x, y + 3, &label, sys_color(14));
+                    crate::win32::theme::rounded(p, item_rect, 2, crate::win32::theme::MENU_HOT);
+                    p.mnemonic_text(x, y + 3, &label, sys_color(7));
                 } else if disabled {
-                    p.disabled_text(x, y + 3, &label);
+                    p.mnemonic_text(x, y + 3, &label, crate::win32::theme::TEXT_DISABLED);
                 } else {
                     p.mnemonic_text(x, y + 3, &label, sys_color(7));
                 }
                 x += width;
             }
-            p.hline(frame, w - frame, y + MENU_HEIGHT - 1, sys_color(15));
+            p.hline(frame, w - frame, y + MENU_HEIGHT - 1, crate::win32::theme::BORDER);
             y += MENU_HEIGHT;
         }
         let edge_rect = Rect::new(frame, y, w - frame, h - frame);
         if window.ex_style & WS_EX_CLIENTEDGE != 0 {
-            p.sunken(edge_rect);
+            // Two pixels: a top-level window's in its frame's colour; a
+            // control's a grey line and its own (window) colour inside.
+            let (outer, inner) = if window.style & WS_CHILD == 0 {
+                let fill = crate::win32::theme::caption(active);
+                (fill, fill)
+            } else {
+                (0x7A7A7A, sys_color(5))
+            };
+            p.outline(edge_rect, outer);
+            let inside = edge_rect.inflate(-1, -1);
+            p.outline(inside, inner);
+            // Scroll bars run up to the grey line.
+            let style = scroll_style(&window);
+            if style & WS_VSCROLL != 0 {
+                p.vline(inside.right - 1, inside.top, inside.bottom, crate::win32::theme::SCROLL_TRACK);
+            }
+            if style & WS_HSCROLL != 0 {
+                p.hline(inside.left, inside.right, inside.bottom - 1, crate::win32::theme::SCROLL_TRACK);
+            }
         } else if window.ex_style & WS_EX_STATICEDGE != 0 {
             p.hline(
                 edge_rect.left,
@@ -997,73 +1007,26 @@ pub fn paint_nc(shared: &mut SharedState, hwnd: u32) {
         if style & WS_VSCROLL != 0 && style & WS_HSCROLL != 0 {
             p.fill(
                 Rect::new(w - r, h - b, w - r + SCROLL_SIZE, h - b + SCROLL_SIZE),
-                sys_color(15),
+                crate::win32::theme::SCROLL_TRACK,
             );
         }
     });
 }
 
 fn draw_small_icon(p: &mut Painter<'_>, x: i32, y: i32) {
-    // A generic application glyph: a white window with a blue title bar.
-    p.fill(Rect::sized(x + 1, y + 2, 14, 12), 0xFFFFFF);
-    p.fill(Rect::sized(x + 1, y + 2, 14, 3), 0x000080);
-    p.hline(x + 1, x + 15, y + 14, 0x000000);
-    p.vline(x + 15, y + 2, y + 15, 0x000000);
+    // A generic application glyph: a window outline with an accent bar.
+    let window = Rect::sized(x + 2, y + 3, 12, 10);
+    p.outline(window, crate::win32::theme::TEXT_DIM);
+    p.fill(
+        Rect::sized(window.left, window.top, window.width(), 3),
+        crate::win32::theme::ACCENT,
+    );
 }
 
-/// Draw a caption button. Glyphs: 0 close, 1 maximize, 2 minimize, 3 restore.
+/// Draw a caption button of an active window. Glyphs: 0 close,
+/// 1 maximize, 2 minimize, 3 restore.
 pub fn caption_button(p: &mut Painter<'_>, rect: Rect, glyph: u8) {
-    p.fill(rect, sys_color(15));
-    p.raised_button(rect);
-    let cx = rect.left + rect.width() / 2;
-    let cy = rect.top + rect.height() / 2;
-    let black = 0x000000;
-    match glyph {
-        0 => {
-            for i in 0..7 {
-                p.fill(Rect::sized(cx - 4 + i, cy - 4 + i, 2, 1), black);
-                p.fill(Rect::sized(cx + 1 - i, cy - 4 + i, 2, 1), black);
-            }
-        }
-        1 => {
-            let r = Rect::new(cx - 5, cy - 5, cx + 4, cy + 3);
-            p.fill(Rect::new(r.left, r.top, r.right, r.top + 2), black);
-            p.vline(r.left, r.top, r.bottom, black);
-            p.vline(r.right - 1, r.top, r.bottom, black);
-            p.hline(r.left, r.right, r.bottom - 1, black);
-        }
-        2 => p.fill(Rect::new(cx - 4, cy + 1, cx + 2, cy + 3), black),
-        _ => {
-            let back = Rect::new(cx - 3, cy - 5, cx + 4, cy);
-            p.fill(
-                Rect::new(back.left, back.top, back.right, back.top + 2),
-                black,
-            );
-            p.vline(back.right - 1, back.top, back.bottom, black);
-            let front = Rect::new(cx - 5, cy - 2, cx + 2, cy + 4);
-            p.fill(front, sys_color(15));
-            p.fill(
-                Rect::new(front.left, front.top, front.right, front.top + 2),
-                black,
-            );
-            p.vline(front.left, front.top, front.bottom, black);
-            p.vline(front.right - 1, front.top, front.bottom, black);
-            p.hline(front.left, front.right, front.bottom - 1, black);
-        }
-    }
-}
-
-fn arrow(p: &mut Painter<'_>, rect: Rect, direction: u8, color: Rgb) {
-    let cx = rect.left + rect.width() / 2;
-    let cy = rect.top + rect.height() / 2;
-    for i in 0..4 {
-        match direction {
-            0 => p.hline(cx - i, cx + i + 1, cy - 2 + i, color), // up
-            1 => p.hline(cx - 3 + i, cx + 4 - i, cy - 1 + i, color), // down
-            2 => p.vline(cx - 2 + i, cy - i, cy + i + 1, color), // left
-            _ => p.vline(cx - 1 + i, cy - 3 + i, cy + 4 - i, color), // right
-        }
-    }
+    crate::win32::theme::caption_button(p, rect, glyph, true, false);
 }
 
 /// Scroll bar geometry: (arrow size, thumb start, thumb size) along the axis.
@@ -1100,54 +1063,14 @@ pub fn draw_scroll_bar(
         rect.width()
     };
     let arrow_size = SCROLL_SIZE.min(length / 2);
-    // Track: Win95 dithers white and button face.
-    for y in rect.top..rect.bottom {
-        for x in rect.left..rect.right {
-            p.pixel(
-                x,
-                y,
-                if (x + y) % 2 == 0 {
-                    sys_color(20)
-                } else {
-                    sys_color(15)
-                },
-            );
-        }
-    }
-    let (first, second) = if vertical {
-        (
-            Rect::sized(rect.left, rect.top, rect.width(), arrow_size),
-            Rect::new(rect.left, rect.bottom - arrow_size, rect.right, rect.bottom),
-        )
-    } else {
-        (
-            Rect::sized(rect.left, rect.top, arrow_size, rect.height()),
-            Rect::new(rect.right - arrow_size, rect.top, rect.right, rect.bottom),
-        )
-    };
-    let enabled = max > min;
-    for (button, direction) in [
-        (first, if vertical { 0 } else { 2 }),
-        (second, if vertical { 1 } else { 3 }),
-    ] {
-        p.fill(button, sys_color(15));
-        p.raised_button(button);
-        arrow(
-            p,
-            button,
-            direction,
-            if enabled { 0 } else { sys_color(16) },
-        );
-    }
-    if let Some((start, size)) = scroll_thumb(length, min, max, pos, page) {
-        let thumb = if vertical {
-            Rect::sized(rect.left, rect.top + start, rect.width(), size)
-        } else {
-            Rect::sized(rect.left + start, rect.top, size, rect.height())
-        };
-        p.fill(thumb, sys_color(15));
-        p.raised_button(thumb);
-    }
+    crate::win32::theme::scroll_bar(
+        p,
+        rect,
+        vertical,
+        arrow_size,
+        scroll_thumb(length, min, max, pos, page),
+        max > min,
+    );
 }
 
 // ── Messaging ────────────────────────────────────────────────────────────
@@ -2319,6 +2242,10 @@ pub fn deactivate_program<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mu
     let mut shared = ctx.shared.borrow_mut();
     shared.gui.focus_hwnd = 0;
     shared.gui.active_hwnd = 0;
+    // Its frame is drawn again as inactive.
+    if let Some(window) = shared.gui.window_mut(previous) {
+        window.nc_dirty = true;
+    }
     shared.gui.dirty = true;
 }
 
@@ -3971,10 +3898,7 @@ fn track_caption_button<M: GuestMemory + ?Sized>(
                 }
                 _ => 2,
             };
-            caption_button(p, local, glyph);
-            if pressed {
-                p.sunken(local);
-            }
+            crate::win32::theme::caption_button(p, local, glyph, true, pressed);
         });
     };
     draw(ctx, true);

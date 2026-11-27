@@ -13,7 +13,7 @@ make test       # build and run the tests
 make desktop    # start the desktop
 ```
 
-The desktop's drive C: is `~/.otw/C` (set `OTW_DRIVE_C` to change it). Put programs there and start them from the Start menu or the desktop.
+The desktop's drive C: is `~/.otw/C` (set `OTW_DRIVE_C` to change it). Put programs there and start them from the desktop or the Menu button at the left of the taskbar (the logo key opens it; type to search programs and press Enter).
 
 Run a single program:
 
