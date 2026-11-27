@@ -54,6 +54,7 @@ const WSAESHUTDOWN: u32 = 10057;
 const WSAETIMEDOUT: u32 = 10060;
 const WSAECONNREFUSED: u32 = 10061;
 const WSAHOST_NOT_FOUND: u32 = 11001;
+const WSATYPE_NOT_FOUND: u32 = 10109;
 const WSAVERNOTSUPPORTED: u32 = 10092;
 const WSANOTINITIALISED: u32 = 10093;
 
@@ -348,6 +349,10 @@ pub fn arg_count(name: &str) -> Option<usize> {
         | "getprotobynumber"
         | "WSACancelAsyncRequest"
         | "WSASetBlockingHook" => 1,
+        "freeaddrinfo" | "FreeAddrInfoW" => 1,
+        "getaddrinfo" | "GetAddrInfoW" => 4,
+        "WSASocketW" | "WSASocketA" => 6,
+        "WSASend" | "WSARecv" => 7,
         "listen" | "shutdown" | "getservbyname" | "getservbyport" | "WSAStartup"
         | "gethostname" | "__WSAFDIsSet" => 2,
         "socket" | "connect" | "bind" | "accept" | "ioctlsocket" | "gethostbyaddr"
@@ -382,14 +387,24 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
 
     let outcome = match name.as_str() {
         "WSAStartup" => {
+            // A version (low byte major, high byte minor) of 1.1 is Windows
+            // 95's Winsock; one of 2 or more gets 2.2 at most, as Windows
+            // does. The error comes back as the value, not SOCKET_ERROR.
             let requested = (args[0] & 0xffff) as u16;
-            if requested == 0 || requested > 0x0101 {
-                let _ = write_wsadata(memory, args[1], 0);
-                fail(&mut shared.winsock, WSAVERNOTSUPPORTED, count)
+            let (major, minor) = (requested & 0xff, requested >> 8);
+            if major == 0 {
+                let _ = write_wsadata(memory, args[1], 0, 0x0101);
+                shared.winsock.last_error = WSAVERNOTSUPPORTED;
+                ApiOutcome::new(WSAVERNOTSUPPORTED, count)
             } else {
+                let (version, high) = if major >= 2 {
+                    (if (major, minor) >= (2, 2) { 0x0202 } else { requested }, 0x0202)
+                } else {
+                    (0x0101, 0x0101)
+                };
                 shared.winsock.started = true;
-                shared.winsock.version = requested;
-                let _ = write_wsadata(memory, args[1], requested);
+                shared.winsock.version = version;
+                let _ = write_wsadata(memory, args[1], version, high);
                 ok(&mut shared.winsock, 0, count)
             }
         }
@@ -417,7 +432,10 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         }
         "WSACancelAsyncRequest" => ApiOutcome::new(0, count),
 
-        "socket" => {
+        // WSASocketA/W(af, type, protocol, protocol info, group, flags): a
+        // socket as `socket` makes (overlapped and inheritance flags do not
+        // matter here).
+        "socket" | "WSASocketW" | "WSASocketA" => {
             if !shared.winsock.started {
                 return Some(fail(&mut shared.winsock, WSANOTINITIALISED, count));
             }
@@ -469,6 +487,47 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
         "connect" => connect(&mut shared, memory, args, count),
         "accept" => accept(&mut shared, memory, args, count),
         "send" => send(&mut shared, memory, args, count),
+        // WSASend/WSARecv(socket, WSABUF[], count, &bytes, flags (WSARecv:
+        // &flags), overlapped, routine): `send` of the buffers together,
+        // `recv` into the first, at once (no overlapped I/O).
+        "WSASend" | "WSARecv" => {
+            let x64 = memory.ptr_size() == 8;
+            let stride = if x64 { 16 } else { 8 };
+            let buffers: Vec<(u32, u32)> = (0..args[2].min(64))
+                .map(|i| {
+                    let at = args[1] + i * stride;
+                    let length = memory.read_u32(at).unwrap_or(0);
+                    let va = memory.read_ptr(at + if x64 { 8 } else { 4 }).unwrap_or(0) as u32;
+                    (va, length)
+                })
+                .collect();
+            let outcome = if name == "WSASend" {
+                let mut bytes = Vec::new();
+                for &(va, length) in &buffers {
+                    bytes.extend(memory.read_bytes(va, length as usize).unwrap_or_default());
+                }
+                let temp = shared.heap.alloc(bytes.len().max(1) as u32).unwrap_or(0);
+                let _ = memory.write_bytes(temp, &bytes);
+                let outcome = send(&mut shared, memory, &[args[0], temp, bytes.len() as u32, args[4]], count);
+                shared.heap.free(temp);
+                outcome
+            } else {
+                let flags = if args[4] != 0 { memory.read_u32(args[4]).unwrap_or(0) } else { 0 };
+                let (va, length) = buffers.first().copied().unwrap_or((0, 0));
+                let outcome = recv(&mut shared, memory, &[args[0], va, length, flags], count);
+                if args[4] != 0 {
+                    let _ = memory.write_u32(args[4], 0);
+                }
+                outcome
+            };
+            if outcome.value == SOCKET_ERROR {
+                return Some(ApiOutcome::new(SOCKET_ERROR, count));
+            }
+            if args[3] != 0 {
+                let _ = memory.write_u32(args[3], outcome.value);
+            }
+            ApiOutcome::new(0, count)
+        }
         "recv" | "WSARecvEx" => recv(&mut shared, memory, args, count),
         "getpeername" => peer_name(&mut shared, memory, args, count, true),
         "getsockname" => peer_name(&mut shared, memory, args, count, false),
@@ -517,6 +576,53 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 let _ = memory.write_u32(args[3], value);
             }
             ok(&mut shared.winsock, 0, count)
+        }
+        // getaddrinfo(node, service, hints, &result), and its UTF-16 twin:
+        // one ADDRINFO per IPv4 address; the error is the value.
+        "getaddrinfo" | "GetAddrInfoW" => {
+            let wide = name == "GetAddrInfoW";
+            let text = |memory: &mut M, va: u32| -> String {
+                if va == 0 {
+                    String::new()
+                } else if wide {
+                    String::from_utf16_lossy(&crate::win32::unicode::read_wstr(memory, va))
+                } else {
+                    String::from_utf8_lossy(&read_cstr_limited(memory, va, 256)).into_owned()
+                }
+            };
+            let (node, service) = (text(memory, args[0]), text(memory, args[1]));
+            let hints = (args[2] != 0).then(|| (0..4).map(|i| memory.read_u32(args[2] + 4 * i).unwrap_or(0)).collect::<Vec<_>>());
+            let (family, socktype, protocol) = hints.map_or((0, 0, 0), |h| (h[1], h[2], h[3]));
+            let Some(port) = addrinfo_port(&service) else {
+                return Some(ApiOutcome::new(WSATYPE_NOT_FOUND, count));
+            };
+            if family != 0 && family != AF_INET as u32 {
+                return Some(ApiOutcome::new(WSAHOST_NOT_FOUND, count));
+            }
+            let addresses = if node.is_empty() { vec![Ipv4Addr::LOCALHOST] } else { resolve_host(&node) };
+            if std::env::var_os("OTW_TRACE_NET").is_some() {
+                eprintln!("[net] {name} {node} {service}: {addresses:?}");
+            }
+            if addresses.is_empty() {
+                shared.winsock.last_error = WSAHOST_NOT_FOUND;
+                return Some(ApiOutcome::new(WSAHOST_NOT_FOUND, count));
+            }
+            let first = build_addrinfo(&mut shared, memory, &addresses, port, socktype, protocol);
+            let _ = memory.write_ptr(args[3], u64::from(first));
+            ApiOutcome::new(0, count)
+        }
+        "freeaddrinfo" | "FreeAddrInfoW" => {
+            let size = memory.ptr_size();
+            let mut info = args[0];
+            for _ in 0..256 {
+                if info == 0 {
+                    break;
+                }
+                let next = memory.read_ptr(info + if size == 8 { 40 } else { 28 }).unwrap_or(0) as u32;
+                shared.heap.free(info);
+                info = next;
+            }
+            ApiOutcome::new(0, count)
         }
         "gethostbyname" => {
             let name = read_cstr_limited(memory, args[0], 256);
@@ -722,7 +828,7 @@ fn read_cstr_limited<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, max: usiz
     }
 }
 
-fn write_wsadata<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, version: u16) -> Option<()> {
+fn write_wsadata<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, version: u16, high: u16) -> Option<()> {
     if va == 0 {
         return None;
     }
@@ -731,7 +837,7 @@ fn write_wsadata<M: GuestMemory + ?Sized>(memory: &mut M, va: u32, version: u16)
     // aligned): 400 bytes. Writing more overruns callers' stack buffers.
     let mut data = vec![0u8; 400];
     data[0..2].copy_from_slice(&version.to_le_bytes());
-    data[2..4].copy_from_slice(&0x0101u16.to_le_bytes());
+    data[2..4].copy_from_slice(&high.to_le_bytes());
     put_cstr(&mut data[4..261], b"WinSock 1.1");
     put_cstr(&mut data[261..390], b"Running");
     data[390..392].copy_from_slice(&256u16.to_le_bytes());
@@ -1538,6 +1644,48 @@ fn resolve_host(name: &str) -> Vec<Ipv4Addr> {
     addresses
 }
 
+/// A getaddrinfo service as a port: none, a number, or a service name.
+fn addrinfo_port(service: &str) -> Option<u16> {
+    if service.is_empty() {
+        return Some(0);
+    }
+    service.parse().ok().or_else(|| service_port(service.as_bytes(), b"tcp").map(|(port, _)| port))
+}
+
+/// A chain of ADDRINFO, one for each address, each with its sockaddr_in
+/// in the same block (ai_flags, family, socktype, protocol, addrlen,
+/// canonname, addr, next: 32 bytes, 48 in a 64-bit process).
+fn build_addrinfo<M: GuestMemory + ?Sized>(
+    shared: &mut SharedState,
+    memory: &mut M,
+    addresses: &[Ipv4Addr],
+    port: u16,
+    socktype: u32,
+    protocol: u32,
+) -> u32 {
+    let x64 = memory.ptr_size() == 8;
+    let (info_size, addrlen_at, addr_at, next_at) = if x64 { (48, 16, 32, 40) } else { (32, 16, 24, 28) };
+    let mut next = 0u32;
+    for address in addresses.iter().rev() {
+        let Some(block) = shared.heap.alloc(info_size + 16) else { break };
+        let mut info = vec![0u8; (info_size + 16) as usize];
+        info[4..8].copy_from_slice(&(AF_INET as u32).to_le_bytes());
+        info[8..12].copy_from_slice(&socktype.to_le_bytes());
+        info[12..16].copy_from_slice(&protocol.to_le_bytes());
+        info[addrlen_at..addrlen_at + 4].copy_from_slice(&16u32.to_le_bytes());
+        let sockaddr = block + info_size;
+        info[addr_at..addr_at + 4].copy_from_slice(&sockaddr.to_le_bytes());
+        info[next_at..next_at + 4].copy_from_slice(&next.to_le_bytes());
+        let at = info_size as usize;
+        info[at..at + 2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        info[at + 2..at + 4].copy_from_slice(&port.to_be_bytes());
+        info[at + 4..at + 8].copy_from_slice(&address.octets());
+        let _ = memory.write_bytes(block, &info);
+        next = block;
+    }
+    next
+}
+
 fn build_hostent<M: GuestMemory + ?Sized>(
     shared: &mut SharedState,
     memory: &mut M,
@@ -1650,6 +1798,38 @@ mod tests {
     }
 
     #[test]
+    fn getaddrinfo_gives_ipv4_addresses() {
+        let ctx = ApiContext::default();
+        let mut memory = TestMemory::default();
+        let _ = memory.write_bytes(0x1000, b"127.0.0.1\0");
+        let _ = memory.write_bytes(0x1100, b"https\0");
+        // hints: flags, AF_INET, SOCK_STREAM, IPPROTO_TCP.
+        for (i, value) in [0u32, 2, 1, 6].into_iter().enumerate() {
+            let _ = memory.write_u32(0x1200 + 4 * i as u32, value);
+        }
+        let outcome = dispatch(&ctx, &mut memory, &ImportName::ByName("getaddrinfo".into()), &[0x1000, 0x1100, 0x1200, 0x1300]).unwrap();
+        assert_eq!(outcome.value, 0);
+        let info = memory.read_u32(0x1300).unwrap();
+        assert_ne!(info, 0);
+        assert_eq!(memory.read_u32(info + 4), Some(2)); // AF_INET
+        assert_eq!(memory.read_u32(info + 8), Some(1)); // SOCK_STREAM
+        assert_eq!(memory.read_u32(info + 16), Some(16)); // ai_addrlen
+        assert_eq!(memory.read_u32(info + 28), Some(0)); // the only one
+        let addr = memory.read_u32(info + 24).unwrap();
+        assert_eq!(memory.read_bytes(addr, 8), Some(vec![2, 0, 1, 187, 127, 0, 0, 1]));
+        let freed = dispatch(&ctx, &mut memory, &ImportName::ByName("freeaddrinfo".into()), &[info]).unwrap();
+        assert_eq!(freed.value, 0);
+        // Sockets as Rust's std makes them.
+        dispatch(&ctx, &mut memory, &ImportName::ByName("WSAStartup".into()), &[0x0202, 0x1400]).unwrap();
+        let socket = dispatch(&ctx, &mut memory, &ImportName::ByName("WSASocketW".into()), &[2, 1, 0, 0, 0, 0x81]).unwrap();
+        assert!(ctx.shared.borrow().winsock.sockets.contains_key(&socket.value));
+        // An unknown service.
+        let _ = memory.write_bytes(0x1100, b"no-such-service\0");
+        let outcome = dispatch(&ctx, &mut memory, &ImportName::ByName("getaddrinfo".into()), &[0x1000, 0x1100, 0x1200, 0x1300]).unwrap();
+        assert_eq!(outcome.value, WSATYPE_NOT_FOUND);
+    }
+
+    #[test]
     fn startup_writes_wsadata_and_byteswap_helpers_work() {
         let mut memory = TestMemory::default();
         let (outcome, error) = call("WSAStartup", &[0x0101, 0x1000], &mut memory);
@@ -1658,10 +1838,60 @@ mod tests {
         assert_eq!(memory.read_bytes(0x1000, 2), Some(vec![1, 1]));
         assert_eq!(memory.read_bytes(0x1002, 2), Some(vec![1, 1]));
 
+        // Winsock 2 asked for (as Rust's std asks): 2.2.
+        let (outcome, _) = call("WSAStartup", &[0x0202, 0x1000], &mut memory);
+        assert_eq!(outcome.value, 0);
+        assert_eq!(memory.read_bytes(0x1000, 4), Some(vec![2, 2, 2, 2]));
+        let (outcome, _) = call("WSAStartup", &[0x0303, 0x1000], &mut memory);
+        assert_eq!(outcome.value, 0);
+        assert_eq!(memory.read_bytes(0x1000, 2), Some(vec![2, 2]));
+        let (outcome, _) = call("WSAStartup", &[0, 0x1000], &mut memory);
+        assert_eq!(outcome.value, WSAVERNOTSUPPORTED);
+
         let (outcome, _) = call("htonl", &[0x0102_0304], &mut memory);
         assert_eq!(outcome.value, 0x0403_0201);
         let (outcome, _) = call("htons", &[0x0102], &mut memory);
         assert_eq!(outcome.value, 0x0201);
+    }
+
+    #[test]
+    fn wsasend_and_wsarecv_move_buffers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 16];
+            let mut got = 0;
+            while got < 8 {
+                got += stream.read(&mut buffer[got..]).unwrap();
+            }
+            stream.write_all(&buffer[..got]).unwrap();
+        });
+        let ctx = ApiContext::default();
+        let mut memory = TestMemory::default();
+        invoke(&ctx, &mut memory, "WSAStartup", &[0x0202, 0x1000]);
+        let address = [2, 0, (port >> 8) as u8, port as u8, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        memory.write_bytes(0x2000, &address);
+        let socket = invoke(&ctx, &mut memory, "WSASocketW", &[2, 1, 0, 0, 0, 0x81]).value;
+        assert_eq!(invoke(&ctx, &mut memory, "connect", &[socket, 0x2000, 16]).value, 0);
+        // Two WSABUFs (32-bit layout: length, pointer).
+        memory.write_bytes(0x3000, b"pingpong");
+        for (at, value) in [(0x4000, 4), (0x4004, 0x3000), (0x4008, 4), (0x400C, 0x3004)] {
+            memory.write_u32(at, value);
+        }
+        assert_eq!(invoke(&ctx, &mut memory, "WSASend", &[socket, 0x4000, 2, 0x4100, 0, 0, 0]).value, 0);
+        assert_eq!(memory.read_u32(0x4100), Some(8));
+        memory.write_u32(0x4200, 16);
+        memory.write_u32(0x4204, 0x5000);
+        let mut got = Vec::new();
+        while got.len() < 8 {
+            assert_eq!(invoke(&ctx, &mut memory, "WSARecv", &[socket, 0x4200, 1, 0x4300, 0x4304, 0, 0]).value, 0);
+            let n = memory.read_u32(0x4300).unwrap() as usize;
+            assert!(n > 0);
+            got.extend(memory.read_bytes(0x5000, n).unwrap());
+        }
+        assert_eq!(got, b"pingpong");
+        server.join().unwrap();
     }
 
     #[test]

@@ -205,6 +205,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         "timeBeginPeriod" | "timeEndPeriod" => 1,
         "timeGetDevCaps" => 2,
         "ProcessPrng" | "SystemFunction036" => 2,
+        "BCryptGenRandom" => 4,
         "SetThreadStackGuarantee" | "EventUnregister" => 1,
         "EventRegister" => 4,
         "EventSetInformation" | "EventWriteTransfer" => 5,
@@ -228,6 +229,42 @@ fn win32(ctx: &ApiContext, memory: &mut dyn GuestMemory, dll: &str, name: &str, 
 
 fn set_error(ctx: &ApiContext, code: u32) {
     ctx.shared.borrow_mut().last_error = code;
+}
+
+/// Random bytes: the host's (/dev/urandom), else on bare metal the CPU's
+/// random number generator (RDRAND) where it has one, mixed with the
+/// time-stamp counter, the clock and a count of calls (SplitMix64): never
+/// the same bytes twice (NSS fails when its source repeats).
+pub(crate) fn fill_random(bytes: &mut [u8], salt: u32) {
+    let from_host = std::fs::File::open("/dev/urandom").ok().and_then(|mut file| {
+        use std::io::Read;
+        file.read_exact(bytes).ok()
+    });
+    if from_host.is_some() {
+        return;
+    }
+    let rdrand = core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0;
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut state = unsafe { core::arch::x86_64::_rdtsc() }
+        ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+        ^ calls.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+        ^ (salt as u64).rotate_left(29);
+    for chunk in bytes.chunks_mut(8) {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state ^ unsafe { core::arch::x86_64::_rdtsc() }.rotate_left(17);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        if rdrand {
+            let mut hardware = 0u64;
+            // SAFETY: the CPU says it has RDRAND.
+            if unsafe { core::arch::x86_64::_rdrand64_step(&mut hardware) } == 1 {
+                z ^= hardware;
+            }
+        }
+        chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
+    }
 }
 
 fn alloc(ctx: &ApiContext, size: u32) -> u32 {
@@ -890,33 +927,18 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             ok(0) // TIME_ZONE_ID_UNKNOWN
         }
         "ProcessPrng" | "SystemFunction036" => {
-            // Random bytes from the host.
             let mut bytes = vec![0u8; arg(1) as usize];
-            let opened = std::fs::File::open("/dev/urandom").ok().and_then(|mut file| {
-                use std::io::Read;
-                file.read_exact(&mut bytes).ok()
-            });
-            if opened.is_none() {
-                // No system source (bare metal): the time-stamp counter,
-                // the clock and a count of calls, mixed (SplitMix64). Never
-                // the same bytes twice: NSS fails when its source repeats.
-                static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut state = unsafe { core::arch::x86_64::_rdtsc() }
-                    ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
-                    ^ calls.wrapping_mul(0xD6E8_FEB8_6659_FD93)
-                    ^ (p(0) as u64).rotate_left(29);
-                for chunk in bytes.chunks_mut(8) {
-                    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                    let mut z = state ^ unsafe { core::arch::x86_64::_rdtsc() }.rotate_left(17);
-                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                    z ^= z >> 31;
-                    chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
-                }
-            }
+            fill_random(&mut bytes, p(0));
             let _ = memory.write_bytes(p(0), &bytes);
             ok(1)
+        }
+        // BCryptGenRandom(algorithm, buffer, length, flags): the system's
+        // random bytes (ring's, so TLS keys, come from here).
+        "BCryptGenRandom" => {
+            let mut bytes = vec![0u8; arg(2) as usize];
+            fill_random(&mut bytes, p(1));
+            let _ = memory.write_bytes(p(1), &bytes);
+            ok(STATUS_SUCCESS)
         }
         "SetThreadStackGuarantee" => ok(1),
         // (file, buffer, length, flags): \\?\C:\... for a file OTW opened.
@@ -1025,9 +1047,40 @@ pub fn call(ctx: &ApiContext, memory: &mut dyn GuestMemory, name: &str, a: &[u64
             }
             ok(STATUS_SUCCESS)
         }
+        // NtReadFile/NtWriteFile(file, event, APC, its context, &IO status,
+        // buffer, length, &offset, key): ReadFile/WriteFile, at once (Rust
+        // programs write their standard output and errors this way).
+        "NtReadFile" | "NtWriteFile" => {
+            let write = name == "NtWriteFile";
+            let offset = if p(7) != 0 { memory.read_u64(p(7)).map(|o| o as i64).unwrap_or(-1) } else { -1 };
+            if offset >= 0 {
+                let high = alloc(ctx, 4);
+                let _ = memory.write_u32(high, (offset >> 32) as u32);
+                win32(ctx, memory, "KERNEL32.dll", "SetFilePointer", &[p(0), offset as u32, high, 0]);
+                ctx.shared.borrow_mut().heap.free(high);
+            }
+            let done = alloc(ctx, 4);
+            let _ = memory.write_u32(done, 0);
+            let succeeded = win32(ctx, memory, "KERNEL32.dll", if write { "WriteFile" } else { "ReadFile" }, &[p(0), p(5), p(6), done, 0]) != 0;
+            let count = memory.read_u32(done).unwrap_or(0);
+            ctx.shared.borrow_mut().heap.free(done);
+            let status = match (succeeded, write) {
+                (true, false) if count == 0 && p(6) != 0 => 0xC000_0011, // STATUS_END_OF_FILE
+                (true, _) => STATUS_SUCCESS,
+                (false, _) if ctx.shared.borrow().last_error == 109 => 0xC000_014B, // STATUS_PIPE_BROKEN
+                (false, _) => 0xC000_0185, // STATUS_IO_DEVICE_ERROR
+            };
+            // IO_STATUS_BLOCK: the status (pointer-sized), the bytes moved.
+            if p(4) != 0 {
+                let size = memory.ptr_size();
+                let _ = memory.write_ptr(p(4), u64::from(status));
+                let _ = memory.write_ptr(p(4) + size, u64::from(count));
+            }
+            ok(status)
+        }
         // Native calls for what OTW does not offer through them.
         "NtQuerySection" | "NtQueryInformationThread" | "NtSetInformationProcess" | "NtQuerySystemInformation"
-        | "NtOpenDirectoryObject" | "NtQueryDirectoryObject" | "NtCreateFile" | "NtReadFile" | "NtWriteFile"
+        | "NtOpenDirectoryObject" | "NtQueryDirectoryObject" | "NtCreateFile"
         | "NtDeviceIoControlFile" | "NtFsControlFile" | "NtCancelIoFileEx" | "LdrResolveDelayLoadedAPI"
         | "NtCreateSection" => ok(STATUS_NOT_IMPLEMENTED),
         "RtlGetLastNtStatus" => ok(0),
