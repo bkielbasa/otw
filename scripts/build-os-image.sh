@@ -4,7 +4,12 @@
 # Drive C: is a second partition (OTW-C) filled from OTW_DRIVE_C (default
 # ~/.otw/C); OTW_DRIVE_C= (empty) leaves it out. It has OTW_DRIVE_C_FREE MiB
 # (default 2048) free for what is saved and downloaded there: the kernel
-# writes it to the disk, so it stays until the image is built again.
+# writes it to the disk.
+# Built again over an existing image, the image keeps its drive C:: the
+# kernel's partition is made again, OTW's own files on C: (C:\OTW, the
+# fonts) are brought up to date, and files from OTW_DRIVE_C that are not
+# on C: yet are added; nothing saved, downloaded or installed there is
+# lost. OTW_FRESH=1 makes the whole image anew instead.
 # Write it to a USB stick or disk for a real machine
 # (sudo dd if=target/os/otw.img of=/dev/sdX bs=4M conv=fsync status=progress)
 # and boot it with UEFI and Secure Boot off; or try it with `make os`.
@@ -35,10 +40,34 @@ for dir in /usr/share/fonts/truetype/dejavu /usr/share/fonts/truetype/liberation
 done
 DRIVE_C="${OTW_DRIVE_C-$HOME/.otw/C}"
 FREE="${OTW_DRIVE_C_FREE:-2048}"
+IMAGE="${OS_IMAGE:-$OUT/otw.img}"
+
+# An image with a drive C: already: keep it.
+if [[ "${OTW_FRESH:-0}" != 1 && -f "$IMAGE" ]] && grep -qa "O.T.W.-.C" <(head -c 32768 "$IMAGE"); then
+  # Not while a VM has it open (QEMU locks its disk images).
+  if ! python3 -I -c 'import fcntl, sys
+f = open(sys.argv[1], "r+b")
+try:
+    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)' "$IMAGE"; then
+    echo "$IMAGE is in use (a VM is running on it): stop it first" >&2
+    exit 1
+  fi
+  echo "==> updating $IMAGE (drive C: is kept; OTW_FRESH=1 to start anew)"
+  python3 -I "$ROOT/scripts/make-disk.py" --update "$IMAGE" "${partitions[0]}"
+  (cd "$ROOT" && scripts/cargo.sh build --quiet --bin otw-disk)
+  "$ROOT/target/debug/otw-disk" sync "$IMAGE" OTW-C --replace "$EXTRA"
+  if [[ -n "$DRIVE_C" && -d "$DRIVE_C" ]]; then
+    "$ROOT/target/debug/otw-disk" sync "$IMAGE" OTW-C "$DRIVE_C"
+  fi
+  exit 0
+fi
+
 if [[ -n "$DRIVE_C" && -d "$DRIVE_C" ]]; then
   partitions+=("data:OTW-C:auto+$FREE:$DRIVE_C+$EXTRA")
 else
   partitions+=("data:OTW-C:auto+$FREE:$EXTRA")
 fi
 echo "==> making the disk"
-python3 -I "$ROOT/scripts/make-disk.py" "${OS_IMAGE:-$OUT/otw.img}" "${partitions[@]}"
+python3 -I "$ROOT/scripts/make-disk.py" "$IMAGE" "${partitions[@]}"

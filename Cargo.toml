@@ -5,6 +5,8 @@ edition = "2021"
 description = "Open-source Windows 95 compatibility VM: PE loader, IAT dispatcher, and Win32 API layers"
 license = "GPL-2.0-only"
 publish = false
+# `cargo run` runs the VM (src/bin/ has tools besides).
+default-run = "otw-vm"
 
 [dependencies]
 # x86-only CPU backend for the VM. Other architectures are not needed yet.

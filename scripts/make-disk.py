@@ -3,11 +3,16 @@
 with no root rights and nothing but the standard library.
 
     make-disk.py OUTPUT PARTITION...
+    make-disk.py --update IMAGE PARTITION...
 
 Each PARTITION is KIND:LABEL:SIZE_MIB:DIRECTORY, KIND being "esp" (an EFI
 system partition: what UEFI boots, EFI/BOOT/BOOTX64.EFI) or "data" (a basic
 data partition). SIZE_MIB "auto" makes room for the directory and a quarter
 more; "auto+N" for N MiB more besides (free space for what is written). Long file names are kept (VFAT long name entries).
+
+With --update, the named partitions of an existing IMAGE are made again in
+place (where and as large as they are; SIZE_MIB is not used) and the others
+are left as they are.
 """
 
 import os
@@ -241,7 +246,48 @@ def gpt(out, total_sectors, partitions):
     out.write(header(total_sectors - 1, 1, total_sectors - 33))
 
 
+def partitions_of(image):
+    """{label: (first sector, last sector)} from an image's GPT."""
+    image.seek(SECTOR)
+    header = image.read(92)
+    if header[0:8] != b"EFI PART":
+        raise SystemExit("no GPT partition table")
+    entries_lba, count, size = struct.unpack_from("<QII", header, 72)
+    image.seek(entries_lba * SECTOR)
+    found = {}
+    for _ in range(count):
+        entry = image.read(size)
+        first, last = struct.unpack_from("<QQ", entry, 32)
+        label = entry[56:128].decode("utf-16-le").split("\0")[0]
+        if label:
+            found[label] = (first, last)
+    return found
+
+
+def update(path, specs):
+    with open(path, "r+b") as image:
+        found = partitions_of(image)
+        for spec in specs:
+            kind, label, _size, directory = spec.split(":", 3)
+            if label not in found:
+                raise SystemExit(f"{path} has no partition {label!r}")
+            first, last = found[label]
+            # Zeroed first: no old directory records show through.
+            image.seek(first * SECTOR)
+            for _ in range((last + 1 - first) // 2048):
+                image.write(bytes(2048 * SECTOR))
+            image.write(bytes(((last + 1 - first) % 2048) * SECTOR))
+            fat = Fat32((last + 1 - first) * SECTOR, label, image, first * SECTOR)
+            fill(fat, directory)
+            fat.finish()
+            print(f"made partition {label} of {path} again")
+
+
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--update":
+        if len(sys.argv) < 4:
+            raise SystemExit(__doc__)
+        return update(sys.argv[2], sys.argv[3:])
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
     output, specs = sys.argv[1], sys.argv[2:]
