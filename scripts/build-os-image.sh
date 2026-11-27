@@ -46,7 +46,7 @@ done
 APPS="$ROOT/apps/app-center/target/x86_64-pc-windows-gnullvm/release"
 if [[ "${OTW_APP_CENTER:-1}" != 0 ]] && "$ROOT/scripts/build-app-center.sh" >/dev/null; then
   mkdir -p "$EXTRA/Program Files/App Center" "$EXTRA/WINDOWS/Desktop" "$EXTRA/WINDOWS/Start Menu/Programs"
-  cp "$APPS"/*.exe "$EXTRA/Program Files/App Center/"
+  cp "$APPS"/*.exe "$APPS"/*.dll "$EXTRA/Program Files/App Center/"
   if [[ -f "$APPS/app-center-gui.exe" ]]; then
     for at in "$EXTRA/WINDOWS/Desktop" "$EXTRA/WINDOWS/Start Menu/Programs"; do
       "$ROOT/target/debug/otw-disk" link "$at/App Center.lnk" 'C:\Program Files\App Center\app-center-gui.exe' "App Center" >/dev/null

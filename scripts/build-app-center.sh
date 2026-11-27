@@ -47,4 +47,7 @@ export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
 export AR_x86_64_pc_windows_gnullvm=llvm-ar
 cd "$ROOT/apps/app-center"
 cargo build --release --target "$TARGET" "$@"
+# Rust's unwinding (panics) is llvm-mingw's libunwind.dll: it goes with
+# the programs.
+cp "$MINGW/x86_64-w64-mingw32/bin/libunwind.dll" "$ROOT/apps/app-center/target/$TARGET/release/"
 ls "$ROOT/apps/app-center/target/$TARGET/release/"*.exe
