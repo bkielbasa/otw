@@ -1,0 +1,25 @@
+[package]
+name = "app-center"
+version = "0.1.0"
+edition = "2021"
+description = "Find and download Windows applications from the winget community repository"
+license = "MIT"
+
+# Not a member of the otw-vm package in the repository root.
+[workspace]
+
+[lib]
+name = "app_center"
+path = "src/lib.rs"
+
+[[bin]]
+name = "app-center"
+path = "src/main.rs"
+
+[dependencies]
+miniz_oxide = "0.8"
+sha2 = "0.10"
+yaml-rust2 = { version = "0.10", default-features = false }
+# rustls + ring + the Mozilla root store compiled in: no OpenSSL and no
+# dependency on the operating system's certificate store.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }

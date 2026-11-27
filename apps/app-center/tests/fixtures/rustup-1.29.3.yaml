@@ -1,0 +1,80 @@
+Author: The Rust Programming Language
+Commands:
+- cargo
+- cargo-clippy
+- cargo-fmt
+- cargo-miri
+- clippy-driver
+- rls
+- rust-analyzer
+- rust-gdb
+- rust-gdbgui
+- rust-lldb
+- rustc
+- rustdoc
+- rustfmt
+- rustup
+Copyright: Copyright (c) 2026 The Rust Project Developers
+Description: Rustup installs The Rust Programming Language from the official release
+  channels, enabling you to easily switch between stable, beta, and nightly compilers
+  and keep them updated. It makes cross-compiling simpler with binary builds of the
+  standard library for common platforms. And it runs on all platforms Rust supports,
+  including Windows.
+InstallModes:
+- interactive
+- silent
+- silentWithProgress
+InstallerSwitches:
+  Silent: -y -q
+  SilentWithProgress: -y
+InstallerType: exe
+Installers:
+- Architecture: x86
+  InstallerSha256: FA448CC3839D6FBACB5ED1954C16F60C4D16E7E6476677A66FFFB34DC91BD201
+  InstallerUrl: https://static.rust-lang.org/rustup/archive/1.29.3/i686-pc-windows-msvc/rustup-init.exe
+- Architecture: x64
+  InstallerSha256: 38027D51D69A5D05493627A0634DBEA52D6CD793C8F072D2373D3F4163EEC7DB
+  InstallerUrl: https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-pc-windows-msvc/rustup-init.exe
+- Architecture: arm64
+  InstallerSha256: 407E0D72F81D26A01F9D032B8317908CBB2917BA22765474B682B41390792AD9
+  InstallerUrl: https://static.rust-lang.org/rustup/archive/1.29.3/aarch64-pc-windows-msvc/rustup-init.exe
+License: Apache-2.0 or MIT
+Localization:
+- Author: The Rust Programming Language
+  Copyright: Copyright (c) 2026 The Rust Project Developers
+  Description: "Rustup \u53EF\u4ECE\u5B98\u65B9\u53D1\u5E03\u6E20\u9053\u5B89\u88C5
+    Rust \u7F16\u7A0B\u8BED\u8A00\uFF0C\u8BA9\u4F60\u80FD\u5728\u7A33\u5B9A\u7248\u3001\u6D4B\u8BD5\u7248\u548C\u6BCF\u591C\u7248\u7F16\u8BD1\u5668\u4E4B\u95F4\u8F7B\u677E\u5207\u6362\uFF0C\u5E76\u4FDD\u6301\u66F4\u65B0\u3002\u901A\u8FC7\u5E38\u89C1\u5E73\u53F0\u6807\u51C6\u5E93\u7684\u4E8C\u8FDB\u5236\u7F16\u8BD1\uFF0C\u5B83\u80FD\u8BA9\u4EA4\u53C9\u7F16\u8BD1\u53D8\u5F97\u66F4\u7B80\u5355\u3002\u5B83\u8FD8\u80FD\u5728
+    Rust \u652F\u6301\u7684\u6240\u6709\u5E73\u53F0\u4E0A\u8FD0\u884C\uFF0C\u5305\u62EC
+    Windows\u3002"
+  License: "Apache-2.0 \u6216 MIT"
+  PackageLocale: zh-CN
+  PackageName: 'Rustup: the Rust toolchain installer'
+  PackageUrl: https://rust-lang.github.io/rustup/
+  PrivacyUrl: https://foundation.rust-lang.org/policies/privacy-policy/
+  Publisher: The Rust Programming Language
+  PublisherSupportUrl: https://github.com/rust-lang/rustup/issues
+  PublisherUrl: https://www.rust-lang.org/
+  ReleaseNotesUrl: https://github.com/rust-lang/rustup/blob/master/CHANGELOG.md
+  ShortDescription: "Rust \u5DE5\u5177\u94FE\u5B89\u88C5\u7A0B\u5E8F"
+  Tags:
+  - rust
+  - rustlang
+ManifestType: merged
+ManifestVersion: 1.28.0
+PackageIdentifier: Rustlang.Rustup
+PackageLocale: en-US
+PackageName: 'Rustup: the Rust toolchain installer'
+PackageUrl: https://rust-lang.github.io/rustup/
+PackageVersion: 1.29.3
+PrivacyUrl: https://foundation.rust-lang.org/policies/privacy-policy/
+ProductCode: Rustup
+Publisher: The Rust Programming Language
+PublisherSupportUrl: https://github.com/rust-lang/rustup/issues
+PublisherUrl: https://www.rust-lang.org/
+ReleaseDate: 2026-11-03
+ReleaseNotesUrl: https://github.com/rust-lang/rustup/blob/master/CHANGELOG.md
+ShortDescription: The Rust toolchain installer
+Tags:
+- rust
+- rustlang
+UpgradeBehavior: install
