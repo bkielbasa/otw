@@ -39,33 +39,42 @@ const DEFAULT_PALETTE: u32 = 15;
 
 /// Windows 95 default system colours, as `0x00RRGGBB`.
 pub fn sys_color(index: u32) -> Rgb {
+    use crate::win32::theme;
+    // OTW's dark theme for what the system draws (captions, frames, menus,
+    // scroll bars, tooltips); window and button faces stay light, as
+    // programs draw on them in black by default.
     match index {
-        0 => 0xC0C0C0,  // COLOR_SCROLLBAR
-        1 => 0x008080,  // COLOR_BACKGROUND
-        2 => 0x000080,  // COLOR_ACTIVECAPTION
-        3 => 0x808080,  // COLOR_INACTIVECAPTION
-        4 => 0xC0C0C0,  // COLOR_MENU
-        5 => 0xFFFFFF,  // COLOR_WINDOW
-        6 => 0x000000,  // COLOR_WINDOWFRAME
-        7 => 0x000000,  // COLOR_MENUTEXT
-        8 => 0x000000,  // COLOR_WINDOWTEXT
-        9 => 0xFFFFFF,  // COLOR_CAPTIONTEXT
-        10 => 0xC0C0C0, // COLOR_ACTIVEBORDER
-        11 => 0xC0C0C0, // COLOR_INACTIVEBORDER
-        12 => 0x808080, // COLOR_APPWORKSPACE
-        13 => 0x000080, // COLOR_HIGHLIGHT
-        14 => 0xFFFFFF, // COLOR_HIGHLIGHTTEXT
-        15 => 0xC0C0C0, // COLOR_BTNFACE
-        16 => 0x808080, // COLOR_BTNSHADOW
-        17 => 0x808080, // COLOR_GRAYTEXT
-        18 => 0x000000, // COLOR_BTNTEXT
-        19 => 0xC0C0C0, // COLOR_INACTIVECAPTIONTEXT
-        20 => 0xFFFFFF, // COLOR_BTNHIGHLIGHT
-        21 => 0x000000, // COLOR_3DDKSHADOW
-        22 => 0xDFDFDF, // COLOR_3DLIGHT
-        23 => 0x000000, // COLOR_INFOTEXT
-        24 => 0xFFFFE1, // COLOR_INFOBK
-        _ => 0xC0C0C0,
+        0 => theme::SCROLL_TRACK,           // COLOR_SCROLLBAR
+        1 => theme::DESKTOP,                // COLOR_BACKGROUND
+        2 => theme::CAPTION_ACTIVE,         // COLOR_ACTIVECAPTION
+        3 => theme::CAPTION_INACTIVE,       // COLOR_INACTIVECAPTION
+        4 => theme::SURFACE,                // COLOR_MENU
+        5 => 0xFFFFFF,                      // COLOR_WINDOW
+        6 => 0x646464,                      // COLOR_WINDOWFRAME
+        7 => theme::TEXT,                   // COLOR_MENUTEXT
+        8 => 0x000000,                      // COLOR_WINDOWTEXT
+        9 => theme::CAPTION_TEXT_ACTIVE,    // COLOR_CAPTIONTEXT
+        10 => theme::CAPTION_ACTIVE,        // COLOR_ACTIVEBORDER
+        11 => theme::CAPTION_INACTIVE,      // COLOR_INACTIVEBORDER
+        12 => theme::RAISED,                // COLOR_APPWORKSPACE
+        13 => 0x0078D7,                     // COLOR_HIGHLIGHT
+        14 => 0xFFFFFF,                     // COLOR_HIGHLIGHTTEXT
+        15 => 0xF0F0F0,                     // COLOR_BTNFACE
+        16 => 0xA0A0A0,                     // COLOR_BTNSHADOW
+        17 => 0x6D6D6D,                     // COLOR_GRAYTEXT
+        18 => 0x000000,                     // COLOR_BTNTEXT
+        19 => theme::CAPTION_TEXT_INACTIVE, // COLOR_INACTIVECAPTIONTEXT
+        20 => 0xFFFFFF,                     // COLOR_BTNHIGHLIGHT
+        21 => 0x696969,                     // COLOR_3DDKSHADOW
+        22 => 0xE3E3E3,                     // COLOR_3DLIGHT
+        23 => theme::TEXT,                  // COLOR_INFOTEXT
+        24 => theme::RAISED,                // COLOR_INFOBK
+        26 => 0x0066CC,                     // COLOR_HOTLIGHT
+        27 => theme::CAPTION_ACTIVE,        // COLOR_GRADIENTACTIVECAPTION
+        28 => theme::CAPTION_INACTIVE,      // COLOR_GRADIENTINACTIVECAPTION
+        29 => theme::MENU_HOT,              // COLOR_MENUHILIGHT
+        30 => theme::SURFACE,               // COLOR_MENUBAR
+        _ => 0xF0F0F0,
     }
 }
 
