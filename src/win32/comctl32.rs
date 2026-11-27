@@ -766,13 +766,55 @@ const LVIS_STATEIMAGEMASK: u32 = 0xF000;
 const LVN_ITEMCHANGED: u32 = -101i32 as u32;
 const NM_CLICK: u32 = -2i32 as u32;
 const NM_DBLCLK: u32 = -3i32 as u32;
+const NM_RETURN: u32 = -4i32 as u32;
+/// An item opened: double-clicked, or Enter pressed on it.
+const LVN_ITEMACTIVATE: u32 = -114i32 as u32;
+const LVN_GETDISPINFOA: u32 = -150i32 as u32;
+const LVN_GETDISPINFOW: u32 = -177i32 as u32;
+/// The list asks its parent for every item (LVM_SETITEMCOUNT says how many).
+const LVS_OWNERDATA: u32 = 0x1000;
+/// `pszText` of an item whose text the parent gives when asked.
+const LPSTR_TEXTCALLBACK: u32 = u32::MAX;
 
 #[derive(Clone, Debug, Default)]
 struct ListItem {
     /// Text of the item and its subitems.
     texts: Vec<Vec<u8>>,
+    /// Which of them the parent gives when asked (LVN_GETDISPINFO): bit
+    /// `n` for subitem `n`. Subitems never given a text are asked for too,
+    /// as Windows does.
+    callback: u64,
+    /// Which subitems were given a text of their own.
+    given: u64,
     state: u32,
     lparam: u32,
+}
+
+impl ListItem {
+    /// Set subitem `sub`'s text, or make the parent give it (None).
+    fn set_text(&mut self, sub: usize, value: Option<Vec<u8>>) {
+        if self.texts.len() <= sub {
+            self.texts.resize(sub + 1, Vec::new());
+        }
+        let bit = 1u64 << sub.min(63);
+        match value {
+            Some(value) => {
+                self.texts[sub] = value;
+                self.callback &= !bit;
+                self.given |= bit;
+            }
+            None => {
+                self.texts[sub].clear();
+                self.callback |= bit;
+                self.given &= !bit;
+            }
+        }
+    }
+
+    fn is_callback(&self, sub: usize) -> bool {
+        let bit = 1u64 << sub.min(63);
+        self.callback & bit != 0 || (sub > 0 && self.given & bit == 0)
+    }
 }
 
 /// A report-view list view: columns, rows, checkboxes and one selection.
@@ -792,7 +834,59 @@ fn with_list<R>(ctx: &ApiContext, hwnd: u32, f: impl FnOnce(&mut ListView) -> R)
 /// Read an LVITEM's text (pszText at 20), in either character set.
 fn item_text<M: GuestMemory + ?Sized>(memory: &mut M, item: u32, wide: bool) -> Option<Vec<u8>> {
     let va = lvi(memory, item, 5);
-    (va >= 0x10000 && va != u32::MAX).then(|| text(memory, va, wide))
+    (va >= 0x10000 && va != LPSTR_TEXTCALLBACK).then(|| text(memory, va, wide))
+}
+
+/// An LVITEM's text as the list keeps it: `None` for LPSTR_TEXTCALLBACK
+/// (the parent gives it when asked), else the text (empty without one).
+fn item_text_or_callback<M: GuestMemory + ?Sized>(memory: &mut M, item: u32, wide: bool) -> Option<Vec<u8>> {
+    if lvi(memory, item, 5) == LPSTR_TEXTCALLBACK {
+        None
+    } else {
+        Some(item_text(memory, item, wide).unwrap_or_default())
+    }
+}
+
+/// Subitem `sub` of item `index`'s text: kept, or asked of the parent
+/// (LVN_GETDISPINFO, in the parent's character set).
+fn display_text<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, index: usize, sub: usize) -> Vec<u8> {
+    let Some(item) = with_list(ctx, hwnd, |list| list.items.get(index).cloned()) else {
+        return Vec::new();
+    };
+    if !item.is_callback(sub) {
+        return item.texts.get(sub).cloned().unwrap_or_default();
+    }
+    let (parent, id) = match ctx.shared.borrow().gui.window(hwnd) {
+        Some(window) if window.parent != 0 => (window.parent, window.id),
+        _ => return Vec::new(),
+    };
+    let parent_proc = ctx.shared.borrow().gui.window(parent).map(|w| w.wndproc).unwrap_or(0);
+    let wide = unicode::is_unicode_proc(ctx, parent_proc);
+    // NMLVDISPINFO: NMHDR, then an LVITEM; and a buffer for the text.
+    const CAPACITY: u32 = 260;
+    let x64 = memory.ptr_size() == 8;
+    let header = crate::win32::x64::NMHDR.size(x64);
+    let size = header + crate::win32::x64::LVITEM.size(x64);
+    let block = ctx.shared.borrow_mut().heap.alloc(size + CAPACITY * 2).unwrap_or(0);
+    if block == 0 {
+        return Vec::new();
+    }
+    let _ = memory.write_bytes(block, &vec![0u8; (size + CAPACITY * 2) as usize]);
+    let buffer = block + size;
+    let nmhdr = crate::win32::x64::View::new(memory, &crate::win32::x64::NMHDR, block);
+    for (field, value) in [hwnd, id, if wide { LVN_GETDISPINFOW } else { LVN_GETDISPINFOA }].into_iter().enumerate() {
+        nmhdr.set(memory, field, value);
+    }
+    let lvitem = block + header;
+    for (field, value) in [(0, 1), (1, index as u32), (2, sub as u32), (5, buffer), (6, CAPACITY), (8, item.lparam)] {
+        set_lvi(memory, lvitem, field, value);
+    }
+    user::send(ctx, memory, parent, WM_NOTIFY, id, block);
+    // The parent may point pszText at text of its own.
+    let va = lvi(memory, lvitem, 5);
+    let value = if va == LPSTR_TEXTCALLBACK { Vec::new() } else { text(memory, va, wide) };
+    ctx.shared.borrow_mut().heap.free(block);
+    value
 }
 
 /// LVITEM field `index` in the process's layout: mask, iItem, iSubItem,
@@ -920,10 +1014,26 @@ fn ensure_visible(ctx: &ApiContext, hwnd: u32, index: usize) {
 fn paint_list<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32) {
     let ps = user::scratch(ctx, 80);
     let hdc = user::begin_paint(ctx, memory, hwnd, ps);
-    let list = with_list(ctx, hwnd, |list| list.clone());
+    let mut list = with_list(ctx, hwnd, |list| list.clone());
     let (width, height) = client_size(ctx, hwnd);
     let header = header_height(ctx, hwnd);
     let rows = visible_rows(ctx, hwnd);
+    // The parent gives the texts it keeps itself (only the rows shown).
+    let columns = list.columns.len().max(1);
+    for index in list.top..(list.top + rows).min(list.items.len()) {
+        {
+            for sub in 0..columns {
+                if list.items[index].is_callback(sub) {
+                    let value = display_text(ctx, memory, hwnd, index, sub);
+                    let item = &mut list.items[index];
+                    if item.texts.len() <= sub {
+                        item.texts.resize(sub + 1, Vec::new());
+                    }
+                    item.texts[sub] = value;
+                }
+            }
+        }
+    }
     let focused = ctx.shared.borrow().gui.focus_hwnd == hwnd;
     let checkboxes = list.ex_style & LVS_EX_CHECKBOXES != 0;
     let scrollbar = list.items.len() > rows;
@@ -1018,7 +1128,7 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             let wide = msg == 0x104D;
             let mask = lvi(memory, lparam, 0);
             let index = lvi(memory, lparam, 1) as usize;
-            let label = if mask & 1 != 0 { item_text(memory, lparam, wide).unwrap_or_default() } else { Vec::new() };
+            let label = if mask & 1 != 0 { item_text_or_callback(memory, lparam, wide) } else { Some(Vec::new()) };
             let state_mask = lvi(memory, lparam, 4);
             let state = if mask & 8 != 0 { lvi(memory, lparam, 3) & state_mask } else { 0 };
             let item_lparam = if mask & 4 != 0 { lvi(memory, lparam, 8) } else { 0 };
@@ -1028,7 +1138,9 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
                 if list.ex_style & LVS_EX_CHECKBOXES != 0 && state & LVIS_STATEIMAGEMASK == 0 {
                     state |= 1 << 12; // unchecked
                 }
-                list.items.insert(at, ListItem { texts: vec![label], state, lparam: item_lparam });
+                let mut item = ListItem { state, lparam: item_lparam, ..ListItem::default() };
+                item.set_text(0, label);
+                list.items.insert(at, item);
                 at
             });
             invalidate_control(ctx, hwnd);
@@ -1045,15 +1157,8 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             }
             if msg == 0x1006 || msg == 0x104C {
                 if mask & 1 != 0 {
-                    if let Some(value) = item_text(memory, lparam, wide) {
-                        with_list(ctx, hwnd, |list| {
-                            let texts = &mut list.items[index].texts;
-                            if texts.len() <= sub {
-                                texts.resize(sub + 1, Vec::new());
-                            }
-                            texts[sub] = value;
-                        });
-                    }
+                    let value = item_text_or_callback(memory, lparam, wide);
+                    with_list(ctx, hwnd, |list| list.items[index].set_text(sub, value));
                 }
                 if mask & 4 != 0 {
                     let value = lvi(memory, lparam, 8);
@@ -1068,7 +1173,8 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
                 let item = with_list(ctx, hwnd, |list| list.items[index].clone());
                 if mask & 1 != 0 {
                     let (va, capacity) = (lvi(memory, lparam, 5), lvi(memory, lparam, 6));
-                    put_text(memory, va, capacity, item.texts.get(sub).map(|t| t.as_slice()).unwrap_or(b""), wide);
+                    let value = display_text(ctx, memory, hwnd, index, sub);
+                    put_text(memory, va, capacity, &value, wide);
                 }
                 if mask & 4 != 0 {
                     set_lvi(memory, lparam, 8, item.lparam);
@@ -1127,6 +1233,59 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             invalidate_control(ctx, hwnd);
             at as u32
         }
+        // LVM_GETCOLUMNA/W: what the mask asks of column wparam.
+        0x1019 | 0x105F => {
+            let Some((title, width)) = with_list(ctx, hwnd, |list| list.columns.get(wparam as usize).cloned()) else {
+                return 0;
+            };
+            let mask = lvc(memory, lparam, 0);
+            let view = crate::win32::x64::View::new(memory, &crate::win32::x64::LVCOLUMN, lparam);
+            if mask & 0x1 != 0 {
+                view.set(memory, 1, 0); // LVCF_FMT: LVCFMT_LEFT
+            }
+            if mask & 0x2 != 0 {
+                view.set(memory, 2, width as u32); // LVCF_WIDTH
+            }
+            if mask & 0x4 != 0 {
+                let (va, capacity) = (lvc(memory, lparam, 3), lvc(memory, lparam, 4));
+                put_text(memory, va, capacity, &title, msg == 0x105F); // LVCF_TEXT
+            }
+            if mask & 0x8 != 0 {
+                view.set(memory, 5, wparam); // LVCF_SUBITEM
+            }
+            if mask & 0x20 != 0 {
+                view.set(memory, 7, wparam); // LVCF_ORDER
+            }
+            1
+        }
+        // LVM_SETCOLUMNA/W: the title and width.
+        0x101A | 0x1060 => {
+            let mask = lvc(memory, lparam, 0);
+            let title_va = lvc(memory, lparam, 3);
+            let title = (mask & 0x4 != 0).then(|| text(memory, title_va, msg == 0x1060));
+            let width = (mask & 0x2 != 0).then(|| lvc(memory, lparam, 2) as i32);
+            let found = with_list(ctx, hwnd, |list| {
+                let Some(column) = list.columns.get_mut(wparam as usize) else { return false };
+                if let Some(title) = title {
+                    column.0 = title;
+                }
+                if let Some(width) = width {
+                    column.1 = width;
+                }
+                true
+            });
+            invalidate_control(ctx, hwnd);
+            u32::from(found)
+        }
+        // LVM_GETCOLUMNORDERARRAY(count, int[]): columns stay in order.
+        0x103B => {
+            let columns = with_list(ctx, hwnd, |list| list.columns.len());
+            for index in 0..(wparam as usize).min(columns) {
+                let _ = memory.write_u32(lparam + 4 * index as u32, index as u32);
+            }
+            u32::from(wparam as usize <= columns)
+        }
+        0x103A => 1, // LVM_SETCOLUMNORDERARRAY
         // LVM_DELETECOLUMN
         0x101C => u32::from(with_list(ctx, hwnd, |list| (wparam as usize) < list.columns.len() && { list.columns.remove(wparam as usize); true })),
         // LVM_GETCOLUMNWIDTH, LVM_SETCOLUMNWIDTH (LVSCW_AUTOSIZE* fill the client)
@@ -1155,19 +1314,16 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         // LVM_GETITEMTEXTA/W, LVM_SETITEMTEXTA/W
         0x102D | 0x1073 => {
             let sub = lvi(memory, lparam, 2) as usize;
-            let value = with_list(ctx, hwnd, |list| list.items.get(wparam as usize).and_then(|i| i.texts.get(sub).cloned()).unwrap_or_default());
+            let value = display_text(ctx, memory, hwnd, wparam as usize, sub);
             let (va, capacity) = (lvi(memory, lparam, 5), lvi(memory, lparam, 6));
             put_text(memory, va, capacity, &value, msg == 0x1073)
         }
         0x102E | 0x1074 => {
             let sub = lvi(memory, lparam, 2) as usize;
-            let value = item_text(memory, lparam, msg == 0x1074).unwrap_or_default();
+            let value = item_text_or_callback(memory, lparam, msg == 0x1074);
             with_list(ctx, hwnd, |list| {
                 if let Some(item) = list.items.get_mut(wparam as usize) {
-                    if item.texts.len() <= sub {
-                        item.texts.resize(sub + 1, Vec::new());
-                    }
-                    item.texts[sub] = value;
+                    item.set_text(sub, value);
                 }
             });
             invalidate_control(ctx, hwnd);
@@ -1196,9 +1352,28 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
         0x1032 => with_list(ctx, hwnd, |list| list.items.iter().filter(|i| i.state & LVIS_SELECTED != 0).count() as u32),
         0x1027 => with_list(ctx, hwnd, |list| list.top as u32),
         0x1028 => visible_rows(ctx, hwnd) as u32,
+        // LVM_SETITEMCOUNT: a list that asks its parent for its items
+        // (LVS_OWNERDATA) has that many; others only make room.
+        0x102F => {
+            let style = ctx.shared.borrow().gui.window(hwnd).map(|w| w.style).unwrap_or(0);
+            if style & LVS_OWNERDATA != 0 {
+                with_list(ctx, hwnd, |list| {
+                    let callback = ListItem { callback: u64::MAX, ..ListItem::default() };
+                    list.items.resize(wparam as usize, callback);
+                    list.top = list.top.min(list.items.len().saturating_sub(1));
+                });
+                invalidate_control(ctx, hwnd);
+            }
+            1
+        }
         // LVM_SETBKCOLOR, LVM_SETTEXTCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETIMAGELIST,
-        // LVM_SETITEMCOUNT, LVM_REDRAWITEMS, LVM_UPDATE, LVM_SORTITEMS: accepted.
-        0x1001 | 0x1024 | 0x1026 | 0x1003 | 0x102F | 0x1015 | 0x102A | 0x1030 => 1,
+        // LVM_REDRAWITEMS, LVM_UPDATE, LVM_SORTITEMS: accepted.
+        0x1001 | 0x1024 | 0x1026 | 0x1003 | 0x1015 | 0x102A | 0x1030 => {
+            if msg == 0x1015 || msg == 0x102A {
+                invalidate_control(ctx, hwnd);
+            }
+            1
+        }
         // LVM_GETHEADER, LVM_GETIMAGELIST and the rest: none.
         0x1000..=0x10FF => 0,
         0x000F => {
@@ -1236,6 +1411,9 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             }
             set_state(ctx, memory, hwnd, index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
             list_notify(ctx, memory, hwnd, if msg == 0x0203 { NM_DBLCLK } else { NM_CLICK }, index as i32, 0, 0);
+            if msg == 0x0203 {
+                list_notify(ctx, memory, hwnd, LVN_ITEMACTIVATE, index as i32, 0, 0);
+            }
             0
         }
         // WM_MOUSEWHEEL
@@ -1256,6 +1434,14 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
                 return 0;
             }
             let current = with_list(ctx, hwnd, |list| list.items.iter().position(|i| i.state & LVIS_SELECTED != 0));
+            // Enter opens the selected item.
+            if wparam == 0x0D {
+                list_notify(ctx, memory, hwnd, NM_RETURN, current.map_or(-1, |c| c as i32), 0, 0);
+                if let Some(index) = current {
+                    list_notify(ctx, memory, hwnd, LVN_ITEMACTIVATE, index as i32, 0, 0);
+                }
+                return 0;
+            }
             let next = match wparam {
                 0x26 => current.map(|c| c.saturating_sub(1)).unwrap_or(0),
                 0x28 => current.map(|c| (c + 1).min(total - 1)).unwrap_or(0),
@@ -1286,5 +1472,97 @@ pub fn listview_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, 
             0
         }
         _ => user::def_window_proc(ctx, memory, hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
+    use super::*;
+
+    #[derive(Default)]
+    struct Sparse(std::collections::BTreeMap<u32, u8>);
+    impl GuestMemory for Sparse {
+        fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+            Some((0..len as u32).map(|i| self.0.get(&(va + i)).copied().unwrap_or(0)).collect())
+        }
+        fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+            for (i, &b) in bytes.iter().enumerate() {
+                self.0.insert(va + i as u32, b);
+            }
+            Some(())
+        }
+        fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+            self.write_bytes(va, &value.to_le_bytes())
+        }
+    }
+
+    fn list(ctx: &ApiContext, style: u32) -> u32 {
+        let hwnd = 0x200;
+        ctx.shared.borrow_mut().gui.windows.push(crate::win32::GuestWindow {
+            hwnd,
+            class: "SysListView32".into(),
+            style,
+            width: 300,
+            height: 200,
+            ..Default::default()
+        });
+        hwnd
+    }
+
+    #[test]
+    fn callback_texts_are_kept_apart() {
+        let mut item = ListItem::default();
+        item.set_text(0, None);
+        item.set_text(2, Some(b"size".to_vec()));
+        assert!(item.is_callback(0));
+        assert!(!item.is_callback(2));
+        assert_eq!(item.texts[2], b"size");
+        item.set_text(0, Some(b"name".to_vec()));
+        assert!(!item.is_callback(0));
+        // A subitem never given a text is asked for, as on Windows.
+        assert!(item.is_callback(1));
+        assert!(!ListItem::default().is_callback(0));
+    }
+
+    #[test]
+    fn items_inserted_with_text_callbacks() {
+        let ctx = ApiContext::default();
+        let mut memory = Sparse::default();
+        let hwnd = list(&ctx, 0x1); // LVS_REPORT
+        // LVM_INSERTITEMW: mask LVIF_TEXT, item 0, pszText LPSTR_TEXTCALLBACK.
+        let item = 0x2_0000;
+        for (offset, value) in [(0, 1), (4, 0), (20, LPSTR_TEXTCALLBACK)] {
+            memory.write_u32(item + offset, value);
+        }
+        assert_eq!(listview_proc(&ctx, &mut memory, hwnd, 0x104D, 0, item), 0);
+        let kept = with_list(&ctx, hwnd, |list| list.items[0].clone());
+        assert!(kept.is_callback(0));
+        // A plain text is kept and given back as it is.
+        let text = 0x2_0100;
+        memory.write_bytes(text, b"7-Zip\0");
+        for (offset, value) in [(0, 1), (4, 1), (20, text)] {
+            memory.write_u32(item + offset, value);
+        }
+        listview_proc(&ctx, &mut memory, hwnd, 0x1007, 0, item);
+        assert_eq!(display_text(&ctx, &mut memory, hwnd, 1, 0), b"7-Zip");
+    }
+
+    #[test]
+    fn owner_data_lists_have_the_count_they_are_given() {
+        let ctx = ApiContext::default();
+        let mut memory = Sparse::default();
+        let hwnd = list(&ctx, 0x1 | LVS_OWNERDATA);
+        listview_proc(&ctx, &mut memory, hwnd, 0x102F, 4, 0); // LVM_SETITEMCOUNT
+        assert_eq!(listview_proc(&ctx, &mut memory, hwnd, 0x1004, 0, 0), 4); // LVM_GETITEMCOUNT
+        assert!(with_list(&ctx, hwnd, |list| list.items.iter().all(|i| i.is_callback(0) && i.is_callback(3))));
+        // A list that keeps its items only makes room.
+        let ctx = ApiContext::default();
+        let hwnd = list(&ctx, 0x1);
+        listview_proc(&ctx, &mut memory, hwnd, 0x102F, 4, 0);
+        assert_eq!(listview_proc(&ctx, &mut memory, hwnd, 0x1004, 0, 0), 0);
     }
 }
