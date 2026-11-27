@@ -623,12 +623,21 @@ fn refresh_processes(ctx: &ApiContext) {
     // (A caller further up may be looking at the state: the next look
     // catches up.)
     let Ok(mut shared) = ctx.shared.try_borrow_mut() else { return };
-    for object in shared.sync.objects.values_mut() {
+    let mut ended = Vec::new();
+    for (&handle, object) in shared.sync.objects.iter_mut() {
         if let Object::Process { pid, exit } = object {
             if exit.is_none() {
                 *exit = launcher.as_ref().and_then(|l| l.exit_code(*pid)).or_else(|| crate::win32::kobj::exit_code(*pid));
+                if exit.is_some() {
+                    ended.push(handle);
+                }
             }
         }
+    }
+    drop(shared);
+    // The threads waiting for them (the thread that looked may be another).
+    for handle in ended {
+        wake_handle(ctx, handle);
     }
 }
 

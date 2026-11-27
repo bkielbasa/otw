@@ -99,6 +99,11 @@ pub fn profile_report() {
     if samples.is_empty() {
         return;
     }
+    let counts: Vec<u64> = otw_vm::win32::kobj::COUNTS.iter().map(|c| c.swap(0, core::sync::atomic::Ordering::Relaxed)).collect();
+    log!(
+        "OTW kernel: [profile] waits: {} notifications woke {} threads, {} woken by key, {} parks ({} woken)",
+        counts[0], counts[1], counts[2], counts[3], counts[4]
+    );
     let runners = RUNNERS.lock().unwrap();
     // Each program's address space and modules (copied under its lock).
     let mut spaces: Vec<(u64, String, Vec<(String, u64, u64, Vec<(u32, String)>)>)> = Vec::new();

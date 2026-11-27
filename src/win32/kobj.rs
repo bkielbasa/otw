@@ -260,7 +260,16 @@ fn changes() -> &'static (Mutex<u64>, std::sync::Condvar) {
 }
 
 /// Note a change and wake the processes waiting for one.
+/// Counts for the profiler: notifications, threads woken by them, wakes
+/// by key, parks, parks that ended woken.
+pub static COUNTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn count(index: usize, n: u64) {
+    COUNTS[index].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn notify() {
+    count(0, 1);
     let (count, condvar) = changes();
     *count.lock().unwrap_or_else(|p| p.into_inner()) += 1;
     condvar.notify_all();
@@ -357,25 +366,33 @@ pub fn park(timeout: std::time::Duration) -> bool {
     PARKER.with(|parker| {
         let woken = parker.woken.lock().unwrap_or_else(|p| p.into_inner());
         let (mut woken, _) = parker.wake.wait_timeout_while(woken, timeout, |w| !*w).unwrap_or_else(|p| p.into_inner());
-        std::mem::replace(&mut *woken, false)
+        let woken = std::mem::replace(&mut *woken, false);
+        count(3, 1);
+        count(4, woken as u64);
+        woken
     })
 }
 
 /// Wake the threads waiting for `key` of process `pid`.
 pub fn wake(pid: u32, key: u64) {
     let parkers: Vec<Arc<Parker>> = registry().get(&(pid, key)).cloned().unwrap_or_default();
+    count(2, parkers.len() as u64);
     for parker in parkers {
         parker.unpark();
     }
 }
 
-/// Wake the threads of every process waiting on shared objects.
+/// Have each process waiting on shared objects look at them: one of its
+/// waiting threads (which takes in pipe data and notes ended processes for
+/// the whole process, waking the threads that wait for them by key).
+/// Waking all of them woke a hundred threads of Firefox at each message.
 fn wake_shared() {
     let parkers: Vec<Arc<Parker>> = registry()
         .iter()
         .filter(|((_, key), _)| *key == KEY_SHARED)
-        .flat_map(|(_, parkers)| parkers.iter().cloned())
+        .filter_map(|(_, parkers)| parkers.first().cloned())
         .collect();
+    count(1, parkers.len() as u64);
     for parker in parkers {
         parker.unpark();
     }
