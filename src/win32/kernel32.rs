@@ -425,7 +425,7 @@ pub fn arg_count(name: &str) -> Option<usize> {
         },
         "SetFilePointer" | "GetFileTime" | "SetFileTime" | "GetFullPathNameA"
         | "GetTempFileNameA" | "HeapReAlloc" => 4,
-        "LockFile" | "UnlockFile" | "ReadFile" | "WriteFile" | "GetDiskFreeSpaceA" => 5,
+        "LockFile" | "UnlockFile" | "ReadFile" | "WriteFile" | "GetDiskFreeSpaceA" | "GetDiskFreeSpaceW" => 5,
         "RaiseException" => 4,
         "SearchPathA" => 6,
         "DuplicateHandle" | "CreateFileA" => 7,
@@ -1196,7 +1196,8 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             set_error(ctx, 2);
             ok(0)
         }
-        "GetDiskFreeSpaceA" => {
+        // The root path does not matter: one drive size for all.
+        "GetDiskFreeSpaceA" | "GetDiskFreeSpaceW" => {
             for (index, value) in [8u32, 512, 200_000, 250_000].iter().enumerate() {
                 if args[index + 1] != 0 {
                     let _ = memory.write_u32(args[index + 1], *value);

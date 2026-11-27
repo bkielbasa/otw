@@ -242,6 +242,11 @@ fn plan(name: &str) -> Option<Plan> {
         "GetModuleFileNameW" => Wrap("GetModuleFileNameA", &[Out(1, 2)]),
         "GetModuleHandleW" => Wrap("GetModuleHandleA", &[In(0)]),
         "MoveFileExW" => WrapN("MoveFileA", &[In(0), In(1)], 3),
+        // (from, to, progress routine, its data, flags): moved at once.
+        "MoveFileWithProgressW" => WrapN("MoveFileA", &[In(0), In(1)], 5),
+        "GetCompressedFileSizeW" | "SetPriorityClass" => Native(2),
+        "FindFirstChangeNotificationW" => Native(3),
+        "FindNextChangeNotification" | "FindCloseChangeNotification" => Native(1),
         "MoveFileW" => Wrap("MoveFileA", &[In(0), In(1)]),
         "CopyFileW" => Wrap("CopyFileA", &[In(0), In(1)]),
         "FindResourceW" => Wrap("FindResourceA", &[In(1), In(2)]),
@@ -729,6 +734,32 @@ fn native<M: GuestMemory + ?Sized>(
             write_wide(memory, args[0], &text, true);
             args[0]
         }
+        // (path, &high): the size the file takes, which is its size here.
+        "GetCompressedFileSizeW" => {
+            let path = wide_to_ansi(&read_wstr(memory, args[0]));
+            match crate::win32::crt::host_path_in(ctx, &path).and_then(|host| std::fs::metadata(host).ok()) {
+                Some(metadata) if metadata.is_file() => {
+                    let size = metadata.len();
+                    if args[1] != 0 {
+                        let _ = memory.write_u32(args[1], (size >> 32) as u32);
+                    }
+                    size as u32
+                }
+                _ => {
+                    set_last_error(ctx, 2); // ERROR_FILE_NOT_FOUND
+                    u32::MAX // INVALID_FILE_SIZE
+                }
+            }
+        }
+        "SetPriorityClass" => 1,
+        // Changes in a directory are not watched: the program looks
+        // again itself (7-Zip refreshes when asked).
+        "FindFirstChangeNotificationW" => {
+            set_last_error(ctx, 50); // ERROR_NOT_SUPPORTED
+            u32::MAX
+        }
+        "FindNextChangeNotification" => 0,
+        "FindCloseChangeNotification" => 1,
         // (buffer length in characters, buffer): "C:\\", "D:\\" when
         // there is one, then an empty string; the length without the last
         // zero, or what is needed when the buffer is too small.
@@ -1524,6 +1555,20 @@ mod tests {
         assert_eq!(call(&mut m, 5), 4);
         let units: Vec<u16> = m.0[0x100..0x10A].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         assert_eq!(units, "C:\\\0\0".encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn functions_7zip_file_manager_needs() {
+        let ctx = ApiContext::default();
+        let mut m = Flat(vec![0; 0x200]);
+        let mut call = |m: &mut Flat, name: &str, args: &[u32]| native(&ctx, m, "KERNEL32.dll", name, args, args.len(), 0).unwrap().value;
+        // Directories are not watched: the program refreshes itself.
+        assert_eq!(call(&mut m, "FindFirstChangeNotificationW", &[0x100, 0, 1]), u32::MAX);
+        assert_eq!(call(&mut m, "FindCloseChangeNotification", &[u32::MAX]), 1);
+        assert_eq!(call(&mut m, "SetPriorityClass", &[u32::MAX, 0x80]), 1);
+        let path: Vec<u8> = "C:\\no such file.7z".encode_utf16().chain([0]).flat_map(|u| u.to_le_bytes()).collect();
+        let _ = m.write_bytes(0x100, &path);
+        assert_eq!(call(&mut m, "GetCompressedFileSizeW", &[0x100, 0]), u32::MAX);
     }
 
     #[test]

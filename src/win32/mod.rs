@@ -1213,6 +1213,10 @@ impl SystemCalls for ApiContext {
         if msvcrt::is_msvcrt(&dll) {
             return msvcrt::call(self, memory, &name, args);
         }
+        if let Some(text) = name.as_str().filter(|text| NT_FOR_32_BIT.contains(text)) {
+            let wide: Vec<u64> = args.iter().map(|&a| u64::from(a)).collect();
+            return nt::call(self, memory, text, &wide);
+        }
         dispatch_with_memory(self, memory, &dll, &name, args, caller)
     }
 
@@ -1298,6 +1302,7 @@ pub const BUILTIN_PROCS: &[&str] = &[
     "OTW_PropSheetProc",
     "OTW_TabProc",
     "OTW_ListViewProc",
+    "OTW_ComboBoxExProc",
     "OTW_TreeViewProc",
     "OTW_TooltipProc",
     "OTW_RebarProc",
@@ -1432,9 +1437,16 @@ pub fn api_set_host(dll: &str) -> Option<&'static str> {
     })
 }
 
+/// Functions of the NT layer (`nt`, written for 64-bit programs) that
+/// 32-bit programs call too: their arguments are all one slot wide.
+const NT_FOR_32_BIT: &[&str] = &["GetFileInformationByHandle", "CreateHardLinkW"];
+
 pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
     if msvcrt::is_msvcrt(dll) {
         return msvcrt::arg_count(name.as_str()?);
+    }
+    if let Some(text) = name.as_str().filter(|text| NT_FOR_32_BIT.contains(text)) {
+        return nt::arg_count(text);
     }
     let dll = api_set_host(dll).unwrap_or(dll);
     if is_ucrt(dll) {
@@ -2940,6 +2952,13 @@ mod tests {
     #[allow(unused_imports)]
     use crate::platform::prelude::*;
     use super::is_rust_backed_dll;
+
+    #[test]
+    fn nt_functions_32_bit_programs_call() {
+        let by_name = |name: &str| super::arg_count("KERNEL32.dll", &super::ImportName::ByName(name.into()));
+        assert_eq!(by_name("GetFileInformationByHandle"), Some(2));
+        assert_eq!(by_name("CreateHardLinkW"), Some(3));
+    }
 
     #[test]
     fn rust_backed_dlls_are_excluded_from_companion_mapping() {
