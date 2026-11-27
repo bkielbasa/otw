@@ -931,7 +931,62 @@ enum Outcome {
 }
 
 /// Wait as `wait` says (its deadline in milliseconds from now, or none).
-fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wait, timeout: u32) -> Outcome {
+/// With OTW_TRACE_LONG_WAITS=ms, waits that took at least that long and
+/// ended because what they waited for came are logged.
+fn wait<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, wait: Wait, timeout: u32) -> Outcome {
+    let Some(threshold) = crate::kernel::lock::long_wait_threshold() else {
+        return wait_for(ctx, memory, wait, timeout);
+    };
+    let began = std::time::Instant::now();
+    let what = describe_wait(ctx, &wait);
+    let thread = memory.current_thread();
+    let outcome = wait_for(ctx, memory, wait, timeout);
+    let ms = began.elapsed().as_millis() as u64;
+    if ms >= threshold && matches!(outcome, Outcome::Signaled(_)) {
+        let pid = ctx.shared.borrow().pid;
+        eprintln!("[wait] {:?} process {pid:#x} thread {thread} waited {ms} ms for {what} (timeout {timeout})", std::time::Instant::now());
+    }
+    outcome
+}
+
+/// What a wait is for, for the log.
+fn describe_wait(ctx: &ApiContext, wait: &Wait) -> String {
+    let shared = ctx.shared.borrow();
+    let mut parts: Vec<String> = wait
+        .handles
+        .iter()
+        .map(|h| match shared.sync.objects.get(h) {
+            Some(Object::Event { manual, .. }) => format!("event {h:#x}{}", if *manual { " (manual)" } else { "" }),
+            Some(Object::Mutex { .. }) => format!("mutex {h:#x}"),
+            Some(Object::Semaphore { .. }) => format!("semaphore {h:#x}"),
+            Some(Object::Thread { id, .. }) => format!("thread {id}'s end"),
+            Some(Object::Process { pid, .. }) => format!("process {pid:#x}'s end"),
+            Some(Object::Timer { .. }) => format!("timer {h:#x}"),
+            None => format!("handle {h:#x}"),
+        })
+        .collect();
+    if wait.section != 0 {
+        parts.push(format!("critical section {:#x}", wait.section));
+    }
+    if wait.srw != 0 {
+        parts.push(format!("SRW lock {:#x}", wait.srw));
+    }
+    if wait.address != 0 {
+        parts.push(format!("address {:#x}", wait.address));
+    }
+    if wait.wake_key != 0 {
+        parts.push(format!("wake-up on {:#x}", wait.wake_key));
+    }
+    if wait.messages {
+        parts.push("messages".into());
+    }
+    if parts.is_empty() {
+        parts.push("time".into());
+    }
+    parts.join(", ")
+}
+
+fn wait_for<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, mut wait: Wait, timeout: u32) -> Outcome {
     let thread = memory.current_thread();
     // A wait made again after the thread came off the CPU keeps its deadline.
     // (Only the same wait: a call that came back for another reason, such

@@ -611,6 +611,8 @@ impl Runner {
             if tags[index] == 0 {
                 tags[index] = crate::profile::tag(&self.syscalls.describe(&entry.dll, &entry.name));
             }
+            // What the lock's holder does, for a thread waiting long for it.
+            self.lock.note_doing(unsafe { &*(tags[index] as *const &'static str) });
             crate::sched::tagged(tags[index])
         });
         {

@@ -44,6 +44,17 @@ pub struct BigLock {
     /// What tells whether the process's state is in use (it must not be
     /// when the lock is given up): a function and its argument.
     in_use: std::sync::OnceLock<(fn(usize) -> bool, usize)>,
+    /// What the holder is doing (a `&'static str`'s address, 0: not
+    /// said), for OTW_TRACE_LONG_WAITS.
+    doing: std::sync::atomic::AtomicUsize,
+    /// Where the holder took it (a `&'static Location`'s address).
+    taken_at: std::sync::atomic::AtomicUsize,
+}
+
+/// OTW_TRACE_LONG_WAITS: log waits at least this many milliseconds long.
+pub fn long_wait_threshold() -> Option<u64> {
+    static THRESHOLD: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| std::env::var("OTW_TRACE_LONG_WAITS").ok().and_then(|v| v.parse().ok()))
 }
 
 fn trace_lock() -> bool {
@@ -83,6 +94,7 @@ impl BigLock {
     }
 
     /// Take the lock (again, if this host thread holds it).
+    #[track_caller]
     pub fn acquire(self: &Arc<Self>) {
         let me = std::thread::current().id();
         // Briefly spin before sleeping: the lock is held for short spells
@@ -96,11 +108,21 @@ impl BigLock {
         let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
         if owner.thread.is_some_and(|t| t != me) {
             let started = std::time::Instant::now();
+            let holder = self.doing.load(std::sync::atomic::Ordering::Relaxed);
+            let taken_at = self.taken_at.load(std::sync::atomic::Ordering::Relaxed);
             owner.waiting += 1;
             while owner.thread.is_some_and(|t| t != me) {
                 owner = self.free.wait(owner).unwrap_or_else(|p| p.into_inner());
             }
             owner.waiting -= 1;
+            if let Some(threshold) = long_wait_threshold() {
+                let ms = started.elapsed().as_millis() as u64;
+                if ms >= threshold {
+                    let what = if holder == 0 { "?" } else { unsafe { *(holder as *const &'static str) } };
+                    let at = if taken_at == 0 { None } else { Some(unsafe { &*(taken_at as *const core::panic::Location<'static>) }) };
+                    eprintln!("[lock] {:?} {:p}: a thread waited {ms} ms for it, held by one that took it at {at:?} (in {what})", std::time::Instant::now(), Arc::as_ptr(self));
+                }
+            }
             if trace_lock() {
                 WAITED.with(|w| {
                     let mut w = w.borrow_mut();
@@ -118,6 +140,11 @@ impl BigLock {
         }
         if owner.thread.is_none() && trace_lock() {
             owner.since = Some(std::time::Instant::now());
+        }
+        if owner.thread.is_none() && long_wait_threshold().is_some() {
+            let at: &'static core::panic::Location<'static> = core::panic::Location::caller();
+            self.taken_at.store(at as *const _ as usize, std::sync::atomic::Ordering::Relaxed);
+            self.doing.store(0, std::sync::atomic::Ordering::Relaxed);
         }
         owner.thread = Some(me);
         self.busy.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -151,6 +178,12 @@ impl BigLock {
                 self.free.notify_one();
             }
         }
+    }
+
+    /// Say what the holder does now (`name` must live for good: a
+    /// `&'static &'static str`), for the long-wait log.
+    pub fn note_doing(&self, name: &'static &'static str) {
+        self.doing.store(name as *const &'static str as usize, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Name a check that the process's state is not in use, made whenever
@@ -197,6 +230,7 @@ impl BigLock {
     }
 
     /// Take the lock again as many times as `release_all` gave it up.
+    #[track_caller]
     pub fn reacquire(self: &Arc<Self>, depth: usize) {
         for _ in 0..depth {
             self.acquire();
@@ -227,6 +261,7 @@ pub struct Hold(Arc<BigLock>);
 
 impl Hold {
     /// Take the lock and be in the system for its process.
+    #[track_caller]
     pub fn new(lock: &Arc<BigLock>) -> Self {
         lock.acquire();
         ACTIVE.with(|active| active.borrow_mut().push(lock.clone()));
