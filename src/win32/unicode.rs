@@ -1369,7 +1369,16 @@ fn native<M: GuestMemory + ?Sized>(
         "ShellExecuteW" => {
             let operation = String::from_utf8_lossy(&wide_to_ansi(&read_wstr(memory, args[1]))).into_owned();
             let file = String::from_utf8_lossy(&wide_to_ansi(&read_wstr(memory, args[2]))).into_owned();
-            eprintln!("[shell] ShellExecute {operation:?} {file:?} (not started)");
+            let opens = operation.is_empty() || operation.eq_ignore_ascii_case("open") || operation.eq_ignore_ascii_case("runas");
+            if opens && crate::win32::sync::is_program(file.as_bytes()) {
+                let read = |memory: &mut M, va: u32| if va == 0 { Vec::new() } else { wide_to_ansi(&read_wstr(memory, va)) };
+                let (parameters, directory) = (read(memory, args[3]), read(memory, args[4]));
+                return ok(match crate::win32::sync::shell_start(ctx, file.as_bytes(), &parameters, &directory) {
+                    Some(_) => 42,
+                    None => 2, // SE_ERR_FNF
+                });
+            }
+            eprintln!("[shell] ShellExecute {operation:?} {file:?} (only programs are started)");
             42 // > 32: success
         }
         // ── OLE32, OLEACC, WINSPOOL ──

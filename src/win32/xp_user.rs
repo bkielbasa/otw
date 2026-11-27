@@ -800,8 +800,25 @@ pub fn dispatch<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, name:
             let info = crate::win32::x64::View::new(memory, &crate::win32::x64::SHELLEXECUTEINFO, args[0]);
             let (verb_va, file_va, params_va) = (info.get32(memory, 3), info.get32(memory, 4), info.get32(memory, 5));
             let (verb, file, params) = (read(memory, verb_va), read(memory, file_va), read(memory, params_va));
+            let directory_va = info.get32(memory, 6);
+            let directory = read(memory, directory_va);
+            // Programs start (opening one, a downloaded installer say);
+            // other files have no program to open them yet.
+            let opens = verb.is_empty() || verb.eq_ignore_ascii_case(b"open") || verb.eq_ignore_ascii_case(b"runas");
+            if opens && crate::win32::sync::is_program(&file) {
+                let Some(process) = crate::win32::sync::shell_start(ctx, &file, &params, &directory) else {
+                    info.set(memory, 8, 2); // SE_ERR_FNF
+                    ctx.shared.borrow_mut().last_error = 2;
+                    return ok(0);
+                };
+                info.set(memory, 8, 42);
+                // SEE_MASK_NOCLOSEPROCESS: the caller gets the process.
+                let mask = info.get32(memory, 1);
+                info.set(memory, 14, if mask & 0x40 != 0 { process } else { 0 });
+                return ok(1);
+            }
             eprintln!(
-                "[shell] ShellExecuteEx {} {} {} (starting programs is not supported yet)",
+                "[shell] ShellExecuteEx {} {} {} (only programs are started)",
                 String::from_utf8_lossy(&verb),
                 String::from_utf8_lossy(&file),
                 String::from_utf8_lossy(&params)

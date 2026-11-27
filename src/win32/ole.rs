@@ -172,6 +172,18 @@ fn ole32_args(name: &str) -> Option<usize> {
     })
 }
 
+/// The ordinals of OLEAUT32's string functions, for programs that import
+/// them by name (64-bit ones do).
+fn oleaut32_ordinal(name: &str) -> Option<u16> {
+    Some(match name {
+        "SysAllocString" => 2,
+        "SysAllocStringLen" => 4,
+        "SysFreeString" => 6,
+        "SysStringLen" => 7,
+        _ => return None,
+    })
+}
+
 fn oleaut32_args(ordinal: u16) -> Option<usize> {
     Some(match ordinal {
         2 | 6 | 7 | 8 | 9 | 16 | 17 | 18 | 21 | 22 | 24 | 37 | 38 | 39 | 149 | 150 => 1,
@@ -279,6 +291,7 @@ pub fn arg_count(dll: &str, name: &ImportName) -> Option<usize> {
             .or_else(|| crate::win32::com::arg_count(name))
             .or_else(|| ole32_args(name)),
         ("oleaut32.dll", ImportName::Ordinal(ordinal)) => oleaut32_args(*ordinal),
+        ("oleaut32.dll", ImportName::ByName(name)) => oleaut32_ordinal(name).and_then(oleaut32_args),
         ("winspool.drv", ImportName::ByName(name)) => match name.as_str() {
             "ClosePrinter" => Some(1),
             "OpenPrinterA" => Some(3),
@@ -307,6 +320,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
     let count = arg_count(dll, name)?;
     if args.len() < count {
         return None;
+    }
+    if let ImportName::ByName(text) = name {
+        if let Some(ordinal) = oleaut32_ordinal(text).filter(|_| dll.eq_ignore_ascii_case("oleaut32.dll")) {
+            return dispatch(ctx, memory, dll, &ImportName::Ordinal(ordinal), args);
+        }
     }
     let ok = |value: u32| Some(ApiOutcome::new(value, count));
     // A pointer-sized result (an interface pointer, a handle) and a 32-bit one.
@@ -816,5 +834,25 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
+    use super::*;
+
+    #[test]
+    fn string_functions_by_name_match_their_ordinals() {
+        let by_name = |name: &str| arg_count("OLEAUT32.dll", &ImportName::ByName(name.into()));
+        assert_eq!(by_name("SysAllocString"), Some(1));
+        assert_eq!(by_name("SysAllocStringLen"), Some(2));
+        assert_eq!(by_name("SysFreeString"), Some(1));
+        assert_eq!(by_name("SysStringLen"), Some(1));
+        assert_eq!(by_name("VariantInit"), None);
+        assert_eq!(arg_count("OLE32.dll", &ImportName::ByName("SysAllocString".into())), None);
     }
 }

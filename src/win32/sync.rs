@@ -768,6 +768,48 @@ fn launch_options<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, arg
     crate::win32::LaunchOptions { environment, handles, inherit: args[4] != 0, suspended: flags & 4 != 0 }
 }
 
+/// Whether ShellExecute starts `file` as a program (rather than opening
+/// it with one).
+pub(crate) fn is_program(file: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(file).trim().trim_matches('"').to_ascii_lowercase();
+    text.ends_with(".exe") || text.ends_with(".com")
+}
+
+/// Start the program `file` with `parameters` as ShellExecute does: the
+/// new process's handle, or None when it cannot be started.
+pub(crate) fn shell_start(ctx: &ApiContext, file: &[u8], parameters: &[u8], directory: &[u8]) -> Option<u32> {
+    let launcher = ctx.shared.borrow().launcher.0.clone()?;
+    let file = String::from_utf8_lossy(file).trim().trim_matches('"').as_bytes().to_vec();
+    let path = program_path(ctx, &file, b"")?;
+    let mut command_line = [b"\"".as_slice(), &path, b"\""].concat();
+    if !parameters.is_empty() {
+        command_line.push(b' ');
+        command_line.extend_from_slice(parameters);
+    }
+    let directory = if directory.is_empty() {
+        ctx.shared.borrow().current_dir.clone()
+    } else {
+        crate::win32::crt::absolute(ctx, directory)
+    };
+    let options = crate::win32::LaunchOptions {
+        environment: Some(crate::win32::env::block(ctx)),
+        handles: None,
+        inherit: false,
+        suspended: false,
+    };
+    match launcher.start_with(ctx, &path, &command_line, &directory, options) {
+        Ok(pid) => {
+            let process = create(ctx, None, Object::Process { pid, exit: None });
+            refresh_processes(ctx);
+            Some(process)
+        }
+        Err(error) => {
+            eprintln!("[shell] {} did not start: {error}", String::from_utf8_lossy(&path));
+            None
+        }
+    }
+}
+
 /// The program a `CreateProcess` call names: its application name, or the
 /// start of its command line (quoted, or the shortest run of words that
 /// names a file), found as Windows searches: the current directory, the
@@ -1517,6 +1559,15 @@ mod tests {
     use crate::platform::prelude::*;
     use super::*;
     use crate::win32::native::{SRW_EXCLUSIVE, SRW_READER, SRW_WAITERS};
+
+    #[test]
+    fn shell_execute_starts_programs_only() {
+        assert!(is_program(b"C:\\My Documents\\Downloads\\iview476_x64_setup.exe"));
+        assert!(is_program(b"\"C:\\Setup.EXE\""));
+        assert!(is_program(b"command.com"));
+        assert!(!is_program(b"C:\\My Documents\\readme.txt"));
+        assert!(!is_program(b"https://example.com/"));
+    }
 
     /// A 64-bit process's memory, as thread `.1` sees it (TEB at `.2`).
     struct Flat(Vec<u8>, u32, u32);

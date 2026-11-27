@@ -15,6 +15,35 @@ use crate::{
     win32::{unicode, ApiContext, ApiOutcome, GuestMemory},
 };
 
+/// Where downloads go (FOLDERID_Downloads; it has no CSIDL).
+pub const DOWNLOADS: &str = "C:\\My Documents\\Downloads";
+
+/// The path of a known folder (`FOLDERID_*`, as its 16 bytes): those that
+/// have a CSIDL, and Downloads.
+fn known_folder(id: &[u8]) -> Option<&'static str> {
+    let known = [
+        ("B4BFCC3A-DB2C-424C-B029-7FE99A87C641", 0x10), // Desktop
+        ("FDD39AD0-238F-46AF-ADB4-6C85480369C7", 0x05), // Documents
+        ("33E28130-4E1E-4676-835A-98395C3BC3BB", 0x05), // Pictures
+        ("3EB685DB-65F9-4CF6-A03A-E3EF65729F3D", 0x1A), // RoamingAppData
+        ("F1B32785-6FBA-4FCF-9D55-7B8E7F157091", 0x1C), // LocalAppData
+        ("62AB5D82-FDC1-4DC3-A9DD-070D1D495D97", 0x23), // ProgramData
+        ("905E63B6-C1BF-494E-B29C-65B732D3D21A", 0x26), // ProgramFiles
+        ("6D809377-6AF0-444B-8957-A3773F02200E", 0x26), // ProgramFilesX64
+        ("F38BF404-1D43-42F2-9305-67DE0B28FC23", 0x24), // Windows
+        ("1AC14E77-02E7-4E5D-B744-2EB1AE5198B7", 0x25), // System
+        ("A77F5D77-2E2B-44C3-A6A2-ABA601054A51", 0x02), // Programs
+        ("625B53C3-AB48-4EC1-BA1F-A1EF4146FC19", 0x0B), // StartMenu
+        ("B97D20BB-F46A-4C97-BA10-5E3608430854", 0x07), // Startup
+        ("FD228CB7-AE11-4AE3-864C-16F3910AB8FE", 0x14), // Fonts
+    ];
+    let is = |text: &str| crate::win32::shell::parse_guid(text).is_some_and(|g| g.as_slice() == id);
+    if is("374DE290-123F-4565-9164-39C4925E467B") {
+        return Some(DOWNLOADS);
+    }
+    known.iter().find(|(text, _)| is(text)).and_then(|(_, c)| crate::win32::unicode::special_folder(*c))
+}
+
 /// Replace `%NAME%` with the Windows 95 environment's value.
 fn expand_environment(ctx: &ApiContext, text: &[u8]) -> Vec<u8> {
     let text = String::from_utf16_lossy(&unicode::ansi_to_wide(text));
@@ -210,27 +239,11 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             1
         }
         // SHGetKnownFolderPath(folder id, flags, token, &path): the folders
-        // that have a CSIDL, as a CoTaskMemAlloc'd string.
+        // that have a CSIDL, and Downloads, as a CoTaskMemAlloc'd string.
         "SHGetKnownFolderPath" => {
             let id = memory.read_bytes(args[0], 16).unwrap_or_default();
-            let known = [
-                ("B4BFCC3A-DB2C-424C-B029-7FE99A87C641", 0x10), // Desktop
-                ("FDD39AD0-238F-46AF-ADB4-6C85480369C7", 0x05), // Documents
-                ("33E28130-4E1E-4676-835A-98395C3BC3BB", 0x05), // Pictures
-                ("3EB685DB-65F9-4CF6-A03A-E3EF65729F3D", 0x1A), // RoamingAppData
-                ("F1B32785-6FBA-4FCF-9D55-7B8E7F157091", 0x1C), // LocalAppData
-                ("62AB5D82-FDC1-4DC3-A9DD-070D1D495D97", 0x23), // ProgramData
-                ("905E63B6-C1BF-494E-B29C-65B732D3D21A", 0x26), // ProgramFiles
-                ("6D809377-6AF0-444B-8957-A3773F02200E", 0x26), // ProgramFilesX64
-                ("F38BF404-1D43-42F2-9305-67DE0B28FC23", 0x24), // Windows
-                ("1AC14E77-02E7-4E5D-B744-2EB1AE5198B7", 0x25), // System
-                ("A77F5D77-2E2B-44C3-A6A2-ABA601054A51", 0x02), // Programs
-                ("625B53C3-AB48-4EC1-BA1F-A1EF4146FC19", 0x0B), // StartMenu
-                ("B97D20BB-F46A-4C97-BA10-5E3608430854", 0x07), // Startup
-                ("FD228CB7-AE11-4AE3-864C-16F3910AB8FE", 0x14), // Fonts
-            ];
-            let csidl = known.iter().find(|(text, _)| crate::win32::shell::parse_guid(text).is_some_and(|g| g.as_slice() == id.as_slice())).map(|(_, c)| *c);
-            match csidl.and_then(crate::win32::unicode::special_folder) {
+            let folder = known_folder(&id);
+            match folder {
                 Some(path) => {
                     let units: Vec<u16> = path.encode_utf16().chain([0]).collect();
                     let block = ctx.shared.borrow_mut().heap.alloc(units.len() as u32 * 2).unwrap_or(0);
@@ -1017,5 +1030,27 @@ pub fn vxd_call<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, args:
         // PageQuery(address, MEMORY_BASIC_INFORMATION, size).
         0x0001_000E => call(ctx, memory, "KERNEL32.dll", "VirtualQuery", &[arg(0), arg(1), arg(2)]),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use crate::platform as std;
+    #[allow(unused_imports)]
+    use crate::platform::prelude::*;
+    use super::*;
+
+    fn id(text: &str) -> Vec<u8> {
+        crate::win32::shell::parse_guid(text).unwrap().to_vec()
+    }
+
+    #[test]
+    fn known_folders() {
+        assert_eq!(known_folder(&id("374DE290-123F-4565-9164-39C4925E467B")), Some("C:\\My Documents\\Downloads"));
+        assert_eq!(known_folder(&id("FDD39AD0-238F-46AF-ADB4-6C85480369C7")), Some("C:\\My Documents"));
+        assert_eq!(known_folder(&id("B4BFCC3A-DB2C-424C-B029-7FE99A87C641")), Some("C:\\WINDOWS\\Desktop"));
+        assert_eq!(known_folder(&id("00000000-0000-0000-0000-000000000001")), None);
+        assert_eq!(known_folder(&[]), None);
     }
 }
