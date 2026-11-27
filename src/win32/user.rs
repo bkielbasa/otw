@@ -252,7 +252,7 @@ pub fn calc_nc_size<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, h
 /// A window's style as far as its own scroll bars go: a combo box passes
 /// WS_VSCROLL/WS_HSCROLL on to its drop-down list and shows none itself.
 fn scroll_style(window: &GuestWindow) -> u32 {
-    if window.class.eq_ignore_ascii_case("ComboBox") {
+    if crate::win32::controls::is_combo_class(&window.class) {
         window.style & !(WS_VSCROLL | WS_HSCROLL)
     } else {
         window.style
@@ -1221,6 +1221,7 @@ fn builtin_proc<M: GuestMemory + ?Sized>(
         "OTW_PropSheetProc" => crate::win32::comctl32::sheet_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_TabProc" => crate::win32::comctl32::tab_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_ListViewProc" => crate::win32::comctl32::listview_proc(ctx, memory, hwnd, msg, wparam, lparam),
+        "OTW_ComboBoxExProc" => crate::win32::controls::combo_ex_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_TreeViewProc" => crate::win32::treeview::treeview_proc(ctx, memory, hwnd, msg, wparam, lparam),
         "OTW_RebarProc" => crate::win32::rebar::rebar_proc(ctx, memory, hwnd, msg, wparam, lparam),
         // Tooltips: tools are accepted and never shown.
@@ -1492,7 +1493,8 @@ fn system_logfont(weight: u32) -> Vec<u8> {
 
 /// The common controls COMCTL32 provides; a genuine COMCTL32 registers
 /// its own.
-pub const COMMON_CONTROL_CLASSES: [&str; 7] = [
+pub const COMMON_CONTROL_CLASSES: [&str; 8] = [
+    "ComboBoxEx32",
     "ToolbarWindow32",
     "msctls_statusbar32",
     "SysListView32",
@@ -1530,7 +1532,8 @@ pub fn ensure_builtin_classes(ctx: &ApiContext) {
         return;
     }
     let builtin = |name: &str| ctx.builtin_proc(name);
-    let classes: [(&str, &str, u32, u32); 19] = [
+    let classes: [(&str, &str, u32, u32); 20] = [
+        ("ComboBoxEx32", "OTW_ComboBoxExProc", 0x08, 6),
         ("SysTreeView32", "OTW_TreeViewProc", 0x08, 0),
         ("ReBarWindow32", "OTW_RebarProc", 0x08, 0),
         ("tooltips_class32", "OTW_TooltipProc", 0x08, 0),
@@ -2360,7 +2363,7 @@ pub fn set_focus<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd
 /// given sets how far its list drops down.
 fn closed_combo_height(class: &str, style: u32) -> Option<i32> {
     const CBS_DROPDOWN: u32 = 2;
-    (class.eq_ignore_ascii_case("ComboBox") && style & 3 >= CBS_DROPDOWN).then_some(21)
+    (crate::win32::controls::is_combo_class(class) && style & 3 >= CBS_DROPDOWN).then_some(21)
 }
 
 pub fn set_window_pos<M: GuestMemory + ?Sized>(

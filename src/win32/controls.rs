@@ -1908,6 +1908,104 @@ fn list_message<M: GuestMemory + ?Sized>(
     })
 }
 
+/// Whether windows of class `name` are combo boxes (ComboBoxEx32 is one,
+/// with the extended messages on top).
+pub fn is_combo_class(name: &str) -> bool {
+    name.eq_ignore_ascii_case("ComboBox") || name.eq_ignore_ascii_case("ComboBoxEx32")
+}
+
+/// COMBOBOXEXITEM: mask, iItem, pszText, cchTextMax, iImage,
+/// iSelectedImage, iOverlay, iIndent, lParam.
+const COMBOBOXEXITEM: crate::win32::x64::Layout = crate::win32::x64::Layout::new(&[
+    crate::win32::x64::F::D,
+    crate::win32::x64::F::P,
+    crate::win32::x64::F::P,
+    crate::win32::x64::F::D,
+    crate::win32::x64::F::D,
+    crate::win32::x64::F::D,
+    crate::win32::x64::F::D,
+    crate::win32::x64::F::D,
+    crate::win32::x64::F::P,
+]);
+const CBEIF_TEXT: u32 = 0x1;
+const CBEIF_LPARAM: u32 = 0x20;
+
+/// The extended combo box (`ComboBoxEx32`): a combo box (its own edit
+/// field, which CBEM_GETEDITCONTROL hands out) taking COMBOBOXEXITEMs.
+/// Item images are not drawn.
+pub fn combo_ex_proc<M: GuestMemory + ?Sized>(ctx: &ApiContext, memory: &mut M, hwnd: u32, msg: u32, wparam: u32, lparam: u32) -> u32 {
+    let field = |memory: &mut M, index: usize| crate::win32::x64::View::new(memory, &COMBOBOXEXITEM, lparam).get32(memory, index);
+    match msg {
+        // CBEM_GETCOMBOCONTROL, CBEM_GETEDITCONTROL: the control itself.
+        0x0406 | 0x0407 => hwnd,
+        // CBEM_INSERTITEMA/W: the text, at iItem (-1: the end).
+        0x0401 | 0x040B => {
+            let wide = msg == 0x040B;
+            let text = if field(memory, 0) & CBEIF_TEXT != 0 {
+                let va = field(memory, 2);
+                if va < 0x10000 || va == u32::MAX {
+                    Vec::new()
+                } else if wide {
+                    crate::win32::unicode::wide_to_ansi(&crate::win32::unicode::read_wstr(memory, va))
+                } else {
+                    read_cstr(memory, va)
+                }
+            } else {
+                Vec::new()
+            };
+            let index = field(memory, 1) as i32;
+            let data = if field(memory, 0) & CBEIF_LPARAM != 0 { field(memory, 8) } else { 0 };
+            let at = {
+                let mut shared = ctx.shared.borrow_mut();
+                let Some(w) = shared.gui.window_mut(hwnd) else { return u32::MAX };
+                let at = if index < 0 { w.control.items.len() } else { (index as usize).min(w.control.items.len()) };
+                w.control.items.insert(at, (text, data));
+                at
+            };
+            redraw(ctx, hwnd);
+            at as u32
+        }
+        // CBEM_GETITEMA/W: the text of iItem (-1: the edit field's).
+        0x0404 | 0x040D => {
+            let wide = msg == 0x040D;
+            if field(memory, 0) & CBEIF_TEXT == 0 {
+                return 1;
+            }
+            let index = field(memory, 1) as i32;
+            let text = if index < 0 {
+                ctx.shared.borrow().gui.window(hwnd).map(|w| w.text.clone()).unwrap_or_default()
+            } else {
+                ctx.shared
+                    .borrow()
+                    .gui
+                    .window(hwnd)
+                    .and_then(|w| w.control.items.get(index as usize).map(|item| item.0.clone()))
+                    .unwrap_or_default()
+            };
+            let (va, capacity) = (field(memory, 2), field(memory, 3));
+            if va != 0 && capacity > 0 {
+                let mut text = text;
+                text.truncate(capacity as usize - 1);
+                if wide {
+                    crate::win32::unicode::write_wide(memory, va, &crate::win32::unicode::ansi_to_wide(&text), true);
+                } else {
+                    let _ = write_cstr(memory, va, &text);
+                }
+            }
+            1
+        }
+        // CBEM_SETITEMA/W, CBEM_SETIMAGELIST, CBEM_GETIMAGELIST,
+        // CBEM_SETEXSTYLE/SETEXTENDEDSTYLE, CBEM_GETEXSTYLE,
+        // CBEM_HASEDITCHANGED, CCM_SETUNICODEFORMAT, CCM_SETWINDOWTHEME:
+        // accepted (nothing before).
+        0x0405 | 0x040C => 1,
+        0x0402 | 0x0403 | 0x0408 | 0x040E | 0x0409 | 0x040A | 0x2005 | 0x200B => 0,
+        // CCM_GETUNICODEFORMAT
+        0x2006 => 1,
+        _ => combo_proc(ctx, memory, hwnd, msg, wparam, lparam),
+    }
+}
+
 fn is_combo(ctx: &ApiContext, hwnd: u32) -> bool {
     ctx.shared
         .borrow()
@@ -1918,7 +2016,7 @@ fn is_combo(ctx: &ApiContext, hwnd: u32) -> bool {
 }
 
 fn is_combo_window(w: &crate::win32::GuestWindow) -> bool {
-    w.class.eq_ignore_ascii_case("ComboBox")
+    is_combo_class(&w.class)
 }
 
 fn listbox_proc<M: GuestMemory + ?Sized>(
@@ -4187,7 +4285,7 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
                 .window(item)
                 .map(|w| {
                     if w.class.eq_ignore_ascii_case("Edit")
-                        || w.class.eq_ignore_ascii_case("ComboBox")
+                        || is_combo_class(&w.class)
                     {
                         w.text.clone()
                     } else {
@@ -4297,6 +4395,61 @@ mod tests {
         fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
             self.write_bytes(va, &value.to_le_bytes())
         }
+    }
+
+    /// Memory anywhere in the address space, made as it is written.
+    #[derive(Default)]
+    struct Sparse(std::collections::BTreeMap<u32, u8>);
+    impl GuestMemory for Sparse {
+        fn read_bytes(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+            Some((0..len as u32).map(|i| self.0.get(&(va + i)).copied().unwrap_or(0)).collect())
+        }
+        fn write_bytes(&mut self, va: u32, bytes: &[u8]) -> Option<()> {
+            for (i, &b) in bytes.iter().enumerate() {
+                self.0.insert(va + i as u32, b);
+            }
+            Some(())
+        }
+        fn write_u32(&mut self, va: u32, value: u32) -> Option<()> {
+            self.write_bytes(va, &value.to_le_bytes())
+        }
+    }
+
+    #[test]
+    fn extended_combo_boxes_take_items_and_text() {
+        let ctx = ApiContext::default();
+        let mut memory = Sparse::default();
+        let hwnd = 0x100;
+        ctx.shared.borrow_mut().gui.windows.push(crate::win32::GuestWindow {
+            hwnd,
+            class: "ComboBoxEx32".into(),
+            style: 0x0000_0042, // CBS_DROPDOWN | CBS_AUTOHSCROLL
+            width: 200,
+            height: 21,
+            ..Default::default()
+        });
+        assert!(is_combo_class("comboboxex32"));
+        assert_eq!(combo_ex_proc(&ctx, &mut memory, hwnd, 0x0407, 0, 0), hwnd);
+        // CBEM_INSERTITEMW with a COMBOBOXEXITEM (32-bit layout).
+        let (item, text) = (0x2_1000, 0x2_1100);
+        let units: Vec<u8> = "C:\\".encode_utf16().chain([0]).flat_map(|u| u.to_le_bytes()).collect();
+        memory.write_bytes(text, &units);
+        for (offset, value) in [(0, CBEIF_TEXT), (4, u32::MAX), (8, text)] {
+            memory.write_u32(item + offset, value);
+        }
+        assert_eq!(combo_ex_proc(&ctx, &mut memory, hwnd, 0x040B, 0, item), 0);
+        assert_eq!(combo_ex_proc(&ctx, &mut memory, hwnd, 0x0146, 0, 0), 1); // CB_GETCOUNT
+        // CBEM_GETITEMW of item 0 into a buffer.
+        let buffer = 0x2_1200;
+        for (offset, value) in [(0, CBEIF_TEXT), (4, 0), (8, buffer), (12, 16)] {
+            memory.write_u32(item + offset, value);
+        }
+        assert_eq!(combo_ex_proc(&ctx, &mut memory, hwnd, 0x040D, 0, item), 1);
+        assert_eq!(crate::win32::unicode::read_wstr(&mut memory, buffer), "C:\\".encode_utf16().collect::<Vec<_>>());
+        // The edit field's text.
+        memory.write_bytes(0x2_1300, b"C:\\Program Files\\\0");
+        combo_ex_proc(&ctx, &mut memory, hwnd, WM_SETTEXT, 0, 0x2_1300);
+        assert_eq!(ctx.shared.borrow().gui.window(hwnd).unwrap().text, b"C:\\Program Files\\");
     }
 
     #[test]
