@@ -77,6 +77,53 @@ struct SocketEntry {
     async_hwnd: u32,
     async_msg: u32,
     async_events: u32,
+    /// A non-blocking `connect` under way: the socket becomes writable
+    /// when it is made.
+    connecting: bool,
+    /// SO_ERROR: why the last non-blocking connect failed.
+    error: u32,
+}
+
+/// Start a TCP connection: at once with `nonblocking` where the platform
+/// can (the second value: still being made), else made before it returns.
+fn start_connect(address: SocketAddr, nonblocking: bool) -> io::Result<(TcpStream, bool)> {
+    #[cfg(not(feature = "std"))]
+    if nonblocking {
+        return TcpStream::connect_started(&address).map(|stream| (stream, true));
+    }
+    let _ = nonblocking;
+    TcpStream::connect_timeout(&address, Duration::from_secs(20)).map(|stream| (stream, false))
+}
+
+/// Whether a socket's non-blocking connect is still under way (noting it
+/// when it finished, or failed).
+fn still_connecting(entry: &mut SocketEntry) -> bool {
+    if !entry.connecting {
+        return false;
+    }
+    let GuestSocket::TcpStream(stream) = &entry.kind else {
+        entry.connecting = false;
+        return false;
+    };
+    #[cfg(not(feature = "std"))]
+    let state = stream.connected();
+    #[cfg(feature = "std")]
+    let state: io::Result<bool> = { let _ = stream; Ok(true) };
+    match state {
+        Ok(false) => true,
+        Ok(true) => {
+            entry.connecting = false;
+            if let GuestSocket::TcpStream(stream) = &entry.kind {
+                entry.local_addr = stream.local_addr().ok().and_then(ipv4);
+            }
+            false
+        }
+        Err(error) => {
+            entry.connecting = false;
+            entry.error = io_error_code(&error);
+            false
+        }
+    }
 }
 
 enum GuestSocket {
@@ -152,6 +199,8 @@ impl WinSockState {
                 async_hwnd: 0,
                 async_msg: 0,
                 async_events: 0,
+                connecting: false,
+                error: 0,
             },
         );
         handle
@@ -455,8 +504,17 @@ pub fn dispatch<M: GuestMemory + ?Sized>(
             if !shared.winsock.sockets.contains_key(&args[0]) {
                 return Some(fail(&mut shared.winsock, WSAENOTSOCK, count));
             }
+            // SO_ERROR (level SOL_SOCKET): why a non-blocking connect
+            // failed; other options read as 0.
+            let value = if args[1] == 0xFFFF && args[2] == 0x1007 {
+                let entry = shared.winsock.sockets.get_mut(&args[0]).unwrap();
+                still_connecting(entry);
+                std::mem::take(&mut entry.error)
+            } else {
+                0
+            };
             if args[4] != 0 {
-                let _ = memory.write_u32(args[3], 0);
+                let _ = memory.write_u32(args[3], value);
             }
             ok(&mut shared.winsock, 0, count)
         }
@@ -1017,8 +1075,13 @@ fn connect<M: GuestMemory + ?Sized>(
     if std::env::var_os("OTW_TRACE_NET").is_some() {
         eprintln!("[net] connect socket {} to {address}", args[0]);
     }
+    // A non-blocking connect returns at once (WSAEWOULDBLOCK), the socket
+    // writable once connected: the process (all of whose threads wait for
+    // its lock meanwhile) is not held up for the network's round trip.
+    let mut connecting = false;
     let result = match kind {
-        SOCK_STREAM => TcpStream::connect_timeout(&address.into(), Duration::from_secs(20)).map(|stream| {
+        SOCK_STREAM => start_connect(address.into(), nonblocking).map(|(stream, pending)| {
+            connecting = pending;
             let _ = stream.set_nonblocking(nonblocking);
             GuestSocket::TcpStream(stream)
         }),
@@ -1039,6 +1102,11 @@ fn connect<M: GuestMemory + ?Sized>(
             };
             entry.remote_addr = Some(address);
             entry.kind = kind;
+            entry.connecting = connecting;
+            entry.error = 0;
+            if connecting {
+                return fail(&mut shared.winsock, WSAEWOULDBLOCK, count);
+            }
             post_async(&mut shared, args[0], FD_CONNECT);
             post_async(&mut shared, args[0], FD_WRITE);
             ok(&mut shared.winsock, 0, count)
@@ -1105,6 +1173,9 @@ fn send<M: GuestMemory + ?Sized>(
     let Some(entry) = shared.winsock.entry(args[0]) else {
         return fail(&mut shared.winsock, WSAENOTSOCK, count);
     };
+    if still_connecting(entry) {
+        return fail(&mut shared.winsock, WSAEWOULDBLOCK, count);
+    }
     let Some(bytes) = memory.read_bytes(args[1], bounded_length(args[2])) else {
         return fail(&mut shared.winsock, WSAEFAULT, count);
     };
@@ -1131,6 +1202,9 @@ fn recv<M: GuestMemory + ?Sized>(
     let Some(entry) = shared.winsock.entry(args[0]) else {
         return fail(&mut shared.winsock, WSAENOTSOCK, count);
     };
+    if still_connecting(entry) {
+        return fail(&mut shared.winsock, WSAEWOULDBLOCK, count);
+    }
     let mut buffer = vec![0u8; bounded_length(args[2])];
     let peek = args[3] & 0x02 != 0; // MSG_PEEK
     let result = match &mut entry.kind {
@@ -1317,8 +1391,8 @@ pub fn select_ready(shared: &mut SharedState, thread: u32) -> Option<bool> {
         return Some(true);
     }
     let (read, write) = (pending.read.clone(), pending.write.clone());
-    let writable = write.iter().any(|h| state.sockets.get(h).is_some_and(|e| !matches!(e.kind, GuestSocket::Unbound { .. } | GuestSocket::TcpListener { .. })));
-    Some(writable || read.iter().any(|h| state.entry(*h).is_some_and(is_readable)))
+    let writable = write.iter().any(|h| state.sockets.get_mut(h).is_some_and(|e| !matches!(e.kind, GuestSocket::Unbound { .. } | GuestSocket::TcpListener { .. }) && !still_connecting(e)));
+    Some(writable || read.iter().any(|h| state.entry(*h).is_some_and(|e| !still_connecting(e) && is_readable(e))))
 }
 
 /// `select`: sockets are polled; while none is ready and the timeout has
@@ -1380,7 +1454,7 @@ fn select_poll<M: GuestMemory + ?Sized>(
     let mut ready_read = Vec::new();
     for handle in &read {
         if let Some(entry) = shared.winsock.entry(*handle) {
-            if is_readable(entry) {
+            if !still_connecting(entry) && is_readable(entry) {
                 ready_read.push(*handle);
             }
         }
@@ -1388,7 +1462,7 @@ fn select_poll<M: GuestMemory + ?Sized>(
     let ready_write: Vec<u32> = write
         .iter()
         .copied()
-        .filter(|handle| shared.winsock.sockets.get(handle).is_some_and(|e| !matches!(e.kind, GuestSocket::Unbound { .. } | GuestSocket::TcpListener { .. })))
+        .filter(|handle| shared.winsock.sockets.get_mut(handle).is_some_and(|e| !matches!(e.kind, GuestSocket::Unbound { .. } | GuestSocket::TcpListener { .. }) && !still_connecting(e)))
         .collect();
     let ready_except: Vec<u32> = Vec::new();
     let total = ready_read.len() + ready_write.len() + ready_except.len();

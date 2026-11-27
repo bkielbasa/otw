@@ -171,6 +171,20 @@ impl TcpStream {
         waiting(false, timeout.as_micros() as u64, || net.tcp_connected(socket.id))?;
         Ok(TcpStream(socket))
     }
+    /// Start connecting and return at once; `connected` tells when the
+    /// connection is made (a non-blocking `connect`).
+    pub fn connect_started(address: &SocketAddr) -> io::Result<TcpStream> {
+        let net = network()?;
+        Ok(TcpStream(Socket::new(net.tcp_connect(*address).map_err(error)?)))
+    }
+    /// Whether the connection is made: `Ok(false)` while it is being made.
+    pub fn connected(&self) -> io::Result<bool> {
+        match network()?.tcp_connected(self.0.id) {
+            Ok(()) => Ok(true),
+            Err(NetError::WouldBlock) => Ok(false),
+            Err(e) => Err(error(e)),
+        }
+    }
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         if how != Shutdown::Read {
             network()?.shutdown(self.0.id);
