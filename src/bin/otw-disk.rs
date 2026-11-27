@@ -3,11 +3,16 @@
 //! rebuilt image keeps what was saved, downloaded and installed on it.
 //!
 //!     otw-disk sync IMAGE LABEL [--replace] DIRECTORY[+DIRECTORY...]
+//!     otw-disk link FILE TARGET [DESCRIPTION]
 //!
 //! Copies each directory's tree into partition LABEL (by its GPT name):
 //! folders and files that are not there are added; with `--replace`, files
 //! that are there with other contents are written again. Nothing on the
 //! partition is removed.
+//!
+//! `link` writes a Windows shell link (.lnk) to TARGET (a path on the
+//! guest, `C:\...`) into the host file FILE: a desktop or Start menu
+//! shortcut to put on drive C:.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -142,8 +147,26 @@ fn sync(fs: &Fat32FileSystem, host: &Path, guest: &str, replace: bool, counts: &
     Ok(())
 }
 
+/// The shell link to `target` (its folder is where it starts).
+fn shortcut(target: &str, description: &str) -> Vec<u8> {
+    let working_dir = target.rfind('\\').map(|i| target[..i].to_string()).unwrap_or_default();
+    otw_vm::win32::lnk::write(&otw_vm::win32::lnk::ShellLink {
+        target: target.to_string(),
+        arguments: String::new(),
+        working_dir,
+        description: description.to_string(),
+    })
+}
+
 fn run(args: &[String]) -> Result<String, String> {
-    let usage = "usage: otw-disk sync IMAGE LABEL [--replace] DIRECTORY[+DIRECTORY...]";
+    let usage = "usage: otw-disk sync IMAGE LABEL [--replace] DIRECTORY[+DIRECTORY...]\n       otw-disk link FILE TARGET [DESCRIPTION]";
+    if let [command, file, target, rest @ ..] = args {
+        if command == "link" {
+            let description = rest.first().map(String::as_str).unwrap_or("");
+            std::fs::write(file, shortcut(target, description)).map_err(|e| format!("{file}: {e}"))?;
+            return Ok(format!("{file}: a shortcut to {target}"));
+        }
+    }
     let [command, image, label, rest @ ..] = args else { return Err(usage.into()) };
     if command != "sync" {
         return Err(usage.into());
@@ -176,5 +199,19 @@ fn main() -> ExitCode {
             eprintln!("otw-disk: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortcuts_start_in_their_target_folder() {
+        let bytes = shortcut("C:\\Program Files\\App Center\\app-center-gui.exe", "App Center");
+        let link = otw_vm::win32::lnk::read(&bytes).unwrap();
+        assert_eq!(link.target, "C:\\Program Files\\App Center\\app-center-gui.exe");
+        assert_eq!(link.working_dir, "C:\\Program Files\\App Center");
+        assert_eq!(link.description, "App Center");
     }
 }

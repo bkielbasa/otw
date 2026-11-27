@@ -32,6 +32,8 @@ make os         # boot it in QEMU
 
 What programs save, download and install on drive C: is written to the disk and stays there. Running `make image` again keeps it: the kernel is replaced, OTW's own files on C: are brought up to date and new files from `~/.otw/C` are added, but nothing already on C: is removed or overwritten (`OTW_FRESH=1 make image` starts from an empty drive instead). It refuses while a VM is running on the image. Drive C: has 2 GiB free (`OTW_DRIVE_C_FREE`, in MiB, when the image is made anew).
 
+The image includes the App Center (`apps/app-center`: find and download programs from the winget repository) in `C:\Program Files\App Center`, with a shortcut on the desktop, when the Windows toolchain is installed: `scripts/build-app-center.sh --fetch` adds the Rust target `x86_64-pc-windows-gnullvm` and llvm-mingw (in `~/.local/share/otw-toolchain`, no root needed). Without it the image is built without the App Center (`OTW_APP_CENTER=0` leaves it out on purpose).
+
 `make os` opens a window in a desktop session; without one the screen is at `vnc://127.0.0.1:5901` (`VM_DISPLAY=gtk` or `sdl` to choose). The kernel's log goes to the serial port (`VM_SERIAL=file` to keep it). `VM_NIC=e1000`, `e1000e` or `igb` gives the machine an Intel card instead of virtio. A kernel built with `OTW_PROFILE=1` logs where the CPUs' time goes every ten seconds (idle, program code by module, the subsystem by call), how threads were woken and how long pipe data and completion packets waited (`OTW_KERNEL_ENV=OTW_PROFILE_SECONDS=1` for a report every second).
 
 On a real machine, write it to a USB stick and boot it with UEFI and Secure Boot off:

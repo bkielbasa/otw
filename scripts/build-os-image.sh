@@ -38,6 +38,23 @@ mkdir -p "$EXTRA/WINDOWS/FONTS"
 for dir in /usr/share/fonts/truetype/dejavu /usr/share/fonts/truetype/liberation /usr/share/fonts/truetype/liberation2; do
   [[ -d "$dir" ]] && cp "$dir"/*.ttf "$EXTRA/WINDOWS/FONTS/" 2>/dev/null || true
 done
+# The App Center (apps/app-center), built for Windows when the toolchain
+# is there (scripts/build-app-center.sh --fetch installs it), in
+# C:\Program Files\App Center with a shortcut on the desktop and in the
+# Start menu. OTW_APP_CENTER=0 leaves it out.
+(cd "$ROOT" && scripts/cargo.sh build --quiet --bin otw-disk)
+APPS="$ROOT/apps/app-center/target/x86_64-pc-windows-gnullvm/release"
+if [[ "${OTW_APP_CENTER:-1}" != 0 ]] && "$ROOT/scripts/build-app-center.sh" >/dev/null; then
+  mkdir -p "$EXTRA/Program Files/App Center" "$EXTRA/WINDOWS/Desktop" "$EXTRA/WINDOWS/Start Menu/Programs"
+  cp "$APPS"/*.exe "$EXTRA/Program Files/App Center/"
+  if [[ -f "$APPS/app-center-gui.exe" ]]; then
+    for at in "$EXTRA/WINDOWS/Desktop" "$EXTRA/WINDOWS/Start Menu/Programs"; do
+      "$ROOT/target/debug/otw-disk" link "$at/App Center.lnk" 'C:\Program Files\App Center\app-center-gui.exe' "App Center" >/dev/null
+    done
+  fi
+else
+  echo "==> the App Center is left out (no Windows toolchain: scripts/build-app-center.sh --fetch)"
+fi
 DRIVE_C="${OTW_DRIVE_C-$HOME/.otw/C}"
 FREE="${OTW_DRIVE_C_FREE:-2048}"
 IMAGE="${OS_IMAGE:-$OUT/otw.img}"
@@ -56,7 +73,6 @@ except OSError:
   fi
   echo "==> updating $IMAGE (drive C: is kept; OTW_FRESH=1 to start anew)"
   python3 -I "$ROOT/scripts/make-disk.py" --update "$IMAGE" "${partitions[0]}"
-  (cd "$ROOT" && scripts/cargo.sh build --quiet --bin otw-disk)
   "$ROOT/target/debug/otw-disk" sync "$IMAGE" OTW-C --replace "$EXTRA"
   if [[ -n "$DRIVE_C" && -d "$DRIVE_C" ]]; then
     "$ROOT/target/debug/otw-disk" sync "$IMAGE" OTW-C "$DRIVE_C"
